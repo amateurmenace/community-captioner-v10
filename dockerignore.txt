@@ -1,0 +1,8 @@
+node_modules
+dist
+dist_electron
+.git
+.env
+.DS_Store
+release
+build

@@ -6,6 +6,10 @@
   "main": "electron/main.js",
   "description": "AI-powered live captioning for community media.",
   "author": "Community Captioner",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/amateurmenace/community-captioner-v10.git"
+  },
   "scripts": {
     "dev": "concurrently \"npm run server\" \"vite\"",
     "client": "vite",

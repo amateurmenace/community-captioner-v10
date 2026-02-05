@@ -478,15 +478,16 @@ function App() {
 
     const startRecording = async () => {
         try {
-            // 1. Get Audio Stream (Crucial for Visualization)
+            // 1. Get Audio Stream
+            // CLOUD FIX: Remove sampleRate: 16000 constraint to avoid "OverconstrainedError" on consumer hardware
+            // Let the browser pick the native rate, and AudioContext will handle resampling.
             stream = await navigator.mediaDevices.getUserMedia({ 
                 audio: { 
                     deviceId: appState.audioSourceId ? { exact: appState.audioSourceId } : undefined,
-                    echoCancellation: false,
-                    autoGainControl: false,
-                    noiseSuppression: false,
-                    channelCount: 1,
-                    sampleRate: 16000 
+                    echoCancellation: true,
+                    autoGainControl: true,
+                    noiseSuppression: true,
+                    channelCount: 1
                 } 
             });
             if (!mounted) return;
@@ -507,9 +508,12 @@ function App() {
                     ws.binaryType = 'arraybuffer';
                     localWs = ws;
                     
-                    ws.onopen = () => {
+                    ws.onopen = async () => {
                         console.log("Local Whisper Connected");
                         const ctx = new AudioContext({ sampleRate: 16000 });
+                        // CRITICAL: Force resume in case browser policy suspended it
+                        if (ctx.state === 'suspended') await ctx.resume();
+                        
                         source = ctx.createMediaStreamSource(stream!);
                         const processor = ctx.createScriptProcessor(4096, 1, 1);
                         processor.onaudioprocess = (e) => {
@@ -574,18 +578,32 @@ function App() {
                 recognition.onerror = (event: any) => {
                     console.error("Speech Rec Error", event);
                     if (event.error === 'network') {
+                        // Add notification so user sees it in UI
+                        setAppState(prev => ({
+                             ...prev,
+                             notifications: [...prev.notifications, { id: Date.now().toString(), message: "Network Error: Retrying Speech API...", type: 'error', timestamp: Date.now() }]
+                        }));
                         // Retry on network error
-                        setTimeout(() => { if(mounted) recognition.start(); }, 500);
+                        setTimeout(() => { if(mounted) try { recognition.start(); } catch(e){} }, 1000);
+                    } else if (event.error === 'not-allowed') {
+                        alert("Microphone access denied. Please allow microphone access in your browser settings.");
+                        setAppState(p => ({...p, isRecording: false}));
                     }
                 };
                 
                 recognition.onend = () => {
                     // Auto-restart
-                    if (mounted) recognition.start();
+                    if (mounted) {
+                        try { recognition.start(); } catch(e) {}
+                    }
                 };
                 
                 recognitionRef.current = recognition;
-                recognition.start();
+                try {
+                    recognition.start();
+                } catch(e) {
+                    console.warn("Recognition start failed", e);
+                }
             }
             
             // --- CLOUD MODE (Gemini Live) ---
@@ -640,7 +658,11 @@ function App() {
                         geminiSession = session;
 
                         // Audio Pipeline
+                        // Force 16k context for Gemini, browser handles resampling from native stream
                         const ctx = new AudioContext({ sampleRate: 16000 });
+                        // CRITICAL: Force resume in case browser policy suspended it (common in Cloud/Production)
+                        if (ctx.state === 'suspended') await ctx.resume();
+
                         const sourceNode = ctx.createMediaStreamSource(stream!);
                         const processor = ctx.createScriptProcessor(4096, 1, 1);
                         
