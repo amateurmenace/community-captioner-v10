@@ -1,0 +1,68 @@
+{
+  "name": "community-captioner",
+  "private": true,
+  "version": "6.1.0",
+  "type": "module",
+  "main": "electron/main.js",
+  "description": "AI-powered live captioning for community media.",
+  "author": "Community Captioner",
+  "scripts": {
+    "dev": "concurrently \"npm run server\" \"vite\"",
+    "client": "vite",
+    "build": "vite build",
+    "server": "node server/relay.js",
+    "start": "node server/relay.js",
+    "dist": "npm run build && electron-builder"
+  },
+  "dependencies": {
+    "@ffmpeg/ffmpeg": "^0.12.10",
+    "@ffmpeg/util": "^0.12.1",
+    "@google/genai": "*",
+    "express": "^4.19.2",
+    "localtunnel": "^2.0.2",
+    "lucide-react": "^0.378.0",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "react-dropzone": "^14.2.3",
+    "recharts": "^2.12.7",
+    "ws": "^8.17.0"
+  },
+  "devDependencies": {
+    "@types/react": "^18.3.2",
+    "@types/react-dom": "^18.3.0",
+    "@vitejs/plugin-react": "^4.2.1",
+    "autoprefixer": "^10.4.19",
+    "concurrently": "^8.2.2",
+    "electron": "^30.0.0",
+    "electron-builder": "^24.13.3",
+    "postcss": "^8.4.38",
+    "tailwindcss": "^3.4.3",
+    "typescript": "^5.4.5",
+    "vite": "^5.2.11"
+  },
+  "build": {
+    "appId": "com.community.captioner",
+    "productName": "Community Captioner",
+    "asar": false,
+    "directories": {
+      "output": "dist_electron"
+    },
+    "files": [
+      "dist/**/*",
+      "electron/**/*",
+      "server/**/*",
+      "package.json"
+    ],
+    "mac": {
+      "target": "dmg",
+      "hardenedRuntime": true,
+      "gatekeeperAssess": false
+    },
+    "win": {
+      "target": "nsis"
+    },
+    "linux": {
+      "target": "AppImage"
+    }
+  }
+}

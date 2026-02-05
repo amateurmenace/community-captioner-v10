@@ -1,0 +1,7 @@
+{
+  "name": "Copy of Copy of 8. Community Captioner",
+  "description": "An open-source, AI-powered live captioning system for community media, featuring real-time context correction and analytics.",
+  "requestFramePermissions": [
+    "microphone"
+  ]
+}
