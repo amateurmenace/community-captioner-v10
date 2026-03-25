@@ -124,7 +124,10 @@ function App() {
         
         // RTMP
         rtmpUrl: 'ws://localhost:3000',
-        isStreaming: false
+        isStreaming: false,
+
+        // CEA-708 SDI Bridge
+        cea708Enabled: false
     };
   });
 
@@ -992,6 +995,7 @@ function App() {
             currentStream={currentStream}
             onEditCaption={handleEditCaption}
             overlaySettings={appState.overlaySettings}
+            cea708Enabled={appState.cea708Enabled}
         />
       )}
 
@@ -1063,7 +1067,7 @@ function App() {
       )}
 
       {showOutputModal && (
-          <OutputSettings 
+          <OutputSettings
              settings={appState.overlaySettings}
              setSettings={(v) => setAppState(p => ({...p, overlaySettings: v}))}
              outputMode={appState.outputMode}
@@ -1071,6 +1075,18 @@ function App() {
              onClose={() => setShowOutputModal(false)}
              onLaunch={handleLaunchOutput}
              previewText={getLastCaptionText()}
+             cea708Enabled={appState.cea708Enabled}
+             setCea708Enabled={(v) => setAppState(p => ({...p, cea708Enabled: v}))}
+             onCea708Clear={() => {
+                 // Send clear command via the relay WebSocket
+                 const relayUrl = getRelayUrl();
+                 const ws = new WebSocket(relayUrl);
+                 ws.onopen = () => {
+                     ws.send(JSON.stringify({ type: 'join', sessionId: 'demo' }));
+                     ws.send(JSON.stringify({ type: 'cea708_clear' }));
+                     setTimeout(() => ws.close(), 500);
+                 };
+             }}
           />
       )}
     </div>

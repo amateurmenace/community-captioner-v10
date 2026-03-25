@@ -93,7 +93,7 @@ export interface AppState {
   audioSourceId: string;
   targetLanguage: string;
   overlaySettings: OverlaySettings;
-  outputMode: 'browser_overlay' | 'rtmp_embed';
+  outputMode: 'browser_overlay' | 'rtmp_embed' | 'sdi_cea708';
   learningEnabled: boolean;
   notifications: Notification[];
   activeContextName: string | null;
@@ -115,6 +115,9 @@ export interface AppState {
   // RTMP
   rtmpUrl?: string;
   isStreaming: boolean;
+
+  // CEA-708 SDI Bridge
+  cea708Enabled: boolean;
 }
 
 export enum ProcessingStatus {

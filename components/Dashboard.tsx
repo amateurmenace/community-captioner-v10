@@ -31,6 +31,7 @@ interface DashboardProps {
   currentStream: MediaStream | null; 
   onEditCaption: (id: string, newText: string) => void;
   overlaySettings: OverlaySettings; // Added Prop
+  cea708Enabled: boolean;
 }
 
 const BrandLogo = () => (
@@ -313,7 +314,8 @@ const Dashboard: React.FC<DashboardProps> = ({
   currentStream,
   onEditCaption,
   notifications,
-  overlaySettings
+  overlaySettings,
+  cea708Enabled
 }) => {
   const t = useTranslation(uiLanguage);
   const scrollRef = useRef<HTMLDivElement>(null);
@@ -661,6 +663,17 @@ const Dashboard: React.FC<DashboardProps> = ({
               <Tooltip text="Configure size, font, and colors of the output">
                   <button onClick={openObsView} className="flex items-center gap-2 px-4 py-1.5 hover:bg-white text-xs font-bold text-stone-600 rounded-lg transition-all shadow-sm"><Layout size={16} /> Output</button>
               </Tooltip>
+
+              {/* CEA-708 SDI Status */}
+              {cea708Enabled && (
+                  <Tooltip text="CEA-708 CC output is active. Captions are being forwarded to SDI bridge.">
+                      <div className="flex items-center gap-1.5 px-3 py-1.5 bg-green-50 text-green-700 rounded-lg border border-green-200 text-xs font-bold">
+                          <Captions size={14} />
+                          <span>CC</span>
+                          <div className="w-1.5 h-1.5 rounded-full bg-green-500 animate-pulse" />
+                      </div>
+                  </Tooltip>
+              )}
            </div>
            
            <Tooltip text="Pauses the recording (Stop) or Finishes the session completely.">
