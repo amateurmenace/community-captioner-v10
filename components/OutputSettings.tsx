@@ -1,7 +1,7 @@
 
 import React, { useState, useRef, useEffect } from 'react';
-import { X, Layout, Cast, Check, Move, Type, Tv, Copy, RefreshCw, Trash2, Signal, AlertTriangle } from 'lucide-react';
-import { OverlaySettings } from '../types';
+import { X, Layout, Cast, Check, Move, Type, Tv, Copy, RefreshCw, Trash2, Signal, AlertTriangle, Monitor, Play, Square } from 'lucide-react';
+import { OverlaySettings, DeckLinkDevice, DeckLinkStatus } from '../types';
 
 interface Cea708Status {
   endpoint: string;
@@ -31,6 +31,16 @@ const OutputSettings: React.FC<OutputSettingsProps> = ({ settings, setSettings, 
   const [cea708Status, setCea708Status] = useState<Cea708Status | null>(null);
   const [copied, setCopied] = useState(false);
 
+  // DeckLink direct mode state (Electron only)
+  const hasDeckLink = !!(window as any).decklink?.available;
+  const [dlDevices, setDlDevices] = useState<DeckLinkDevice[]>([]);
+  const [dlSelectedDevice, setDlSelectedDevice] = useState<number>(0);
+  const [dlSelectedInputDevice, setDlSelectedInputDevice] = useState<number>(0);
+  const [dlSelectedMode, setDlSelectedMode] = useState<number>(0);
+  const [dlOutputMode, setDlOutputMode] = useState<'standalone' | 'passthrough'>('standalone');
+  const [dlStatus, setDlStatus] = useState<DeckLinkStatus | null>(null);
+  const [dlStarting, setDlStarting] = useState(false);
+
   // Drag Logic
   const handleMouseDown = (e: React.MouseEvent) => {
     setIsDragging(true);
@@ -59,9 +69,49 @@ const OutputSettings: React.FC<OutputSettingsProps> = ({ settings, setSettings, 
     return () => window.removeEventListener('mouseup', handleMouseUp);
   }, []);
 
-  // Poll CEA-708 status when SDI tab is active
+  // Enumerate DeckLink devices when SDI tab opens (Electron only)
   useEffect(() => {
-    if (outputMode !== 'sdi_cea708') return;
+    if (outputMode !== 'sdi_cea708' || !hasDeckLink) return;
+
+    const enumerate = async () => {
+        try {
+            const devices = await (window as any).decklink.enumerateDevices();
+            setDlDevices(devices);
+            // Default to first output device
+            const firstOutput = devices.find((d: DeckLinkDevice) => d.hasOutput);
+            if (firstOutput) {
+                setDlSelectedDevice(firstOutput.index);
+                if (firstOutput.displayModes?.length > 0) {
+                    setDlSelectedMode(firstOutput.displayModes[0].mode);
+                }
+            }
+            const firstInput = devices.find((d: DeckLinkDevice) => d.hasInput);
+            if (firstInput) setDlSelectedInputDevice(firstInput.index);
+        } catch(e) {
+            console.warn('DeckLink enumerate failed', e);
+        }
+    };
+    enumerate();
+  }, [outputMode, hasDeckLink]);
+
+  // Poll DeckLink status when running
+  useEffect(() => {
+    if (outputMode !== 'sdi_cea708' || !hasDeckLink) return;
+
+    const pollStatus = async () => {
+        try {
+            const status = await (window as any).decklink.getStatus();
+            setDlStatus(status);
+        } catch(e) {}
+    };
+    pollStatus();
+    const interval = setInterval(pollStatus, 1000);
+    return () => clearInterval(interval);
+  }, [outputMode, hasDeckLink]);
+
+  // Poll CEA-708 bridge status when SDI tab is active (web mode fallback)
+  useEffect(() => {
+    if (outputMode !== 'sdi_cea708' || hasDeckLink) return;
 
     const fetchStatus = async () => {
         try {
@@ -132,9 +182,193 @@ const OutputSettings: React.FC<OutputSettingsProps> = ({ settings, setSettings, 
                 </div>
             </div>
 
-            {outputMode === 'sdi_cea708' && (
+            {outputMode === 'sdi_cea708' && hasDeckLink && (
                 <>
-                    {/* CEA-708 Enable Toggle */}
+                    {/* Direct DeckLink Mode (Electron) */}
+                    <div>
+                        <label className="text-xs font-bold text-stone-400 uppercase tracking-wider mb-4 block">DeckLink Device</label>
+                        {dlDevices.length > 0 ? (
+                            <select
+                                value={dlSelectedDevice}
+                                onChange={e => {
+                                    const idx = Number(e.target.value);
+                                    setDlSelectedDevice(idx);
+                                    const dev = dlDevices.find(d => d.index === idx);
+                                    if (dev?.displayModes?.length) setDlSelectedMode(dev.displayModes[0].mode);
+                                }}
+                                className="w-full bg-stone-50 border border-stone-200 rounded-lg p-3 text-sm font-bold"
+                            >
+                                {dlDevices.filter(d => d.hasOutput).map(d => (
+                                    <option key={d.index} value={d.index}>{d.name}</option>
+                                ))}
+                            </select>
+                        ) : (
+                            <div className="p-4 bg-amber-50 border border-amber-200 rounded-lg">
+                                <p className="text-sm font-bold text-amber-700">No DeckLink Devices Found</p>
+                                <p className="text-xs text-amber-600 mt-1">Install Blackmagic Desktop Video drivers and connect a DeckLink card.</p>
+                            </div>
+                        )}
+                    </div>
+
+                    {dlDevices.length > 0 && (
+                        <>
+                            {/* Output Mode */}
+                            <div>
+                                <label className="text-xs font-bold text-stone-400 uppercase tracking-wider mb-4 block">Mode</label>
+                                <div className="grid grid-cols-2 gap-2">
+                                    <button
+                                        onClick={() => setDlOutputMode('standalone')}
+                                        className={`p-3 rounded-lg border text-xs font-bold text-left ${dlOutputMode === 'standalone' ? 'border-sage-500 bg-sage-50 text-forest-dark' : 'border-stone-200 text-stone-500'}`}
+                                    >
+                                        <Monitor size={14} className="mb-1" />
+                                        Standalone
+                                        <p className="text-[10px] font-normal opacity-60 mt-0.5">Black + CC</p>
+                                    </button>
+                                    <button
+                                        onClick={() => setDlOutputMode('passthrough')}
+                                        className={`p-3 rounded-lg border text-xs font-bold text-left ${dlOutputMode === 'passthrough' ? 'border-sage-500 bg-sage-50 text-forest-dark' : 'border-stone-200 text-stone-500'}`}
+                                    >
+                                        <Signal size={14} className="mb-1" />
+                                        Pass-Through
+                                        <p className="text-[10px] font-normal opacity-60 mt-0.5">SDI In + CC Out</p>
+                                    </button>
+                                </div>
+                            </div>
+
+                            {/* Input Device (pass-through only) */}
+                            {dlOutputMode === 'passthrough' && (
+                                <div>
+                                    <label className="text-xs font-bold text-stone-400 uppercase tracking-wider mb-4 block">SDI Input Device</label>
+                                    <select
+                                        value={dlSelectedInputDevice}
+                                        onChange={e => setDlSelectedInputDevice(Number(e.target.value))}
+                                        className="w-full bg-stone-50 border border-stone-200 rounded-lg p-3 text-sm"
+                                    >
+                                        {dlDevices.filter(d => d.hasInput).map(d => (
+                                            <option key={d.index} value={d.index}>{d.name}</option>
+                                        ))}
+                                    </select>
+                                </div>
+                            )}
+
+                            {/* Display Mode */}
+                            <div>
+                                <label className="text-xs font-bold text-stone-400 uppercase tracking-wider mb-4 block">Display Mode</label>
+                                <select
+                                    value={dlSelectedMode}
+                                    onChange={e => setDlSelectedMode(Number(e.target.value))}
+                                    className="w-full bg-stone-50 border border-stone-200 rounded-lg p-3 text-sm"
+                                >
+                                    {(dlDevices.find(d => d.index === dlSelectedDevice)?.displayModes || []).map(m => (
+                                        <option key={m.mode} value={m.mode}>
+                                            {m.name} ({m.width}x{m.height} @ {m.fps.toFixed(2)}fps)
+                                        </option>
+                                    ))}
+                                </select>
+                            </div>
+
+                            {/* Status */}
+                            {dlStatus && dlStatus.running && (
+                                <div>
+                                    <label className="text-xs font-bold text-stone-400 uppercase tracking-wider mb-4 block">Output Status</label>
+                                    <div className="bg-green-50 p-4 rounded-lg border border-green-200">
+                                        <div className="flex items-center gap-2 mb-2">
+                                            <Signal size={14} className="text-green-600 animate-pulse" />
+                                            <span className="text-sm font-bold text-green-700">
+                                                {dlStatus.mode === 'passthrough' ? 'Pass-Through Active' : 'Standalone Output Active'}
+                                            </span>
+                                        </div>
+                                        <div className="grid grid-cols-2 gap-2 mt-2">
+                                            <div className="text-xs text-stone-500">
+                                                <span className="font-bold">{dlStatus.framesOutput.toLocaleString()}</span> frames
+                                            </div>
+                                            <div className="text-xs text-stone-500">
+                                                <span className="font-bold text-red-500">{dlStatus.droppedFrames}</span> dropped
+                                            </div>
+                                        </div>
+                                    </div>
+                                </div>
+                            )}
+
+                            {/* Controls */}
+                            <div>
+                                <label className="text-xs font-bold text-stone-400 uppercase tracking-wider mb-4 block">Controls</label>
+                                <div className="space-y-2">
+                                    <button
+                                        onClick={async () => {
+                                            if (dlStatus?.running) {
+                                                await (window as any).decklink.stop();
+                                                setCea708Enabled(false);
+                                            } else {
+                                                setDlStarting(true);
+                                                try {
+                                                    const selectedDev = dlDevices.find(d => d.index === dlSelectedDevice);
+                                                    const mode = selectedDev?.displayModes?.find(m => m.mode === dlSelectedMode);
+                                                    const fpsStr = mode ? String(mode.fps.toFixed(2)) : '29.97';
+
+                                                    let ok = false;
+                                                    if (dlOutputMode === 'passthrough') {
+                                                        ok = await (window as any).decklink.startPassthrough({
+                                                            inputDevice: dlSelectedInputDevice,
+                                                            outputDevice: dlSelectedDevice,
+                                                            displayMode: dlSelectedMode,
+                                                            frameRate: fpsStr
+                                                        });
+                                                    } else {
+                                                        ok = await (window as any).decklink.startOutput({
+                                                            deviceIndex: dlSelectedDevice,
+                                                            displayMode: dlSelectedMode,
+                                                            frameRate: fpsStr
+                                                        });
+                                                    }
+                                                    if (ok) setCea708Enabled(true);
+                                                } catch(e) {
+                                                    console.error('DeckLink start failed', e);
+                                                }
+                                                setDlStarting(false);
+                                            }
+                                        }}
+                                        disabled={dlStarting}
+                                        className={`w-full p-3 rounded-lg font-bold text-sm flex items-center justify-center gap-2 transition-all ${
+                                            dlStatus?.running
+                                                ? 'bg-red-500 hover:bg-red-600 text-white'
+                                                : 'bg-forest-dark hover:bg-forest-light text-white'
+                                        } disabled:opacity-50`}
+                                    >
+                                        {dlStarting ? (
+                                            <><RefreshCw size={14} className="animate-spin" /> Starting...</>
+                                        ) : dlStatus?.running ? (
+                                            <><Square size={14} /> Stop Output</>
+                                        ) : (
+                                            <><Play size={14} /> Start Output</>
+                                        )}
+                                    </button>
+                                    <button
+                                        onClick={() => (window as any).decklink.clearCaptions()}
+                                        disabled={!dlStatus?.running}
+                                        className="w-full p-3 rounded-lg border border-stone-200 text-sm font-bold text-stone-600 hover:bg-red-50 hover:border-red-200 hover:text-red-600 transition-all disabled:opacity-40 disabled:cursor-not-allowed flex items-center justify-center gap-2"
+                                    >
+                                        <Trash2 size={14} /> Clear Captions
+                                    </button>
+                                </div>
+                            </div>
+                        </>
+                    )}
+
+                    {/* Info */}
+                    <div className="bg-stone-50 p-4 rounded-lg border border-stone-200">
+                        <p className="text-xs font-bold text-stone-600 mb-2">Direct DeckLink Output</p>
+                        <p className="text-[11px] text-stone-500">CEA-608 Roll-Up 2 encoded in-app and embedded as CEA-708 CDP in SDI VANC data via DeckLink SDK.</p>
+                        <div className="mt-3 pt-3 border-t border-stone-200">
+                            <p className="text-[10px] text-stone-400">ASCII only (0x20-0x7E) | ~60 chars/sec at 29.97fps</p>
+                        </div>
+                    </div>
+                </>
+            )}
+
+            {outputMode === 'sdi_cea708' && !hasDeckLink && (
+                <>
+                    {/* Web Mode: External Bridge UI */}
                     <div>
                         <label className="text-xs font-bold text-stone-400 uppercase tracking-wider mb-4 block">CEA-708 Closed Captions</label>
                         <div className="flex items-center justify-between bg-stone-50 p-4 rounded-lg border border-stone-200">
@@ -154,7 +388,6 @@ const OutputSettings: React.FC<OutputSettingsProps> = ({ settings, setSettings, 
                         </div>
                     </div>
 
-                    {/* Connection Status */}
                     <div>
                         <label className="text-xs font-bold text-stone-400 uppercase tracking-wider mb-4 block">Bridge Status</label>
                         <div className={`p-4 rounded-lg border ${cea708Status && cea708Status.connectedBridges > 0 ? 'bg-green-50 border-green-200' : 'bg-amber-50 border-amber-200'}`}>
@@ -181,23 +414,16 @@ const OutputSettings: React.FC<OutputSettingsProps> = ({ settings, setSettings, 
                         </div>
                     </div>
 
-                    {/* WebSocket URL */}
                     <div>
                         <label className="text-xs font-bold text-stone-400 uppercase tracking-wider mb-4 block">Bridge WebSocket URL</label>
                         <div className="space-y-2">
                             {cea708Status && (
                                 <>
                                     <div className="flex items-center gap-2">
-                                        <input
-                                            type="text"
-                                            readOnly
-                                            value={cea708Status.networkEndpoint}
-                                            className="flex-1 bg-stone-900 text-green-400 text-xs font-mono p-3 rounded-lg border-none"
-                                        />
-                                        <button
-                                            onClick={() => handleCopyUrl(cea708Status.networkEndpoint)}
-                                            className="p-3 bg-stone-100 rounded-lg hover:bg-stone-200 transition-colors"
-                                        >
+                                        <input type="text" readOnly value={cea708Status.networkEndpoint}
+                                            className="flex-1 bg-stone-900 text-green-400 text-xs font-mono p-3 rounded-lg border-none" />
+                                        <button onClick={() => handleCopyUrl(cea708Status.networkEndpoint)}
+                                            className="p-3 bg-stone-100 rounded-lg hover:bg-stone-200 transition-colors">
                                             {copied ? <Check size={14} className="text-green-500" /> : <Copy size={14} className="text-stone-500" />}
                                         </button>
                                     </div>
@@ -206,29 +432,18 @@ const OutputSettings: React.FC<OutputSettingsProps> = ({ settings, setSettings, 
                                     </p>
                                 </>
                             )}
-                            {!cea708Status && (
-                                <div className="flex items-center gap-2 text-stone-400 text-xs">
-                                    <RefreshCw size={12} className="animate-spin" />
-                                    <span>Fetching endpoint...</span>
-                                </div>
-                            )}
                         </div>
                     </div>
 
-                    {/* Clear Captions */}
                     <div>
                         <label className="text-xs font-bold text-stone-400 uppercase tracking-wider mb-4 block">Controls</label>
-                        <button
-                            onClick={onCea708Clear}
+                        <button onClick={onCea708Clear}
                             disabled={!cea708Enabled || !cea708Status || cea708Status.connectedBridges === 0}
-                            className="w-full p-3 rounded-lg border border-stone-200 text-sm font-bold text-stone-600 hover:bg-red-50 hover:border-red-200 hover:text-red-600 transition-all disabled:opacity-40 disabled:cursor-not-allowed flex items-center justify-center gap-2"
-                        >
-                            <Trash2 size={14} />
-                            Clear SDI Captions
+                            className="w-full p-3 rounded-lg border border-stone-200 text-sm font-bold text-stone-600 hover:bg-red-50 hover:border-red-200 hover:text-red-600 transition-all disabled:opacity-40 disabled:cursor-not-allowed flex items-center justify-center gap-2">
+                            <Trash2 size={14} /> Clear SDI Captions
                         </button>
                     </div>
 
-                    {/* Info Box */}
                     <div className="bg-stone-50 p-4 rounded-lg border border-stone-200">
                         <p className="text-xs font-bold text-stone-600 mb-2">How It Works</p>
                         <ol className="text-[11px] text-stone-500 space-y-1.5 list-decimal list-inside">

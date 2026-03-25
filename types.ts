@@ -120,6 +120,45 @@ export interface AppState {
   cea708Enabled: boolean;
 }
 
+// DeckLink native integration (available when running in Electron with addon)
+export interface DeckLinkDevice {
+    name: string;
+    index: number;
+    hasInput: boolean;
+    hasOutput: boolean;
+    displayModes?: DeckLinkDisplayMode[];
+}
+
+export interface DeckLinkDisplayMode {
+    name: string;
+    mode: number;
+    width: number;
+    height: number;
+    fps: number;
+}
+
+export interface DeckLinkStatus {
+    running: boolean;
+    mode: 'standalone' | 'passthrough' | 'stopped';
+    framesOutput: number;
+    droppedFrames: number;
+}
+
+// Declare window.decklink (injected by Electron preload)
+declare global {
+    interface Window {
+        decklink?: {
+            available: boolean;
+            enumerateDevices: () => Promise<DeckLinkDevice[]>;
+            startOutput: (opts: { deviceIndex: number; displayMode: number; frameRate?: string }) => Promise<boolean>;
+            startPassthrough: (opts: { inputDevice: number; outputDevice: number; displayMode: number; frameRate?: string }) => Promise<boolean>;
+            stop: () => Promise<void>;
+            getStatus: () => Promise<DeckLinkStatus>;
+            clearCaptions: () => Promise<void>;
+        };
+    }
+}
+
 export enum ProcessingStatus {
   IDLE = 'idle',
   PROCESSING = 'processing',
