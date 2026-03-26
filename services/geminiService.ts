@@ -68,40 +68,73 @@ export const transcribeFile = async (base64Data: string, mimeType: string, apiKe
 };
 
 /**
- * Simulates a scraping of municipal websites.
+ * Uses Gemini + Google Search grounding to find REAL, verified URLs for a municipality.
+ * Google Search grounding means Gemini actually searches the web and returns real results.
  */
 export const searchMunicipalitySources = async (municipality: string, apiKey?: string) => {
     try {
         const ai = getClient(apiKey);
-        const response = await ai.models.generateContent({
-            model: "gemini-3-flash-preview",
-            contents: `The user wants to find public documents for ${municipality} to build a speech-to-text context engine.
-            Act as a web scraper. Generate a list of realistic URLs and Document Titles that would exist on the ${municipality} municipal website.
-            
-            CRITICAL: For each item, include a 'snippet' field containing 2-3 sentences of realistic text content that might be found in that document (containing proper nouns, names, or local places).
 
-            Include 3 PDFs (agendas/minutes), 1 HTML page (About Us/Elected Officials), and 1 Video link.
-            
-            Return a JSON array.`,
+        // Use Google Search grounding to find real URLs
+        const response = await ai.models.generateContent({
+            model: "gemini-2.5-flash",
+            contents: `Find the official municipal website for "${municipality}" and list the most useful pages for learning proper nouns (elected officials, department staff, boards/commissions, meeting agendas/minutes).
+
+For each page found, provide the title, full URL, a category, and why it's useful for live captioning.`,
             config: {
-                responseMimeType: "application/json",
-                responseSchema: {
-                    type: Type.ARRAY,
-                    items: {
-                        type: Type.OBJECT,
-                        properties: {
-                            title: { type: Type.STRING },
-                            url: { type: Type.STRING },
-                            type: { type: Type.STRING, enum: ['PDF', 'Video', 'Web', 'Scraped Data'] },
-                            date: { type: Type.STRING },
-                            snippet: { type: Type.STRING, description: "A preview of the text content found at this source" }
-                        }
-                    }
-                }
-            }
+                tools: [{ googleSearch: {} }],
+            },
         });
-        return response.text ? JSON.parse(response.text) : [];
+
+        const text = response.text || '';
+
+        // Extract grounding sources from the response metadata — these are verified real URLs
+        const groundingChunks = (response as any).candidates?.[0]?.groundingMetadata?.groundingChunks || [];
+        const groundedUrls: {title: string, url: string, type: string, why: string}[] = [];
+        const seenUrls = new Set<string>();
+
+        for (const chunk of groundingChunks) {
+            const url = chunk?.web?.uri;
+            const title = chunk?.web?.title;
+            if (url && title && !seenUrls.has(url)) {
+                seenUrls.add(url);
+                // Categorize by URL/title patterns
+                const lower = (url + ' ' + title).toLowerCase();
+                let type = 'General';
+                if (/official|elected|mayor|council|select.*board|government|board.*alderm/i.test(lower)) type = 'Officials';
+                else if (/meeting|agenda|minute|calendar/i.test(lower)) type = 'Meetings';
+                else if (/department|staff|directory|contact/i.test(lower)) type = 'Departments';
+                else if (/commission|committee|board|advisory/i.test(lower)) type = 'Committees';
+
+                groundedUrls.push({ title, url, type, why: `Found via Google Search for ${municipality}` });
+            }
+        }
+
+        // If grounding returned URLs, use those (they're verified real) — cap at 8
+        if (groundedUrls.length > 0) {
+            return groundedUrls.slice(0, 8);
+        }
+
+        // Fallback: try to parse URLs from the response text
+        const urlRegex = /https?:\/\/[^\s)<>"]+/g;
+        const matches = text.match(urlRegex) || [];
+        const fallbackUrls: {title: string, url: string, type: string, why: string}[] = [];
+        for (const url of matches) {
+            const cleanUrl = url.replace(/[.,;:!?)]+$/, ''); // strip trailing punctuation
+            if (!seenUrls.has(cleanUrl)) {
+                seenUrls.add(cleanUrl);
+                fallbackUrls.push({
+                    title: cleanUrl.split('/').pop()?.replace(/-/g, ' ') || 'Web Page',
+                    url: cleanUrl,
+                    type: 'General',
+                    why: 'Extracted from search results',
+                });
+            }
+        }
+
+        return fallbackUrls.slice(0, 8);
     } catch (e) {
+        console.error('[Wizard] Search failed:', e);
         return [];
     }
 };
