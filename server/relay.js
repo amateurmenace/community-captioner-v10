@@ -52,7 +52,11 @@ function getLocalIp() {
 const localIP = getLocalIp();
 
 // Point to the Vite build output (dist)
-const distPath = path.join(__dirname, '../dist');
+// In pkg builds, dist/ is next to the executable, not relative to __dirname
+const baseDir = typeof process.pkg !== 'undefined'
+  ? path.dirname(process.execPath)
+  : path.join(__dirname, '..');
+const distPath = process.env.DIST_PATH || path.join(baseDir, 'dist');
 const indexHtmlPath = path.join(distPath, 'index.html');
 
 // Trust proxies (Required for Cloud Run / Heroku / Load Balancers)
@@ -172,7 +176,7 @@ let captionMetrics = {
 
 // Load Gemini API key from .env.local if available
 try {
-    const envPath = path.join(__dirname, '../.env.local');
+    const envPath = path.join(baseDir, '.env.local');
     if (fs.existsSync(envPath)) {
         const envContent = fs.readFileSync(envPath, 'utf-8');
         const match = envContent.match(/GEMINI_API_KEY=(.+)/);
@@ -206,7 +210,14 @@ try {
     decklink = require('../native/decklink/build/Release/decklink_addon.node');
     console.log('[DeckLink] Native addon loaded in relay server');
 } catch (e) {
-    console.warn('[DeckLink] Native addon not available:', e.message);
+    // Fallback: look for addon next to the executable (standalone builds)
+    try {
+        const addonPath = path.join(path.dirname(process.execPath), 'decklink_addon.node');
+        decklink = require(addonPath);
+        console.log('[DeckLink] Native addon loaded from', addonPath);
+    } catch (e2) {
+        console.warn('[DeckLink] Native addon not available:', e.message);
+    }
 }
 
 async function initCaptionEncoder() {

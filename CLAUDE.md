@@ -8,7 +8,68 @@ AI-powered live captioning platform for community media. Bridges professional br
 npm run dev              # Vite (5173+) + Relay (8080) concurrent
 npm run build:native     # Compile C++ DeckLink/NDI addon
 npm run dist             # Full Electron build (dmg/exe/AppImage)
+npm run build:mac        # Standalone macOS .app (double-click launch)
+npm run build:windows    # Standalone Windows .exe (double-click launch)
+npm run build:app        # Build for current platform
 ```
+
+## Standalone Desktop Builds
+
+`scripts/build-app.js` produces lightweight standalone apps that bundle Node.js + the server + frontend into a single double-clickable package. No Node.js installation required on the target machine.
+
+### Build Commands
+
+- `npm run build:mac` → `build/Community Captioner.app` (~56 MB)
+- `npm run build:windows` → `build/CommunityCaptioner.exe` (~51 MB)
+- `npm run build:app` → builds for whichever platform you're on
+- `npm run build:app -- --platform all` → builds both
+
+### How It Works
+
+1. `vite build` → `dist/` (frontend)
+2. `esbuild` bundles `server/relay.js` + all deps → `server.cjs`
+3. `@yao-pkg/pkg` wraps Node.js + server + frontend into a single binary
+4. (Mac) wraps binary in a `.app` bundle with `dist/` in `Resources/`
+5. (Windows) `dist/` is embedded in the `.exe` via pkg snapshot
+
+On launch: starts relay server on port 8080, opens system browser automatically.
+
+### DeckLink Native Addon on Windows
+
+**The DeckLink addon MUST be compiled on the target platform.** It cannot be cross-compiled from Mac to Windows. To build a Windows `.exe` with DeckLink support:
+
+1. **Must be done on a Windows machine** with:
+   - [DeckLink Desktop Video](https://www.blackmagicdesign.com/support/) installed (includes SDK)
+   - [Node.js 20+](https://nodejs.org/)
+   - [Visual Studio Build Tools](https://visualstudio.microsoft.com/visual-cpp-build-tools/) with C++ workload
+   - NDI SDK (if NDI passthrough is needed)
+
+2. Clone the repo on Windows and run:
+   ```bash
+   npm install
+   npm run build:native    # compiles decklink_addon.node for Windows
+   npm run build:windows   # builds the standalone .exe
+   ```
+
+3. The build script should be updated to automatically include `native/decklink/build/Release/decklink_addon.node` in the `.exe` if it exists.
+
+4. **Fallback**: If the addon wasn't compiled at build time, you can place a Windows-compiled `decklink_addon.node` next to `CommunityCaptioner.exe` and the server will load it from there (see fallback in `relay.js` line ~210).
+
+### macOS .app Bundle Structure
+```
+Community Captioner.app/
+  Contents/
+    Info.plist
+    MacOS/CommunityCaptioner  (pkg binary)
+    Resources/dist/           (frontend assets)
+```
+
+### Important Notes
+
+- Each build wipes intermediate files but preserves other platform outputs in `build/`
+- The `DIST_PATH` env var tells the server where to find frontend assets (set automatically by the launcher)
+- Browser globals (`DOMMatrix`, `ImageData`, `Path2D`) are polyfilled in the launcher for pdf-parse compatibility
+- The `@napi-rs/canvas` warning on startup is harmless (optional dep for PDF rendering)
 
 ## Architecture
 
