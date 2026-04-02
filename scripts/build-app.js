@@ -257,8 +257,26 @@ function buildMacApp(binaryPath, version) {
   // Info.plist
   fs.writeFileSync(path.join(contentsDir, 'Info.plist'), createInfoPlist(version));
 
-  // Move binary into MacOS/
-  fs.renameSync(binaryPath, path.join(macosDir, 'CommunityCaptioner'));
+  // Move the pkg binary into MacOS/ as the actual server process
+  fs.renameSync(binaryPath, path.join(macosDir, 'CommunityCaptioner-bin'));
+  fs.chmodSync(path.join(macosDir, 'CommunityCaptioner-bin'), 0o755);
+
+  // Write a shell script that opens Terminal.app running the binary.
+  // This ensures the user sees server logs when double-clicking the .app.
+  const launchScript = `#!/bin/bash
+DIR="$(cd "$(dirname "$0")" && pwd)"
+BIN="$DIR/CommunityCaptioner-bin"
+osascript - "$BIN" <<'END_SCRIPT'
+on run argv
+  set binPath to item 1 of argv
+  tell application "Terminal"
+    activate
+    do script "clear; exec " & quoted form of binPath
+  end tell
+end run
+END_SCRIPT
+`;
+  fs.writeFileSync(path.join(macosDir, 'CommunityCaptioner'), launchScript);
   fs.chmodSync(path.join(macosDir, 'CommunityCaptioner'), 0o755);
 
   // Copy dist/ into Resources/
