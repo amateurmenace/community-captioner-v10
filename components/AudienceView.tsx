@@ -41,6 +41,7 @@ const AudienceView: React.FC<AudienceViewProps> = ({ onBack }) => {
     const [darkMode, setDarkMode] = useState(() => localStorage.getItem('cc_audience_dark') !== 'false');
     const [fontSize, setFontSize] = useState<FontSize>(() => (localStorage.getItem('cc_audience_font') as FontSize) || 'large');
     const [isFullscreen, setIsFullscreen] = useState(false);
+    const [translationAvailable, setTranslationAvailable] = useState<boolean | null>(null); // null = loading
     const scrollRef = useRef<HTMLDivElement>(null);
     const wsRef = useRef<WebSocket | null>(null);
 
@@ -48,6 +49,22 @@ const AudienceView: React.FC<AudienceViewProps> = ({ onBack }) => {
     useEffect(() => { localStorage.setItem('cc_audience_lang', lang); }, [lang]);
     useEffect(() => { localStorage.setItem('cc_audience_dark', String(darkMode)); }, [darkMode]);
     useEffect(() => { localStorage.setItem('cc_audience_font', fontSize); }, [fontSize]);
+
+    // Check if translation is available (Gemini API key set on server)
+    useEffect(() => {
+        const getApiBase = () => {
+            const protocol = window.location.protocol;
+            const host = window.location.hostname;
+            const port = window.location.port;
+            if (port === '5173') return `${protocol}//${host}:8080`;
+            const portSuffix = port ? `:${port}` : '';
+            return `${protocol}//${host}${portSuffix}`;
+        };
+        fetch(`${getApiBase()}/api/polisher/status`)
+            .then(r => r.json())
+            .then(data => setTranslationAvailable(!!data.geminiKeySet))
+            .catch(() => setTranslationAvailable(false));
+    }, []);
 
     // WebSocket connection with reconnect
     useEffect(() => {
@@ -199,17 +216,26 @@ const AudienceView: React.FC<AudienceViewProps> = ({ onBack }) => {
             {/* Language Picker Bar */}
             {showLangPicker && (
                 <div className={`${borderColor} border-b ${darkMode ? 'bg-stone-800/80' : 'bg-stone-50'} backdrop-blur`}>
+                    {translationAvailable === false && (
+                        <div className={`mx-3 mt-3 p-2.5 rounded-lg text-xs ${darkMode ? 'bg-amber-900/40 text-amber-300 border border-amber-700/50' : 'bg-amber-50 text-amber-700 border border-amber-200'}`}>
+                            Translation requires a Gemini API key. The broadcaster can set one in <strong>Context Engine &rarr; Settings</strong>.
+                            <a href="https://aistudio.google.com/apikey" target="_blank" rel="noopener noreferrer" className="underline ml-1">Get a free key</a>
+                        </div>
+                    )}
                     <div className="flex gap-1.5 overflow-x-auto p-3 scrollbar-hide">
                         {LANGUAGES.map(l => (
                             <button
                                 key={l.code}
                                 onClick={() => changeLanguage(l.code)}
+                                disabled={l.code !== 'en' && translationAvailable === false}
                                 className={`flex items-center gap-1.5 px-3 py-1.5 rounded-full text-sm font-medium whitespace-nowrap shrink-0 transition-all ${
                                     lang === l.code
                                         ? 'bg-blue-600 text-white shadow-md'
-                                        : darkMode
-                                            ? 'bg-stone-700 text-stone-300 hover:bg-stone-600'
-                                            : 'bg-white text-stone-600 hover:bg-stone-100 border border-stone-200'
+                                        : l.code !== 'en' && translationAvailable === false
+                                            ? darkMode ? 'bg-stone-800 text-stone-600 cursor-not-allowed' : 'bg-stone-100 text-stone-400 cursor-not-allowed border border-stone-200'
+                                            : darkMode
+                                                ? 'bg-stone-700 text-stone-300 hover:bg-stone-600'
+                                                : 'bg-white text-stone-600 hover:bg-stone-100 border border-stone-200'
                                 }`}
                             >
                                 <span>{l.flag}</span>
@@ -221,7 +247,7 @@ const AudienceView: React.FC<AudienceViewProps> = ({ onBack }) => {
             )}
 
             {/* Translation indicator */}
-            {lang !== 'en' && (
+            {lang !== 'en' && translationAvailable && (
                 <div className="bg-blue-600/10 border-b border-blue-600/20 px-4 py-1.5 text-center">
                     <span className="text-blue-400 text-xs font-medium">Translating to {currentLang?.name} {currentLang?.flag}</span>
                 </div>

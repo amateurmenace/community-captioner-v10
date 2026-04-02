@@ -173,21 +173,32 @@ let captionMetrics = {
     startTime: Date.now(),
 };
 
-// Load Gemini API key from .env.local if available
-try {
-    const envPath = path.join(baseDir, '.env.local');
-    if (fs.existsSync(envPath)) {
-        const envContent = fs.readFileSync(envPath, 'utf-8');
-        const match = envContent.match(/GEMINI_API_KEY=(.+)/);
-        if (match && match[1] && match[1] !== 'PLACEHOLDER_API_KEY') {
-            const key = match[1].trim();
-            setPolisherApiKey(key);
-            setLearnerApiKey(key);
-            setTranslationApiKey(key);
-            console.log('[Config] Gemini API key loaded from .env.local');
-        }
+// Load Gemini API key — check env var, .env.local, then built-in default
+function loadGeminiApiKey() {
+    // 1. Environment variable (highest priority)
+    if (process.env.GEMINI_API_KEY && process.env.GEMINI_API_KEY !== 'PLACEHOLDER_API_KEY') {
+        return process.env.GEMINI_API_KEY.trim();
     }
-} catch (e) {}
+    // 2. .env.local file
+    try {
+        const envPath = path.join(baseDir, '.env.local');
+        if (fs.existsSync(envPath)) {
+            const envContent = fs.readFileSync(envPath, 'utf-8');
+            const match = envContent.match(/GEMINI_API_KEY=(.+)/);
+            if (match && match[1] && match[1] !== 'PLACEHOLDER_API_KEY') {
+                return match[1].trim();
+            }
+        }
+    } catch (e) {}
+    // 3. Built-in default key (bundled for out-of-box translation support)
+    return 'AIzaSyBfhLU81pK-sKfqhZ4CMcK9UNV2Bi9u7BI';
+}
+
+const geminiKey = loadGeminiApiKey();
+setPolisherApiKey(geminiKey);
+setLearnerApiKey(geminiKey);
+setTranslationApiKey(geminiKey);
+console.log('[Config] Gemini API key loaded');
 
 // Profanity word list (word-boundary matched — won't hit "assemble", "class", etc.)
 const PROFANITY_WORDS = [
