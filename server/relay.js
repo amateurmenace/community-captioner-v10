@@ -1390,7 +1390,11 @@ server.on('listening', async () => {
 
           // Start the tunnel
           const tunnelUrl = await new Promise((resolve, reject) => {
-              const child = spawn(cloudflaredBin, ['tunnel', '--url', `http://localhost:${PORT}`, '--no-autoupdate']);
+              // --config with empty file prevents cloudflared from loading ~/.cloudflared/config.yml
+              // which may contain named tunnel routes that override the --url flag
+              const emptyConfigPath = path.join(cloudflaredDir, 'empty-config.yml');
+              if (!fs.existsSync(emptyConfigPath)) fs.writeFileSync(emptyConfigPath, '# empty config for quick tunnel\n');
+              const child = spawn(cloudflaredBin, ['tunnel', '--url', `http://localhost:${PORT}`, '--no-autoupdate', '--config', emptyConfigPath]);
               let resolved = false;
 
               const timeout = setTimeout(() => {
