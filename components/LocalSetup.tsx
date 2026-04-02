@@ -186,6 +186,27 @@ if __name__ == "__main__":
                         <ArrowLeft size={14} /> Cancel Setup
                     </button>
                     
+                    {/* Desktop download prompt for cloud users */}
+                    <div className="mb-6 p-4 bg-amber-50 border border-amber-200 rounded-xl flex items-start gap-3">
+                        <Download size={20} className="text-amber-600 mt-0.5 shrink-0" />
+                        <div className="flex-1">
+                            <p className="text-sm font-bold text-amber-800">Best with the Desktop App</p>
+                            <p className="text-xs text-amber-700 mt-1">Local captioning works best when run natively. Download the desktop app for the full local experience with DeckLink SDI output.</p>
+                            <div className="flex gap-2 mt-3">
+                                <a href="https://github.com/amateurmenace/community-captioner-v10/releases/latest/download/Community.Captioner-6.1.0-arm64.dmg"
+                                   target="_blank" rel="noopener noreferrer"
+                                   className="px-3 py-1.5 rounded-lg bg-forest-dark text-white text-xs font-bold hover:bg-forest-light transition-all flex items-center gap-1.5">
+                                    <Command size={12} /> macOS
+                                </a>
+                                <a href="https://github.com/amateurmenace/community-captioner-v10/releases/latest/download/CommuntiCaptioner.exe"
+                                   target="_blank" rel="noopener noreferrer"
+                                   className="px-3 py-1.5 rounded-lg bg-forest-dark text-white text-xs font-bold hover:bg-forest-light transition-all flex items-center gap-1.5">
+                                    <Monitor size={12} /> Windows
+                                </a>
+                            </div>
+                        </div>
+                    </div>
+
                     <div className="flex flex-col md:flex-row justify-between items-start md:items-end mb-8 gap-4">
                         <div>
                             <h1 className="text-3xl font-display font-bold text-forest-dark mb-2">Local Privacy Stack</h1>

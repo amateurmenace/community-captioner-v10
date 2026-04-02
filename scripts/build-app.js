@@ -135,21 +135,32 @@ console.log('');
 // Start server
 require('./server.cjs');
 
-// Open browser after server has time to bind
-setTimeout(() => {
-  const plat = process.platform;
-  let cmd;
-  if (plat === 'win32') {
-    cmd = 'start "" "' + url + '"';
-  } else if (plat === 'darwin') {
-    cmd = 'open "' + url + '"';
-  } else {
-    cmd = 'xdg-open "' + url + '"';
-  }
-  exec(cmd, (err) => {
-    if (err) console.log('Could not open browser automatically. Visit ' + url);
+// Open browser once server is actually listening (poll until ready)
+const http = require('http');
+let opened = false;
+function tryOpen() {
+  if (opened) return;
+  const req = http.get(url, (res) => {
+    if (!opened) {
+      opened = true;
+      const plat = process.platform;
+      let cmd;
+      if (plat === 'win32') {
+        cmd = 'start "" "' + url + '"';
+      } else if (plat === 'darwin') {
+        cmd = 'open "' + url + '"';
+      } else {
+        cmd = 'xdg-open "' + url + '"';
+      }
+      exec(cmd, (err) => {
+        if (err) console.log('Could not open browser automatically. Visit ' + url);
+      });
+    }
   });
-}, 1500);
+  req.on('error', () => { setTimeout(tryOpen, 500); });
+  req.setTimeout(2000, () => { req.destroy(); setTimeout(tryOpen, 500); });
+}
+setTimeout(tryOpen, 300);
 
 // Graceful shutdown
 function shutdown() {
@@ -247,6 +258,7 @@ async function main() {
 import 'multer';
 import 'pdf-parse';
 import '@google/genai';
+import 'cloudflared';
 import '../server/relay.js';
 `);
 

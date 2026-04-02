@@ -5,7 +5,7 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 import fs from 'fs';
 import os from 'os';
-import localtunnel from 'localtunnel';
+import { install as installCloudflared } from 'cloudflared';
 import { spawn } from 'child_process';
 import { polish, localPolish, summarize, truncateAtWord, setApiKey as setPolisherApiKey, toggleGemini as togglePolisherGemini, getStatus as getPolisherStatus } from './caption-polisher.js';
 import { feedText as learnerFeedText, setApiKey as setLearnerApiKey, setEnabled as setLearnerEnabled, getSuggestions, acceptSuggestion, dismissSuggestion, setDictionary as setLearnerDictionary, getDictionary as getLearnerDictionary, extractDictionary, generateMishearings, getStatus as getLearnerStatus } from './context-learner.js';
@@ -27,7 +27,6 @@ const server = createServer(app);
 const PORT = process.env.PORT || 8080;
 let publicTunnelUrl = null;
 let backupTunnelUrl = null;
-let tunnelPassword = null;
 
 // Utility to find Local IP
 function getLocalIp() {
@@ -366,14 +365,16 @@ function feedCaptionToEncoder(captionData) {
 
 // --- DeckLink REST API ---
 app.get('/api/decklink/devices', (req, res) => {
+    // isDesktopApp = running from standalone exe/app (not a cloud deploy)
+    const isDesktopApp = !!process.env.DIST_PATH || typeof process.pkg !== 'undefined';
     if (!decklink) {
-        return res.json({ available: false, devices: [], error: 'DeckLink addon not loaded' });
+        return res.json({ available: false, isDesktopApp, devices: [], error: 'DeckLink addon not loaded. Place decklink_addon.node next to the executable.' });
     }
     try {
         const raw = decklink.enumerateDevices();
-        res.json({ available: true, devices: raw });
+        res.json({ available: true, isDesktopApp, devices: raw });
     } catch (e) {
-        res.json({ available: false, devices: [], error: e.message });
+        res.json({ available: false, isDesktopApp, devices: [], error: e.message });
     }
 });
 
@@ -1061,7 +1062,6 @@ app.get('/api/audience-url', (req, res) => {
         url: `${resolvedUrl}/?view=audience&session=demo`,
         localUrl: `http://${localIP}:${PORT}/?view=audience&session=demo`,
         backupUrl: backupTunnelUrl ? `${backupTunnelUrl}/?view=audience&session=demo` : null,
-        tunnelPassword: tunnelPassword,
         audienceCount: getAudienceCount(),
     });
 });
@@ -1341,6 +1341,9 @@ server.on('error', (e) => {
 server.listen(PORT, '0.0.0.0', async () => {
   const isProd = process.env.NODE_ENV === 'production';
 
+  // Signal to launcher that server is ready to accept connections
+  console.log(`__SERVER_READY__ http://localhost:${PORT}`);
+
   console.log('\n' + '\x1b[32m%s\x1b[0m', '='.repeat(50));
   console.log('\x1b[32m%s\x1b[0m', `🚀 Server started successfully!`);
   console.log('\x1b[32m%s\x1b[0m', '='.repeat(50));
@@ -1348,37 +1351,70 @@ server.listen(PORT, '0.0.0.0', async () => {
   console.log(`📍 Network: \x1b[36mhttp://${localIP}:${PORT}\x1b[0m`);
   console.log(`📍 CEA-708: \x1b[36mws://${localIP}:${PORT}/cea708\x1b[0m (SDI Bridge Endpoint)`);
   
-  // CLOUD FIX: Only run localtunnel if NOT in production cloud environment
-  if (!isProd) {
-      // 1. Primary Tunnel (LocalTunnel)
+  // Skip tunnels ONLY on real cloud hosts (Cloud Run, Heroku, Railway, etc.)
+  // Standalone .exe and local dev both need tunnels for audience phone access
+  const isCloudHost = !!(process.env.K_SERVICE || process.env.DYNO || process.env.RAILWAY_ENVIRONMENT || process.env.RENDER);
+  if (!isCloudHost) {
+      // 1. Primary Tunnel (Cloudflare Quick Tunnel — no password, no interstitial)
       try {
-          console.log("\n[Dev] Initializing Primary Tunnel...");
-          // FIX: Explicitly bind to 127.0.0.1 to avoid 503s on some networks
-          const tunnel = await localtunnel({ port: PORT, local_host: '127.0.0.1' });
-          publicTunnelUrl = tunnel.url;
-          console.log(`📍 Primary: \x1b[35m${publicTunnelUrl}\x1b[0m`);
+          console.log("\n🌐 Initializing Cloudflare Tunnel...");
 
-          // Fetch Password for LocalTunnel
-          try {
-              const response = await fetch('https://api.ipify.org?format=json');
-              const data = await response.json();
-              tunnelPassword = data.ip;
-              console.log(`   └─ Password: \x1b[33m${data.ip}\x1b[0m (If asked)`);
-          } catch(e) {}
+          // Determine binary path — use a persistent location outside node_modules
+          const cloudflaredDir = path.join(os.homedir(), '.community-captioner');
+          const cloudflaredBin = path.join(cloudflaredDir, process.platform === 'win32' ? 'cloudflared.exe' : 'cloudflared');
+
+          // Download cloudflared binary if not already present
+          if (!fs.existsSync(cloudflaredBin)) {
+              fs.mkdirSync(cloudflaredDir, { recursive: true });
+              console.log("   Downloading cloudflared binary (one-time)...");
+              await installCloudflared(cloudflaredBin);
+          }
+
+          // Start the tunnel
+          const tunnelUrl = await new Promise((resolve, reject) => {
+              const child = spawn(cloudflaredBin, ['tunnel', '--url', `http://localhost:${PORT}`, '--no-autoupdate']);
+              let resolved = false;
+
+              const timeout = setTimeout(() => {
+                  if (!resolved) { resolved = true; reject(new Error('Tunnel startup timed out (30s)')); }
+              }, 30000);
+
+              const handleOutput = (data) => {
+                  const text = data.toString();
+                  const urlMatch = text.match(/https:\/\/[^\s]+\.trycloudflare\.com/);
+                  if (urlMatch && !resolved) {
+                      resolved = true;
+                      clearTimeout(timeout);
+                      resolve(urlMatch[0]);
+                  }
+              };
+
+              child.stdout.on('data', handleOutput);
+              child.stderr.on('data', handleOutput);
+              child.on('error', (err) => { if (!resolved) { resolved = true; clearTimeout(timeout); reject(err); } });
+
+              // Cleanup on exit
+              const cleanup = () => { try { child.kill(); } catch(e){} };
+              process.on('exit', cleanup);
+              process.on('SIGINT', () => { cleanup(); process.exit(); });
+          });
+
+          publicTunnelUrl = tunnelUrl;
+          console.log(`📍 Public:  \x1b[35m${publicTunnelUrl}\x1b[0m (No password needed)`);
 
       } catch (err) {
-          console.warn("[Dev] Primary tunnel failed:", err.message);
+          console.warn("[Tunnel] Cloudflare tunnel failed:", err.message);
       }
 
-      // 2. Backup Tunnel (SSH to localhost.run) - No password required, usually more stable
+      // 2. Backup Tunnel (SSH to localhost.run) - No password required
       try {
-          console.log("\n[Dev] Initializing Backup Tunnel (localhost.run)...");
+          console.log("\n🌐 Initializing Backup Tunnel (localhost.run)...");
           const ssh = spawn('ssh', [
-              '-R', `80:localhost:${PORT}`, 
+              '-R', `80:localhost:${PORT}`,
               'nokey@localhost.run',
               '-o', 'StrictHostKeyChecking=no' // Prevent interactive prompt
           ]);
-          
+
           const handleOutput = (data) => {
               const text = data.toString();
               // localhost.run outputs "Connect to your tunnel at https://..."
@@ -1386,7 +1422,6 @@ server.listen(PORT, '0.0.0.0', async () => {
               if (urlMatch) {
                    backupTunnelUrl = urlMatch[0];
                    console.log(`📍 Backup:  \x1b[36m${backupTunnelUrl}\x1b[0m (No password needed)`);
-                   console.log(`   └─ Use this if Primary fails (503 error)`);
               }
           };
 
@@ -1397,13 +1432,10 @@ server.listen(PORT, '0.0.0.0', async () => {
           const cleanup = () => { try { ssh.kill(); } catch(e){} };
           process.on('exit', cleanup);
           process.on('SIGINT', () => { cleanup(); process.exit(); });
-          
+
       } catch (e) {
-          console.log("   (Backup tunnel skipped: SSH not found)");
+          console.log("   (Backup tunnel skipped: SSH not available)");
       }
-      
-      console.log(`\n⚠️  NOTE: You are running in 'production preview' mode.`);
-      console.log(`   For hot-reloading development, use: \x1b[33mnpm run dev\x1b[0m`);
   }
   
   console.log(`\n(Press Ctrl+C to stop)`);

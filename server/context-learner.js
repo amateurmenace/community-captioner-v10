@@ -19,7 +19,13 @@ import { fileURLToPath } from 'url';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
-const DATA_DIR = join(__dirname, '..', '.data');
+
+// In pkg builds, __dirname is inside a read-only snapshot.
+// Use the directory next to the executable for writable data.
+const BASE_DIR = typeof process.pkg !== 'undefined'
+  ? dirname(process.execPath)
+  : join(__dirname, '..');
+const DATA_DIR = join(BASE_DIR, '.data');
 const DICTIONARY_FILE = join(DATA_DIR, 'dictionary.json');
 
 let geminiApiKey = null;

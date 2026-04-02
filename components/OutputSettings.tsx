@@ -31,15 +31,21 @@ const OutputSettings: React.FC<OutputSettingsProps> = ({ settings, setSettings, 
   const [cea708Status, setCea708Status] = useState<Cea708Status | null>(null);
   const [copied, setCopied] = useState(false);
 
-  // DeckLink direct mode state (Electron only)
-  const hasDeckLink = !!(window as any).decklink?.available;
+  // DeckLink state — works via Electron IPC or REST API
+  const hasElectronDeckLink = !!(window as any).decklink?.available;
+  const [hasDeckLink, setHasDeckLink] = useState(hasElectronDeckLink);
+  const [isDesktopApp, setIsDesktopApp] = useState(false);
+  const [addonError, setAddonError] = useState<string | null>(null);
   const [dlDevices, setDlDevices] = useState<DeckLinkDevice[]>([]);
   const [dlSelectedDevice, setDlSelectedDevice] = useState<number>(0);
   const [dlSelectedInputDevice, setDlSelectedInputDevice] = useState<number>(0);
   const [dlSelectedMode, setDlSelectedMode] = useState<number>(0);
-  const [dlOutputMode, setDlOutputMode] = useState<'standalone' | 'passthrough'>('standalone');
+  const [dlOutputMode, setDlOutputMode] = useState<'standalone' | 'passthrough' | 'ndi_passthrough'>('standalone');
   const [dlStatus, setDlStatus] = useState<DeckLinkStatus | null>(null);
   const [dlStarting, setDlStarting] = useState(false);
+  const [ndiSources, setNdiSources] = useState<{name: string; url: string}[]>([]);
+  const [selectedNdiSource, setSelectedNdiSource] = useState<string>('');
+  const [ndiScanning, setNdiScanning] = useState(false);
 
   // Drag Logic
   const handleMouseDown = (e: React.MouseEvent) => {
@@ -69,15 +75,54 @@ const OutputSettings: React.FC<OutputSettingsProps> = ({ settings, setSettings, 
     return () => window.removeEventListener('mouseup', handleMouseUp);
   }, []);
 
-  // Enumerate DeckLink devices when SDI tab opens (Electron only)
+  // Helper: get relay base URL
+  const getRelayUrl = () => {
+    const port = window.location.port || (window.location.protocol === 'https:' ? '443' : '80');
+    const p = parseInt(port);
+    const relayPort = (p >= 5173 && p <= 5199) ? '8080' : port;
+    return `${window.location.protocol}//${window.location.hostname}:${relayPort}`;
+  };
+
+  // Check if DeckLink is available (Electron IPC or REST API)
+  useEffect(() => {
+    if (outputMode !== 'sdi_cea708') return;
+    if (hasElectronDeckLink) { setHasDeckLink(true); setIsDesktopApp(true); return; }
+
+    // Check via REST API
+    const check = async () => {
+      try {
+        const res = await fetch(`${getRelayUrl()}/api/decklink/devices`);
+        if (res.ok) {
+          const data = await res.json();
+          if (data.isDesktopApp) setIsDesktopApp(true);
+          if (data.available) {
+            setHasDeckLink(true);
+            setAddonError(null);
+          } else if (data.isDesktopApp) {
+            // We're in the desktop app but addon didn't load
+            setAddonError(data.error || 'DeckLink addon not loaded');
+          }
+        }
+      } catch(e) {}
+    };
+    check();
+  }, [outputMode]);
+
+  // Enumerate DeckLink devices when SDI tab opens
   useEffect(() => {
     if (outputMode !== 'sdi_cea708' || !hasDeckLink) return;
 
     const enumerate = async () => {
         try {
-            const devices = await (window as any).decklink.enumerateDevices();
+            let devices: DeckLinkDevice[];
+            if (hasElectronDeckLink) {
+                devices = await (window as any).decklink.enumerateDevices();
+            } else {
+                const res = await fetch(`${getRelayUrl()}/api/decklink/devices`);
+                const data = await res.json();
+                devices = data.devices || [];
+            }
             setDlDevices(devices);
-            // Default to first output device
             const firstOutput = devices.find((d: DeckLinkDevice) => d.hasOutput);
             if (firstOutput) {
                 setDlSelectedDevice(firstOutput.index);
@@ -94,13 +139,19 @@ const OutputSettings: React.FC<OutputSettingsProps> = ({ settings, setSettings, 
     enumerate();
   }, [outputMode, hasDeckLink]);
 
-  // Poll DeckLink status when running
+  // Poll DeckLink status
   useEffect(() => {
     if (outputMode !== 'sdi_cea708' || !hasDeckLink) return;
 
     const pollStatus = async () => {
         try {
-            const status = await (window as any).decklink.getStatus();
+            let status: DeckLinkStatus;
+            if (hasElectronDeckLink) {
+                status = await (window as any).decklink.getStatus();
+            } else {
+                const res = await fetch(`${getRelayUrl()}/api/decklink/status`);
+                status = await res.json();
+            }
             setDlStatus(status);
         } catch(e) {}
     };
@@ -109,15 +160,36 @@ const OutputSettings: React.FC<OutputSettingsProps> = ({ settings, setSettings, 
     return () => clearInterval(interval);
   }, [outputMode, hasDeckLink]);
 
-  // Poll CEA-708 bridge status when SDI tab is active (web mode fallback)
+  // Scan NDI sources
+  const scanNdiSources = async () => {
+    setNdiScanning(true);
+    try {
+      const res = await fetch(`${getRelayUrl()}/api/ndi/sources`);
+      const data = await res.json();
+      setNdiSources(data.sources || []);
+      if (data.sources?.length > 0 && !selectedNdiSource) {
+        setSelectedNdiSource(data.sources[0].name);
+      }
+    } catch(e) {
+      console.warn('NDI scan failed', e);
+    }
+    setNdiScanning(false);
+  };
+
+  // Auto-scan NDI sources when NDI mode selected
+  useEffect(() => {
+    if (outputMode === 'sdi_cea708' && dlOutputMode === 'ndi_passthrough' && hasDeckLink) {
+      scanNdiSources();
+    }
+  }, [dlOutputMode, outputMode, hasDeckLink]);
+
+  // Poll CEA-708 bridge status (only if no DeckLink available — pure bridge mode)
   useEffect(() => {
     if (outputMode !== 'sdi_cea708' || hasDeckLink) return;
 
     const fetchStatus = async () => {
         try {
-            const port = window.location.port || (window.location.protocol === 'https:' ? '443' : '80');
-            const devPort = port === '5173' ? '8080' : port;
-            const res = await fetch(`${window.location.protocol}//${window.location.hostname}:${devPort}/api/cea708`);
+            const res = await fetch(`${getRelayUrl()}/api/cea708`);
             if (res.ok) {
                 const data = await res.json();
                 setCea708Status(data);
@@ -130,7 +202,7 @@ const OutputSettings: React.FC<OutputSettingsProps> = ({ settings, setSettings, 
     fetchStatus();
     const interval = setInterval(fetchStatus, 3000);
     return () => clearInterval(interval);
-  }, [outputMode]);
+  }, [outputMode, hasDeckLink]);
 
   const handleCopyUrl = (url: string) => {
     navigator.clipboard.writeText(url);
@@ -184,9 +256,9 @@ const OutputSettings: React.FC<OutputSettingsProps> = ({ settings, setSettings, 
 
             {outputMode === 'sdi_cea708' && hasDeckLink && (
                 <>
-                    {/* Direct DeckLink Mode (Electron) */}
+                    {/* DeckLink Output Device */}
                     <div>
-                        <label className="text-xs font-bold text-stone-400 uppercase tracking-wider mb-4 block">DeckLink Device</label>
+                        <label className="text-xs font-bold text-stone-400 uppercase tracking-wider mb-4 block">DeckLink Output</label>
                         {dlDevices.length > 0 ? (
                             <select
                                 value={dlSelectedDevice}
@@ -212,10 +284,10 @@ const OutputSettings: React.FC<OutputSettingsProps> = ({ settings, setSettings, 
 
                     {dlDevices.length > 0 && (
                         <>
-                            {/* Output Mode */}
+                            {/* Output Mode — 3 options */}
                             <div>
-                                <label className="text-xs font-bold text-stone-400 uppercase tracking-wider mb-4 block">Mode</label>
-                                <div className="grid grid-cols-2 gap-2">
+                                <label className="text-xs font-bold text-stone-400 uppercase tracking-wider mb-4 block">Video Source</label>
+                                <div className="grid grid-cols-3 gap-2">
                                     <button
                                         onClick={() => setDlOutputMode('standalone')}
                                         className={`p-3 rounded-lg border text-xs font-bold text-left ${dlOutputMode === 'standalone' ? 'border-sage-500 bg-sage-50 text-forest-dark' : 'border-stone-200 text-stone-500'}`}
@@ -229,13 +301,21 @@ const OutputSettings: React.FC<OutputSettingsProps> = ({ settings, setSettings, 
                                         className={`p-3 rounded-lg border text-xs font-bold text-left ${dlOutputMode === 'passthrough' ? 'border-sage-500 bg-sage-50 text-forest-dark' : 'border-stone-200 text-stone-500'}`}
                                     >
                                         <Signal size={14} className="mb-1" />
-                                        Pass-Through
-                                        <p className="text-[10px] font-normal opacity-60 mt-0.5">SDI In + CC Out</p>
+                                        SDI In
+                                        <p className="text-[10px] font-normal opacity-60 mt-0.5">Pass-Through</p>
+                                    </button>
+                                    <button
+                                        onClick={() => setDlOutputMode('ndi_passthrough')}
+                                        className={`p-3 rounded-lg border text-xs font-bold text-left ${dlOutputMode === 'ndi_passthrough' ? 'border-sage-500 bg-sage-50 text-forest-dark' : 'border-stone-200 text-stone-500'}`}
+                                    >
+                                        <Cast size={14} className="mb-1" />
+                                        NDI
+                                        <p className="text-[10px] font-normal opacity-60 mt-0.5">IP → SDI + CC</p>
                                     </button>
                                 </div>
                             </div>
 
-                            {/* Input Device (pass-through only) */}
+                            {/* SDI Input Device (pass-through only) */}
                             {dlOutputMode === 'passthrough' && (
                                 <div>
                                     <label className="text-xs font-bold text-stone-400 uppercase tracking-wider mb-4 block">SDI Input Device</label>
@@ -248,6 +328,38 @@ const OutputSettings: React.FC<OutputSettingsProps> = ({ settings, setSettings, 
                                             <option key={d.index} value={d.index}>{d.name}</option>
                                         ))}
                                     </select>
+                                </div>
+                            )}
+
+                            {/* NDI Source (NDI passthrough only) */}
+                            {dlOutputMode === 'ndi_passthrough' && (
+                                <div>
+                                    <label className="text-xs font-bold text-stone-400 uppercase tracking-wider mb-4 block">NDI Source</label>
+                                    <div className="space-y-2">
+                                        <div className="flex gap-2">
+                                            <select
+                                                value={selectedNdiSource}
+                                                onChange={e => setSelectedNdiSource(e.target.value)}
+                                                className="flex-1 bg-stone-50 border border-stone-200 rounded-lg p-3 text-sm"
+                                            >
+                                                {ndiSources.length === 0 && <option value="">No sources found</option>}
+                                                {ndiSources.map(s => (
+                                                    <option key={s.name} value={s.name}>{s.name}</option>
+                                                ))}
+                                            </select>
+                                            <button
+                                                onClick={scanNdiSources}
+                                                disabled={ndiScanning}
+                                                className="p-3 bg-stone-100 rounded-lg hover:bg-stone-200 transition-colors disabled:opacity-50"
+                                                title="Scan for NDI sources"
+                                            >
+                                                <RefreshCw size={14} className={`text-stone-600 ${ndiScanning ? 'animate-spin' : ''}`} />
+                                            </button>
+                                        </div>
+                                        {ndiSources.length === 0 && !ndiScanning && (
+                                            <p className="text-[10px] text-stone-400">No NDI sources on network. Click refresh to scan.</p>
+                                        )}
+                                    </div>
                                 </div>
                             )}
 
@@ -275,7 +387,9 @@ const OutputSettings: React.FC<OutputSettingsProps> = ({ settings, setSettings, 
                                         <div className="flex items-center gap-2 mb-2">
                                             <Signal size={14} className="text-green-600 animate-pulse" />
                                             <span className="text-sm font-bold text-green-700">
-                                                {dlStatus.mode === 'passthrough' ? 'Pass-Through Active' : 'Standalone Output Active'}
+                                                {dlStatus.mode === 'ndi_passthrough' ? 'NDI → SDI Active' :
+                                                 dlStatus.mode === 'passthrough' ? 'SDI Pass-Through Active' :
+                                                 'Standalone Output Active'}
                                             </span>
                                         </div>
                                         <div className="grid grid-cols-2 gap-2 mt-2">
@@ -286,6 +400,9 @@ const OutputSettings: React.FC<OutputSettingsProps> = ({ settings, setSettings, 
                                                 <span className="font-bold text-red-500">{dlStatus.droppedFrames}</span> dropped
                                             </div>
                                         </div>
+                                        {(dlStatus as any).ndiSource && (
+                                            <p className="text-[10px] text-stone-400 mt-2">Source: {(dlStatus as any).ndiSource}</p>
+                                        )}
                                     </div>
                                 </div>
                             )}
@@ -297,7 +414,12 @@ const OutputSettings: React.FC<OutputSettingsProps> = ({ settings, setSettings, 
                                     <button
                                         onClick={async () => {
                                             if (dlStatus?.running) {
-                                                await (window as any).decklink.stop();
+                                                // Stop
+                                                if (hasElectronDeckLink) {
+                                                    await (window as any).decklink.stop();
+                                                } else {
+                                                    await fetch(`${getRelayUrl()}/api/decklink/stop`, { method: 'POST' });
+                                                }
                                                 setCea708Enabled(false);
                                             } else {
                                                 setDlStarting(true);
@@ -307,19 +429,50 @@ const OutputSettings: React.FC<OutputSettingsProps> = ({ settings, setSettings, 
                                                     const fpsStr = mode ? String(mode.fps.toFixed(2)) : '29.97';
 
                                                     let ok = false;
-                                                    if (dlOutputMode === 'passthrough') {
-                                                        ok = await (window as any).decklink.startPassthrough({
-                                                            inputDevice: dlSelectedInputDevice,
-                                                            outputDevice: dlSelectedDevice,
-                                                            displayMode: dlSelectedMode,
-                                                            frameRate: fpsStr
-                                                        });
+
+                                                    if (hasElectronDeckLink) {
+                                                        // Electron IPC path
+                                                        if (dlOutputMode === 'passthrough') {
+                                                            ok = await (window as any).decklink.startPassthrough({
+                                                                inputDevice: dlSelectedInputDevice, outputDevice: dlSelectedDevice,
+                                                                displayMode: dlSelectedMode, frameRate: fpsStr
+                                                            });
+                                                        } else if (dlOutputMode === 'ndi_passthrough') {
+                                                            ok = await (window as any).decklink.startNdiPassthrough({
+                                                                ndiSource: selectedNdiSource, outputDevice: dlSelectedDevice,
+                                                                displayMode: dlSelectedMode, frameRate: fpsStr
+                                                            });
+                                                        } else {
+                                                            ok = await (window as any).decklink.startOutput({
+                                                                deviceIndex: dlSelectedDevice, displayMode: dlSelectedMode, frameRate: fpsStr
+                                                            });
+                                                        }
                                                     } else {
-                                                        ok = await (window as any).decklink.startOutput({
-                                                            deviceIndex: dlSelectedDevice,
-                                                            displayMode: dlSelectedMode,
-                                                            frameRate: fpsStr
+                                                        // REST API path
+                                                        let endpoint = '';
+                                                        let body: any = {};
+
+                                                        if (dlOutputMode === 'ndi_passthrough') {
+                                                            endpoint = '/api/ndi/start';
+                                                            body = { ndiSource: selectedNdiSource, outputDevice: dlSelectedDevice,
+                                                                     displayMode: dlSelectedMode, frameRate: fpsStr };
+                                                        } else if (dlOutputMode === 'passthrough') {
+                                                            endpoint = '/api/decklink/start';
+                                                            body = { mode: 'passthrough', inputDevice: dlSelectedInputDevice,
+                                                                     outputDevice: dlSelectedDevice, displayMode: dlSelectedMode, frameRate: fpsStr };
+                                                        } else {
+                                                            endpoint = '/api/decklink/start';
+                                                            body = { mode: 'standalone', deviceIndex: dlSelectedDevice,
+                                                                     displayMode: dlSelectedMode, frameRate: fpsStr };
+                                                        }
+
+                                                        const res = await fetch(`${getRelayUrl()}${endpoint}`, {
+                                                            method: 'POST',
+                                                            headers: { 'Content-Type': 'application/json' },
+                                                            body: JSON.stringify(body)
                                                         });
+                                                        const data = await res.json();
+                                                        ok = data.ok;
                                                     }
                                                     if (ok) setCea708Enabled(true);
                                                 } catch(e) {
@@ -328,7 +481,7 @@ const OutputSettings: React.FC<OutputSettingsProps> = ({ settings, setSettings, 
                                                 setDlStarting(false);
                                             }
                                         }}
-                                        disabled={dlStarting}
+                                        disabled={dlStarting || (dlOutputMode === 'ndi_passthrough' && !selectedNdiSource)}
                                         className={`w-full p-3 rounded-lg font-bold text-sm flex items-center justify-center gap-2 transition-all ${
                                             dlStatus?.running
                                                 ? 'bg-red-500 hover:bg-red-600 text-white'
@@ -344,7 +497,13 @@ const OutputSettings: React.FC<OutputSettingsProps> = ({ settings, setSettings, 
                                         )}
                                     </button>
                                     <button
-                                        onClick={() => (window as any).decklink.clearCaptions()}
+                                        onClick={async () => {
+                                            if (hasElectronDeckLink) {
+                                                (window as any).decklink.clearCaptions();
+                                            } else {
+                                                await fetch(`${getRelayUrl()}/api/decklink/clear`, { method: 'POST' });
+                                            }
+                                        }}
                                         disabled={!dlStatus?.running}
                                         className="w-full p-3 rounded-lg border border-stone-200 text-sm font-bold text-stone-600 hover:bg-red-50 hover:border-red-200 hover:text-red-600 transition-all disabled:opacity-40 disabled:cursor-not-allowed flex items-center justify-center gap-2"
                                     >
@@ -357,8 +516,14 @@ const OutputSettings: React.FC<OutputSettingsProps> = ({ settings, setSettings, 
 
                     {/* Info */}
                     <div className="bg-stone-50 p-4 rounded-lg border border-stone-200">
-                        <p className="text-xs font-bold text-stone-600 mb-2">Direct DeckLink Output</p>
-                        <p className="text-[11px] text-stone-500">CEA-608 Roll-Up 2 encoded in-app and embedded as CEA-708 CDP in SDI VANC data via DeckLink SDK.</p>
+                        <p className="text-xs font-bold text-stone-600 mb-2">
+                            {dlOutputMode === 'ndi_passthrough' ? 'NDI → SDI + Captions' : 'Direct DeckLink Output'}
+                        </p>
+                        <p className="text-[11px] text-stone-500">
+                            {dlOutputMode === 'ndi_passthrough'
+                                ? 'Receives NDI video, converts to SDI, and embeds CEA-708 captions in VANC. Audio is resampled to 48kHz.'
+                                : 'CEA-608 Roll-Up 2 encoded in-app and embedded as CEA-708 CDP in SDI VANC data via DeckLink SDK.'}
+                        </p>
                         <div className="mt-3 pt-3 border-t border-stone-200">
                             <p className="text-[10px] text-stone-400">ASCII only (0x20-0x7E) | ~60 chars/sec at 29.97fps</p>
                         </div>
@@ -366,94 +531,83 @@ const OutputSettings: React.FC<OutputSettingsProps> = ({ settings, setSettings, 
                 </>
             )}
 
-            {outputMode === 'sdi_cea708' && !hasDeckLink && (
+            {outputMode === 'sdi_cea708' && !hasDeckLink && isDesktopApp && (
                 <>
-                    {/* Web Mode: External Bridge UI */}
-                    <div>
-                        <label className="text-xs font-bold text-stone-400 uppercase tracking-wider mb-4 block">CEA-708 Closed Captions</label>
-                        <div className="flex items-center justify-between bg-stone-50 p-4 rounded-lg border border-stone-200">
-                            <div className="flex items-center gap-3">
-                                <Tv size={20} className={cea708Enabled ? 'text-green-600' : 'text-stone-400'} />
-                                <div>
-                                    <p className="text-sm font-bold text-stone-700">SDI Embedding</p>
-                                    <p className="text-xs text-stone-400">SMPTE 334 / CEA-708</p>
-                                </div>
+                    {/* Desktop app is running but native addon not loaded */}
+                    <div className="p-5 bg-amber-50 border border-amber-200 rounded-xl">
+                        <div className="flex items-start gap-3 mb-4">
+                            <Monitor size={24} className="text-amber-600 mt-0.5 shrink-0" />
+                            <div>
+                                <p className="text-sm font-bold text-amber-800">DeckLink Addon Not Found</p>
+                                <p className="text-xs text-amber-700 mt-1 leading-relaxed">
+                                    The native DeckLink addon (<code className="bg-amber-100 px-1 rounded">decklink_addon.node</code>) was not found.
+                                    It must be compiled on this machine and placed next to the executable.
+                                </p>
                             </div>
-                            <button
-                                onClick={() => setCea708Enabled(!cea708Enabled)}
-                                className={`relative w-12 h-6 rounded-full transition-colors ${cea708Enabled ? 'bg-green-500' : 'bg-stone-300'}`}
-                            >
-                                <div className={`absolute top-0.5 w-5 h-5 bg-white rounded-full shadow transition-transform ${cea708Enabled ? 'translate-x-6' : 'translate-x-0.5'}`} />
-                            </button>
+                        </div>
+                        {addonError && (
+                            <div className="bg-amber-100 rounded-lg p-3 mb-3">
+                                <p className="text-[11px] font-mono text-amber-800">{addonError}</p>
+                            </div>
+                        )}
+                        <div className="bg-white rounded-lg p-4 border border-amber-200">
+                            <p className="text-xs font-bold text-stone-700 mb-2">Setup Steps</p>
+                            <ol className="text-[11px] text-stone-600 space-y-1.5 list-decimal list-inside">
+                                <li>Install <a href="https://www.blackmagicdesign.com/support/" target="_blank" rel="noopener noreferrer" className="text-blue-600 underline">Blackmagic Desktop Video</a> drivers</li>
+                                <li>Install <a href="https://visualstudio.microsoft.com/visual-cpp-build-tools/" target="_blank" rel="noopener noreferrer" className="text-blue-600 underline">Visual Studio Build Tools</a> with C++ workload</li>
+                                <li>Clone the repo and run: <code className="bg-stone-100 px-1 rounded">npm run build:native</code></li>
+                                <li>Copy <code className="bg-stone-100 px-1 rounded">decklink_addon.node</code> next to the .exe</li>
+                                <li>Restart the application</li>
+                            </ol>
                         </div>
                     </div>
+                </>
+            )}
 
-                    <div>
-                        <label className="text-xs font-bold text-stone-400 uppercase tracking-wider mb-4 block">Bridge Status</label>
-                        <div className={`p-4 rounded-lg border ${cea708Status && cea708Status.connectedBridges > 0 ? 'bg-green-50 border-green-200' : 'bg-amber-50 border-amber-200'}`}>
-                            <div className="flex items-center gap-2 mb-2">
-                                {cea708Status && cea708Status.connectedBridges > 0 ? (
-                                    <>
-                                        <Signal size={14} className="text-green-600" />
-                                        <span className="text-sm font-bold text-green-700">
-                                            {cea708Status.connectedBridges} Bridge{cea708Status.connectedBridges !== 1 ? 's' : ''} Connected
-                                        </span>
-                                    </>
-                                ) : (
-                                    <>
-                                        <AlertTriangle size={14} className="text-amber-600" />
-                                        <span className="text-sm font-bold text-amber-700">Waiting for Bridge</span>
-                                    </>
-                                )}
+            {outputMode === 'sdi_cea708' && !hasDeckLink && !isDesktopApp && (
+                <>
+                    {/* Not running from desktop app at all */}
+                    <div className="p-5 bg-amber-50 border border-amber-200 rounded-xl">
+                        <div className="flex items-start gap-3 mb-4">
+                            <Monitor size={24} className="text-amber-600 mt-0.5 shrink-0" />
+                            <div>
+                                <p className="text-sm font-bold text-amber-800">Desktop App Required</p>
+                                <p className="text-xs text-amber-700 mt-1 leading-relaxed">
+                                    Embedded SDI captions require the desktop app with a Blackmagic DeckLink device.
+                                    The desktop app includes NDI receive, DeckLink SDI output, and CEA-708 caption embedding.
+                                </p>
                             </div>
-                            <p className="text-xs text-stone-500">
-                                {cea708Status && cea708Status.connectedBridges > 0
-                                    ? 'Captions are being forwarded to SDI output via VANC.'
-                                    : 'Connect the NDI-to-SDI Bridge to the WebSocket URL below.'}
-                            </p>
                         </div>
-                    </div>
-
-                    <div>
-                        <label className="text-xs font-bold text-stone-400 uppercase tracking-wider mb-4 block">Bridge WebSocket URL</label>
                         <div className="space-y-2">
-                            {cea708Status && (
-                                <>
-                                    <div className="flex items-center gap-2">
-                                        <input type="text" readOnly value={cea708Status.networkEndpoint}
-                                            className="flex-1 bg-stone-900 text-green-400 text-xs font-mono p-3 rounded-lg border-none" />
-                                        <button onClick={() => handleCopyUrl(cea708Status.networkEndpoint)}
-                                            className="p-3 bg-stone-100 rounded-lg hover:bg-stone-200 transition-colors">
-                                            {copied ? <Check size={14} className="text-green-500" /> : <Copy size={14} className="text-stone-500" />}
-                                        </button>
-                                    </div>
-                                    <p className="text-[10px] text-stone-400">
-                                        Localhost: <span className="font-mono">{cea708Status.localEndpoint}</span>
-                                    </p>
-                                </>
-                            )}
+                            <a href="https://github.com/amateurmenace/community-captioner-v10/releases/latest"
+                               target="_blank" rel="noopener noreferrer"
+                               className="w-full p-3 rounded-lg bg-forest-dark hover:bg-forest-light text-white text-sm font-bold flex items-center justify-center gap-2 transition-all">
+                                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+                                Download Desktop App
+                            </a>
+                            <div className="grid grid-cols-2 gap-2">
+                                <a href="https://github.com/amateurmenace/community-captioner-v10/releases/latest/download/Community.Captioner-6.1.0-arm64.dmg"
+                                   className="p-2 rounded-lg border border-stone-200 text-xs font-bold text-stone-600 hover:bg-stone-100 text-center transition-all">
+                                    macOS (Apple Silicon)
+                                </a>
+                                <a href="https://github.com/amateurmenace/community-captioner-v10/releases/latest/download/CommuntiCaptioner.exe"
+                                   className="p-2 rounded-lg border border-stone-200 text-xs font-bold text-stone-600 hover:bg-stone-100 text-center transition-all">
+                                    Windows (x64)
+                                </a>
+                            </div>
                         </div>
-                    </div>
-
-                    <div>
-                        <label className="text-xs font-bold text-stone-400 uppercase tracking-wider mb-4 block">Controls</label>
-                        <button onClick={onCea708Clear}
-                            disabled={!cea708Enabled || !cea708Status || cea708Status.connectedBridges === 0}
-                            className="w-full p-3 rounded-lg border border-stone-200 text-sm font-bold text-stone-600 hover:bg-red-50 hover:border-red-200 hover:text-red-600 transition-all disabled:opacity-40 disabled:cursor-not-allowed flex items-center justify-center gap-2">
-                            <Trash2 size={14} /> Clear SDI Captions
-                        </button>
                     </div>
 
                     <div className="bg-stone-50 p-4 rounded-lg border border-stone-200">
-                        <p className="text-xs font-bold text-stone-600 mb-2">How It Works</p>
-                        <ol className="text-[11px] text-stone-500 space-y-1.5 list-decimal list-inside">
-                            <li>Captions are sent to the bridge via WebSocket</li>
-                            <li>Bridge encodes as CEA-608 Roll-Up 2 mode</li>
-                            <li>Embedded as CEA-708 CDP in SDI VANC data</li>
-                            <li>Viewers toggle CC on their equipment</li>
-                        </ol>
+                        <p className="text-xs font-bold text-stone-600 mb-2">What You Get</p>
+                        <ul className="text-[11px] text-stone-500 space-y-1.5 list-disc list-inside">
+                            <li>NDI video receive with audio passthrough</li>
+                            <li>DeckLink SDI output with VANC caption embedding</li>
+                            <li>CEA-608 Roll-Up 2 / CEA-708 Service 1 encoding</li>
+                            <li>All cloud features (Context Engine, translation, etc.)</li>
+                        </ul>
                         <div className="mt-3 pt-3 border-t border-stone-200">
-                            <p className="text-[10px] text-stone-400">ASCII only (0x20-0x7E) | ~60 chars/sec at 29.97fps</p>
+                            <p className="text-[10px] text-stone-400">Requires Blackmagic DeckLink hardware + Desktop Video drivers</p>
                         </div>
                     </div>
                 </>
@@ -546,6 +700,26 @@ const OutputSettings: React.FC<OutputSettingsProps> = ({ settings, setSettings, 
                             </div>
                         </div>
                     </div>
+
+                    {/* Overlay Output URL */}
+                    <div>
+                        <label className="text-xs font-bold text-stone-400 uppercase tracking-wider mb-4 block">Overlay URL</label>
+                        <p className="text-[11px] text-stone-500 mb-2">Add this URL as a Browser Source in OBS/vMix/Wirecast:</p>
+                        <div className="flex items-center gap-2">
+                            <input type="text" readOnly
+                                value={`${window.location.protocol}//${window.location.hostname}:${(() => { const p = parseInt(window.location.port || '80'); return (p >= 5173 && p <= 5199) ? '8080' : window.location.port || '80'; })()}/?view=overlay&session=demo`}
+                                className="flex-1 bg-stone-900 text-green-400 text-xs font-mono p-3 rounded-lg border-none" />
+                            <button onClick={() => {
+                                const p = parseInt(window.location.port || '80');
+                                const relayPort = (p >= 5173 && p <= 5199) ? '8080' : (window.location.port || '80');
+                                navigator.clipboard.writeText(`${window.location.protocol}//${window.location.hostname}:${relayPort}/?view=overlay&session=demo`);
+                            }}
+                                className="p-3 bg-stone-100 rounded-lg hover:bg-stone-200 transition-colors">
+                                <Copy size={14} className="text-stone-500" />
+                            </button>
+                        </div>
+                        <p className="text-[10px] text-stone-400 mt-1">Transparent background, auto-sizes to your settings above.</p>
+                    </div>
                 </>
             )}
         </div>
@@ -561,20 +735,29 @@ const OutputSettings: React.FC<OutputSettingsProps> = ({ settings, setSettings, 
                             {/* Monitor header */}
                             <div className="flex items-center justify-between px-4 py-2 bg-stone-800/50">
                                 <div className="flex items-center gap-2">
-                                    <div className={`w-2 h-2 rounded-full ${cea708Enabled && cea708Status && cea708Status.connectedBridges > 0 ? 'bg-green-400 animate-pulse' : 'bg-stone-600'}`} />
-                                    <span className="text-[10px] font-mono text-stone-400">SDI OUTPUT</span>
+                                    <div className={`w-2 h-2 rounded-full ${dlStatus?.running ? 'bg-green-400 animate-pulse' : cea708Enabled ? 'bg-amber-400' : 'bg-stone-600'}`} />
+                                    <span className="text-[10px] font-mono text-stone-400">
+                                        {dlStatus?.running
+                                            ? dlStatus.mode === 'ndi_passthrough' ? 'NDI → SDI OUTPUT' : dlStatus.mode === 'passthrough' ? 'SDI PASSTHROUGH' : 'SDI OUTPUT'
+                                            : 'SDI OUTPUT'}
+                                    </span>
                                 </div>
                                 <div className="flex items-center gap-3">
+                                    {dlStatus?.running && (
+                                        <span className="text-[10px] font-mono text-stone-500">
+                                            {dlStatus.framesOutput.toLocaleString()} frames
+                                        </span>
+                                    )}
                                     <span className="text-[10px] font-mono text-stone-500">CEA-708</span>
-                                    <span className={`text-[10px] font-mono px-1.5 py-0.5 rounded ${cea708Enabled ? 'bg-green-900 text-green-300' : 'bg-stone-700 text-stone-400'}`}>
-                                        CC {cea708Enabled ? 'ON' : 'OFF'}
+                                    <span className={`text-[10px] font-mono px-1.5 py-0.5 rounded ${dlStatus?.running ? 'bg-green-900 text-green-300' : cea708Enabled ? 'bg-amber-900 text-amber-300' : 'bg-stone-700 text-stone-400'}`}>
+                                        CC {dlStatus?.running ? 'LIVE' : cea708Enabled ? 'ON' : 'OFF'}
                                     </span>
                                 </div>
                             </div>
 
                             {/* Video area with CC simulation */}
                             <div className="flex-1 flex items-end justify-center p-4 bg-gradient-to-t from-stone-900/80 to-transparent">
-                                {cea708Enabled && (
+                                {(cea708Enabled || dlStatus?.running) && (
                                     <div className="w-full max-w-lg">
                                         {/* Simulated CEA-608 Roll-Up 2 display */}
                                         <div className="bg-black/80 px-4 py-2 font-mono text-sm text-white">
@@ -595,14 +778,54 @@ const OutputSettings: React.FC<OutputSettingsProps> = ({ settings, setSettings, 
                         </div>
                     </div>
 
-                    {/* Signal flow diagram */}
+                    {/* Signal flow diagram — adapts to current mode */}
                     <div className="mt-6 flex items-center justify-center gap-3 text-xs text-stone-400">
-                        <div className="bg-white px-3 py-1.5 rounded border border-stone-200 text-stone-600 font-bold">Community Captioner</div>
-                        <div className="text-stone-300">--ws--&gt;</div>
-                        <div className="bg-white px-3 py-1.5 rounded border border-stone-200 text-stone-600 font-bold">NDI-to-SDI Bridge</div>
-                        <div className="text-stone-300">--VANC--&gt;</div>
-                        <div className="bg-white px-3 py-1.5 rounded border border-stone-200 text-stone-600 font-bold">DeckLink SDI</div>
+                        {dlOutputMode === 'ndi_passthrough' ? (
+                            <>
+                                <div className="bg-white px-3 py-1.5 rounded border border-stone-200 text-stone-600 font-bold">NDI Source</div>
+                                <div className="text-stone-300">→</div>
+                                <div className="bg-white px-3 py-1.5 rounded border border-sage-300 text-forest-dark font-bold">Community Captioner</div>
+                                <div className="text-stone-300">→ VANC →</div>
+                                <div className="bg-white px-3 py-1.5 rounded border border-stone-200 text-stone-600 font-bold">DeckLink SDI/HDMI</div>
+                            </>
+                        ) : dlOutputMode === 'passthrough' ? (
+                            <>
+                                <div className="bg-white px-3 py-1.5 rounded border border-stone-200 text-stone-600 font-bold">SDI Input</div>
+                                <div className="text-stone-300">→</div>
+                                <div className="bg-white px-3 py-1.5 rounded border border-sage-300 text-forest-dark font-bold">Community Captioner</div>
+                                <div className="text-stone-300">→ VANC →</div>
+                                <div className="bg-white px-3 py-1.5 rounded border border-stone-200 text-stone-600 font-bold">SDI Output</div>
+                            </>
+                        ) : (
+                            <>
+                                <div className="bg-white px-3 py-1.5 rounded border border-sage-300 text-forest-dark font-bold">Community Captioner</div>
+                                <div className="text-stone-300">→ VANC →</div>
+                                <div className="bg-white px-3 py-1.5 rounded border border-stone-200 text-stone-600 font-bold">DeckLink SDI/HDMI</div>
+                            </>
+                        )}
                     </div>
+
+                    {/* Live stats when running */}
+                    {dlStatus?.running && (
+                        <div className="mt-4 grid grid-cols-4 gap-3">
+                            <div className="bg-white p-3 rounded-lg border border-stone-200 text-center">
+                                <p className="text-lg font-bold text-forest-dark">{dlStatus.framesOutput.toLocaleString()}</p>
+                                <p className="text-[10px] text-stone-400 uppercase font-bold">Frames</p>
+                            </div>
+                            <div className="bg-white p-3 rounded-lg border border-stone-200 text-center">
+                                <p className={`text-lg font-bold ${dlStatus.droppedFrames > 0 ? 'text-red-500' : 'text-green-600'}`}>{dlStatus.droppedFrames}</p>
+                                <p className="text-[10px] text-stone-400 uppercase font-bold">Dropped</p>
+                            </div>
+                            <div className="bg-white p-3 rounded-lg border border-stone-200 text-center">
+                                <p className="text-lg font-bold text-stone-700">{dlStatus.mode === 'ndi_passthrough' ? 'NDI' : dlStatus.mode === 'passthrough' ? 'SDI' : 'BLK'}</p>
+                                <p className="text-[10px] text-stone-400 uppercase font-bold">Source</p>
+                            </div>
+                            <div className="bg-white p-3 rounded-lg border border-stone-200 text-center">
+                                <p className="text-lg font-bold text-stone-700">{dlStatus.frameRate || '29.97'}</p>
+                                <p className="text-[10px] text-stone-400 uppercase font-bold">FPS</p>
+                            </div>
+                        </div>
+                    )}
                 </div>
             ) : (
                 /* Existing Browser Overlay Preview */
@@ -666,19 +889,23 @@ const OutputSettings: React.FC<OutputSettingsProps> = ({ settings, setSettings, 
              )}
              {outputMode === 'sdi_cea708' && (
                  <div className="flex items-center gap-4">
-                     {cea708Status && cea708Status.connectedBridges > 0 && cea708Enabled && (
+                     {dlStatus?.running && (
                          <div className="flex items-center gap-2 text-green-600 text-sm font-bold">
                              <Signal size={16} className="animate-pulse" />
-                             Live
+                             {dlStatus.mode === 'ndi_passthrough' ? 'NDI → SDI Live' : dlStatus.mode === 'passthrough' ? 'SDI Live' : 'Output Live'}
+                             <span className="text-stone-400 font-normal">|</span>
+                             <span className="text-stone-500 font-normal">{dlStatus.framesOutput.toLocaleString()} frames</span>
                          </div>
                      )}
-                     <button
-                        onClick={() => setCea708Enabled(!cea708Enabled)}
-                        className={`px-8 py-3 rounded-xl font-bold transition-all shadow-lg flex items-center gap-2 ${cea708Enabled ? 'bg-red-500 hover:bg-red-600 text-white' : 'bg-forest-dark hover:bg-forest-light text-white'}`}
-                     >
-                         <Tv size={18} />
-                         {cea708Enabled ? 'Disable CC Output' : 'Enable CC Output'}
-                     </button>
+                     {!hasDeckLink && (
+                         <button
+                            onClick={() => setCea708Enabled(!cea708Enabled)}
+                            className={`px-8 py-3 rounded-xl font-bold transition-all shadow-lg flex items-center gap-2 ${cea708Enabled ? 'bg-red-500 hover:bg-red-600 text-white' : 'bg-forest-dark hover:bg-forest-light text-white'}`}
+                         >
+                             <Tv size={18} />
+                             {cea708Enabled ? 'Disable CC Output' : 'Enable CC Output'}
+                         </button>
+                     )}
                  </div>
              )}
       </div>

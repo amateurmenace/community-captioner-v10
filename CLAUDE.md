@@ -142,7 +142,7 @@ Audio → Gemini/Whisper/WebSpeech → Text
 | `/api/polisher/status` | GET | Polisher status (local enabled, Gemini enabled, key set) |
 | `/api/polisher/toggle` | POST | Toggle Gemini AI polishing on/off |
 | `/api/polisher/apikey` | POST | Set Gemini API key for summarization/polish/learning |
-| `/api/audience-url` | GET | Audience view URL, backup URL, tunnel password, viewer count |
+| `/api/audience-url` | GET | Audience view URL, backup URL, viewer count |
 | `/api/context/status` | GET | Auto-learn enabled state, API key presence |
 | `/api/context/enable` | POST | Toggle auto-learn on/off |
 | `/api/context/suggestions` | GET | Pending auto-learned suggestions |
@@ -322,7 +322,7 @@ Accessible at `/?view=audience&session=demo` or via QR code from Dashboard.
 
 **QR Code Modal** (Dashboard toolbar):
 - Local QR generation via `qrcode.react` (works offline)
-- Shows tunnel password for localtunnel access (user's public IP address)
+- Public URL via Cloudflare Quick Tunnel (no password, no interstitial)
 - Backup URL (localhost.run, no password needed)
 - Live audience viewer count
 
@@ -412,8 +412,8 @@ NDI sources may use non-48kHz sample rates (e.g., 44100Hz). The native addon res
 ### Port conflicts in dev mode
 `npm run dev` runs Vite and relay concurrently. The relay needs PORT=8080 (its default). If PORT env var is set to something else (e.g., by the preview tool), the relay lands on the wrong port and `getRelayUrl()` mapping breaks. Ensure PORT=8080 in the launch config (`.claude/launch.json`).
 
-### Tunnel password for audience phone view
-The localtunnel password is your machine's **public IP address**. It's displayed in the QR Code modal on the Dashboard. Users on phones need to enter this IP on the localtunnel interstitial page before they can view captions.
+### Public tunnel not connecting
+The app uses Cloudflare Quick Tunnels (trycloudflare.com) for public URL generation. On first run, it downloads the `cloudflared` binary to `~/.community-captioner/`. If the download fails (no internet, firewall), falls back to localhost.run SSH backup. Ensure outbound HTTPS and SSH are not blocked.
 
 ## Production Deployment Checklist
 
@@ -434,6 +434,7 @@ The localtunnel password is your machine's **public IP address**. It's displayed
 - **ATEM Mini Extreme ISO G2** (additional DeckLink device)
 - **NDI SDK** for IP video receive
 - `.env.local` contains `GEMINI_API_KEY` (also settable via UI)
+- `cloudflared` for Cloudflare Quick Tunnel (public URL, no password interstitial)
 - `qrcode.react` for offline QR code generation
 - `pdf-parse` for server-side PDF text extraction
 - `multer` for multipart file upload handling
