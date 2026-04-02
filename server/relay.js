@@ -24,7 +24,7 @@ app.use(express.json());
 const server = createServer(app);
 
 // CLOUD FIX: Use the environment variable PORT if available, otherwise default to 8080
-const PORT = process.env.PORT || 8080;
+let PORT = process.env.PORT || 8080;
 let publicTunnelUrl = null;
 let backupTunnelUrl = null;
 
@@ -1324,32 +1324,50 @@ server.on('upgrade', (request, socket, head) => {
     }
 });
 
-// Add error handling for port conflicts
+// Auto-retry on port conflict — try up to 10 ports so the app always launches
+let actualPort = parseInt(PORT);
+const maxRetries = 10;
+let retryCount = 0;
+
+function startServer() {
+  server.listen(actualPort, '0.0.0.0');
+}
+
 server.on('error', (e) => {
-  if (e.code === 'EADDRINUSE') {
+  if (e.code === 'EADDRINUSE' && retryCount < maxRetries) {
+    retryCount++;
+    actualPort++;
+    console.warn(`[Port] ${actualPort - 1} in use, trying ${actualPort}...`);
+    startServer();
+  } else if (e.code === 'EADDRINUSE') {
+    const msg = `Ports ${PORT}-${actualPort} are all in use. Close other applications using these ports and try again.`;
     console.error('\n\x1b[31m%s\x1b[0m', '-------------------------------------------------------');
-    console.error('\x1b[31m%s\x1b[0m', `❌ ERROR: Port ${PORT} is already in use.`);
-    console.error('\x1b[33m%s\x1b[0m', `👉 Action Required: Stop the other process or run:`);
-    console.error('\x1b[37m%s\x1b[0m', `   lsof -ti :${PORT} | xargs kill -9`);
+    console.error('\x1b[31m%s\x1b[0m', `❌ ERROR: ${msg}`);
     console.error('\x1b[31m%s\x1b[0m', '-------------------------------------------------------');
-    process.exit(1);
+    // Throw so the launcher's uncaughtException handler can show a native dialog
+    throw new Error(msg);
   } else {
     console.error('Server error:', e);
   }
 });
 
-server.listen(PORT, '0.0.0.0', async () => {
+server.on('listening', async () => {
   const isProd = process.env.NODE_ENV === 'production';
 
+  if (actualPort !== parseInt(PORT)) {
+    console.log(`\n⚠️  Port ${PORT} was busy — running on port ${actualPort} instead`);
+    PORT = actualPort; // Update so all API endpoints use the correct port
+  }
+
   // Signal to launcher that server is ready to accept connections
-  console.log(`__SERVER_READY__ http://localhost:${PORT}`);
+  console.log(`__SERVER_READY__ http://localhost:${actualPort}`);
 
   console.log('\n' + '\x1b[32m%s\x1b[0m', '='.repeat(50));
   console.log('\x1b[32m%s\x1b[0m', `🚀 Server started successfully!`);
   console.log('\x1b[32m%s\x1b[0m', '='.repeat(50));
-  console.log(`\n📍 Local:   \x1b[36mhttp://localhost:${PORT}\x1b[0m`);
-  console.log(`📍 Network: \x1b[36mhttp://${localIP}:${PORT}\x1b[0m`);
-  console.log(`📍 CEA-708: \x1b[36mws://${localIP}:${PORT}/cea708\x1b[0m (SDI Bridge Endpoint)`);
+  console.log(`\n📍 Local:   \x1b[36mhttp://localhost:${actualPort}\x1b[0m`);
+  console.log(`📍 Network: \x1b[36mhttp://${localIP}:${actualPort}\x1b[0m`);
+  console.log(`📍 CEA-708: \x1b[36mws://${localIP}:${actualPort}/cea708\x1b[0m (SDI Bridge Endpoint)`);
   
   // Skip tunnels ONLY on real cloud hosts (Cloud Run, Heroku, Railway, etc.)
   // Standalone .exe and local dev both need tunnels for audience phone access
@@ -1440,3 +1458,6 @@ server.listen(PORT, '0.0.0.0', async () => {
   
   console.log(`\n(Press Ctrl+C to stop)`);
 });
+
+// Kick off the server
+startServer();

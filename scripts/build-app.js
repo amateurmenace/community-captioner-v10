@@ -118,49 +118,83 @@ if (isPkg) {
 // Tell the bundled server where to find the frontend build
 process.env.DIST_PATH = path.join(baseDir, 'dist');
 
-const port = process.env.PORT;
-const url = 'http://localhost:' + port;
+// Show a native OS dialog (non-blocking, fire-and-forget)
+function showDialog(title, msg) {
+  const plat = process.platform;
+  if (plat === 'darwin') {
+    exec('osascript -e ' + JSON.stringify(
+      'display dialog ' + JSON.stringify(msg) + ' with title ' + JSON.stringify(title) + ' buttons {"OK"} default button "OK"'
+    ));
+  } else if (plat === 'win32') {
+    exec('mshta "javascript:var sh=new ActiveXObject(\\'WScript.Shell\\');sh.Popup(' + JSON.stringify(msg).replace(/"/g, '\\'') + ',0,' + JSON.stringify(title).replace(/"/g, '\\'') + ',64);close()"');
+  }
+}
+
+// Open a URL in the default browser
+function openBrowser(url) {
+  const plat = process.platform;
+  let cmd;
+  if (plat === 'win32') {
+    cmd = 'start "" "' + url + '"';
+  } else if (plat === 'darwin') {
+    cmd = 'open "' + url + '"';
+  } else {
+    cmd = 'xdg-open "' + url + '"';
+  }
+  exec(cmd, (err) => {
+    if (err) console.log('Could not open browser automatically. Visit ' + url);
+  });
+}
 
 // Banner
+const defaultUrl = 'http://localhost:' + process.env.PORT;
 console.log('');
 console.log('  ┌─────────────────────────────────────────┐');
 console.log('  │         Community Captioner              │');
 console.log('  │                                          │');
-console.log('  │  Local:   ' + url.padEnd(30) + '│');
-console.log('  │                                          │');
+console.log('  │  Starting server...                      │');
 console.log('  │  Press Ctrl+C to stop                    │');
 console.log('  └─────────────────────────────────────────┘');
 console.log('');
 
+// Intercept stdout to detect the server ready signal
+const origWrite = process.stdout.write.bind(process.stdout);
+let browserOpened = false;
+process.stdout.write = function(chunk, encoding, callback) {
+  const text = typeof chunk === 'string' ? chunk : chunk.toString();
+  // Server emits "__SERVER_READY__ http://localhost:XXXX" when listening
+  const match = text.match(/__SERVER_READY__\\s+(https?:\\/\\/[^\\s]+)/);
+  if (match && !browserOpened) {
+    browserOpened = true;
+    const serverUrl = match[1];
+    console.log('  Opening browser at ' + serverUrl);
+    openBrowser(serverUrl);
+    // Don't print the signal itself
+    return typeof callback === 'function' ? callback() : true;
+  }
+  return origWrite(chunk, encoding, callback);
+};
+
+// Catch fatal errors and show a dialog so the user knows what happened
+process.on('uncaughtException', (err) => {
+  const msg = err.message || String(err);
+  console.error('Fatal error:', msg);
+  showDialog('Community Captioner — Error', msg);
+  // Don't exit immediately so the dialog has time to show
+  setTimeout(() => process.exit(1), 5000);
+});
+
 // Start server
 require('./server.cjs');
 
-// Open browser once server is actually listening (poll until ready)
-const http = require('http');
-let opened = false;
-function tryOpen() {
-  if (opened) return;
-  const req = http.get(url, (res) => {
-    if (!opened) {
-      opened = true;
-      const plat = process.platform;
-      let cmd;
-      if (plat === 'win32') {
-        cmd = 'start "" "' + url + '"';
-      } else if (plat === 'darwin') {
-        cmd = 'open "' + url + '"';
-      } else {
-        cmd = 'xdg-open "' + url + '"';
-      }
-      exec(cmd, (err) => {
-        if (err) console.log('Could not open browser automatically. Visit ' + url);
-      });
-    }
-  });
-  req.on('error', () => { setTimeout(tryOpen, 500); });
-  req.setTimeout(2000, () => { req.destroy(); setTimeout(tryOpen, 500); });
-}
-setTimeout(tryOpen, 300);
+// Fallback: if no ready signal after 15s, try opening default URL anyway
+setTimeout(() => {
+  if (!browserOpened) {
+    browserOpened = true;
+    console.log('  (Ready signal not detected, opening default URL)');
+    openBrowser(defaultUrl);
+  }
+}, 15000);
 
 // Graceful shutdown
 function shutdown() {
