@@ -965,7 +965,13 @@ function App() {
         <Settings size={28} />
       </button>
 
-      {appState.view === 'landing' && <LandingPage onStart={() => setAppState(p => ({...p, view: 'deployment_choice'}))} />}
+      {appState.view === 'landing' && <LandingPage onStart={() => {
+          // Skip the Desktop vs Cloud choice when running locally (from the .app/.exe)
+          // Only show it on cloud-hosted deployments where users might need to download
+          const host = window.location.hostname;
+          const isLocal = host === 'localhost' || host === '127.0.0.1' || host.startsWith('192.168.') || host.startsWith('10.') || host.startsWith('172.');
+          setAppState(p => ({...p, view: isLocal ? 'choice' : 'deployment_choice'}));
+      }} />}
       
       {appState.view === 'dashboard' && (
         <Dashboard 

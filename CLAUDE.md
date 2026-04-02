@@ -120,7 +120,7 @@ Audio → Gemini/Whisper/WebSpeech → Text
 | `components/OutputSettings.tsx` | Caption Output Designer: DeckLink/NDI config, Caption Processing settings |
 | `components/ContextEngine.tsx` | Context Engine UI: PDF upload, URL scraping, municipality wizard, dictionary management, settings with how-to guide |
 | `components/AudienceView.tsx` | Phone caption viewer: auto-reconnect, dark/light mode, font sizes, fullscreen |
-| `App.tsx` | Root component, audio capture, WebSocket connection, state management |
+| `App.tsx` | Root component, audio capture, WebSocket connection, state management. Landing → deployment choice (cloud only) or straight to workflow picker (local). |
 | `electron/main.js` | Electron main process, DeckLink IPC, frame loop (filters to isFinal only) |
 | `types.ts` | TypeScript types including CaptionEncodingConfig, ContextSettings, DictionaryEntry |
 
@@ -376,6 +376,18 @@ Accessible at `/?view=audience&session=demo` or via QR code from Dashboard.
 - `buildCDP(cc1, cc2)`: CEA-608 only — Field 1 data, Field 2 null, DTVCC null padding
 - `buildCDP_DTVCC(dtvccData, frameRate, cc1, cc2)`: Dual mode — CEA-608 in Field 1 for backward compat + DTVCC service data in remaining triplets
 - CRC: mod-256 sum of all bytes = 0
+
+## App Navigation Flow
+
+```
+Landing Page ("Start Captioning")
+  ├── Local (localhost/LAN IP) → Workflow Picker (Live / Prerecorded / Local AI)
+  └── Cloud (public URL)       → Deployment Choice (Desktop App vs Run in Browser)
+                                   ├── Desktop App → Download instructions
+                                   └── Run in Browser → Workflow Picker
+```
+
+The deployment choice screen is **skipped** when running locally (from the standalone .app/.exe or `npm run dev`) since the user is already in the desktop app. It only appears on cloud-hosted deployments where visitors may need to download the desktop app for DeckLink/SDI features.
 
 ## Common Issues & Fixes
 
