@@ -351,8 +351,12 @@ const Dashboard: React.FC<DashboardProps> = ({
         if (manual) return manual;
         const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
         const host = window.location.hostname;
-        const port = window.location.port === '5173' ? '8080' : window.location.port;
-        return `${protocol}//${host}:${port}`;
+        const port = window.location.port;
+        // DEV MODE: Vite dev server → relay on 8080
+        if (port === '5173') return `${protocol}//${host}:8080`;
+        // CLOUD/TUNNEL: No port (default 80/443) → don't append colon
+        const portSuffix = port ? `:${port}` : '';
+        return `${protocol}//${host}${portSuffix}`;
       };
 
       const relayUrl = getWsUrl();
