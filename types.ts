@@ -83,7 +83,7 @@ export interface HighlightClip {
 }
 
 export interface AppState {
-  view: 'landing' | 'deployment_choice' | 'download' | 'choice' | 'dashboard' | 'prerecorded' | 'analytics' | 'context' | 'caption_output' | 'studio' | 'local_setup';
+  view: 'landing' | 'deployment_choice' | 'download' | 'choice' | 'dashboard' | 'prerecorded' | 'analytics' | 'context' | 'caption_output' | 'studio' | 'local_setup' | 'caption_injection';
   isRecording: boolean;
   captions: Caption[];
   interimText: string; // Lifted state for real-time preview

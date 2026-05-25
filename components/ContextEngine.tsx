@@ -39,6 +39,26 @@ const ContextEngine: React.FC<ContextEngineProps> = ({
   const [showNameError, setShowNameError] = useState(false);
   const [rawJson, setRawJson] = useState('');
   const [settingsVisited, setSettingsVisited] = useState(false);
+
+  // Server-side API key status — drives the banner and the wizard gating
+  const [serverKey, setServerKey] = useState<{loaded: boolean, source: string, masked: string} | null>(null);
+  const [showInlineKeyForm, setShowInlineKeyForm] = useState(false);
+
+  // Streaming wizard state — per-URL live phases + entry stream + ETA
+  type WizardPhase = 'queued' | 'fetching' | 'fetched' | 'parsing' | 'parsed' | 'extracting' | 'done' | 'failed';
+  const [wizardLive, setWizardLive] = useState<{
+    url: string;
+    phase: WizardPhase;
+    detail: string;
+    entries: number;
+    startedAt: number;
+    elapsedMs: number;
+    error?: string;
+    textLength?: number;
+    sourceType?: string;
+  }[]>([]);
+  const [wizardEtaMs, setWizardEtaMs] = useState<number | null>(null);
+  const [recentEntries, setRecentEntries] = useState<{original: string, replacement: string, type: string}[]>([]);
   
   // New Settings State
   const [settings, setSettings] = useState<ContextSettings>({
@@ -91,6 +111,14 @@ const ContextEngine: React.FC<ContextEngineProps> = ({
   };
 
   const getApiKey = () => localStorage.getItem('cc_api_key') || apiKey || '';
+
+  // True when either localStorage has a usable key OR the server has one loaded
+  // (from .env.local or set previously via /api/polisher/apikey).
+  const hasUsableKey = () => {
+      const local = getApiKey();
+      if (local && local.length > 10 && local !== 'PLACEHOLDER_API_KEY') return true;
+      return !!serverKey?.loaded;
+  };
 
   const handleScrapeUrl = async () => {
       setScraping(true);
@@ -233,10 +261,23 @@ const ContextEngine: React.FC<ContextEngineProps> = ({
       setBodyProcessing(false);
   };
 
+  const refreshServerKey = useCallback(async () => {
+      try {
+          const res = await fetch(`${getRelayUrl()}/api/gemini/status`);
+          if (res.ok) {
+              const data = await res.json();
+              setServerKey({ loaded: !!data.loaded, source: data.source || 'none', masked: data.masked || '' });
+          }
+      } catch {}
+  }, []);
+
   useEffect(() => {
       fetch(`${getRelayUrl()}/api/context/status`).then(r => r.json()).then(data => {
           setLearnerEnabled(data.enabled);
       }).catch(() => {});
+
+      // Fetch server's view of the active key — this is the source of truth
+      refreshServerKey();
 
       // Sync API key from localStorage to relay server (needed for scraping/extraction)
       const savedKey = localStorage.getItem('cc_api_key');
@@ -245,7 +286,7 @@ const ContextEngine: React.FC<ContextEngineProps> = ({
               method: 'POST',
               headers: { 'Content-Type': 'application/json' },
               body: JSON.stringify({ key: savedKey }),
-          }).catch(() => {});
+          }).then(() => refreshServerKey()).catch(() => {});
       }
 
       // Poll suggestions + learner status every 5 seconds
@@ -256,7 +297,7 @@ const ContextEngine: React.FC<ContextEngineProps> = ({
           }).catch(() => {});
       }, 5000);
       return () => clearInterval(interval);
-  }, []);
+  }, [refreshServerKey]);
 
   const handleActivate = () => {
       if (!engineName.trim()) {
@@ -276,33 +317,61 @@ const ContextEngine: React.FC<ContextEngineProps> = ({
   const [wizardInline, setWizardInline] = useState(false); // true = wizard runs inline on main view
 
   const handleMunicipalitySearch = async () => {
-    const keyToUse = apiKey || tempKey;
-    if (!keyToUse) {
-        setShowKeyPrompt(true);
+    // Prefer client key (Gemini SDK runs client-side for search grounding),
+    // fall back to server-loaded key by asking the server to run the search.
+    const clientKey = getApiKey();
+    const hasClientKey = clientKey && clientKey.length > 10 && clientKey !== 'PLACEHOLDER_API_KEY';
+
+    if (!hasClientKey && !serverKey?.loaded) {
+        setShowInlineKeyForm(true);
         return;
     }
 
-    // Save key if it was entered in temp prompt
-    if (tempKey && !apiKey) {
+    // Save key if user just entered one inline
+    if (tempKey && tempKey !== clientKey && tempKey.length > 10) {
         localStorage.setItem('cc_api_key', tempKey);
+        await fetch(`${getRelayUrl()}/api/polisher/apikey`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ key: tempKey }),
+        }).catch(() => {});
+        await refreshServerKey();
     }
 
     setIsProcessing(true);
+    setSearchResults([]);
     const allResults: any[] = [];
     const seenUrls = new Set<string>();
 
-    // Phase 1: Use Gemini + Google Search grounding to find real URLs
-    setWizardPhase('Searching the web for official sites...');
+    // Phase 1: Use Gemini + Google Search grounding to find real URLs.
+    // If client has its own key we call Gemini directly (faster). Otherwise
+    // we route through the server, which holds the .env.local key.
+    setWizardPhase('Searching Google for official sites…');
+    const searchStart = Date.now();
     try {
-        const geminiResults = await searchMunicipalitySources(searchQuery, keyToUse);
+        let geminiResults: any[] = [];
+        if (hasClientKey) {
+            geminiResults = await searchMunicipalitySources(searchQuery, clientKey);
+        } else {
+            const res = await fetch(`${getRelayUrl()}/api/context/search-municipality`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ query: searchQuery }),
+            });
+            const data = await res.json();
+            if (data.ok && Array.isArray(data.results)) geminiResults = data.results;
+            else if (data.error) console.warn('[Wizard] Server search:', data.error);
+        }
         for (const r of geminiResults) {
             if (r.url && !seenUrls.has(r.url)) {
                 seenUrls.add(r.url);
                 allResults.push(r);
             }
         }
+        setWizardPhase(`Found ${allResults.length} candidate page${allResults.length === 1 ? '' : 's'} in ${((Date.now() - searchStart) / 1000).toFixed(1)}s`);
     } catch (e) {
         console.warn('[Wizard] Gemini search failed:', e);
+        setWizardPhase('Search failed — check API key. Falling back to direct URL crawl.');
     }
 
     // Phase 2: If we found any .gov or .org sites, crawl them for internal links
@@ -311,7 +380,8 @@ const ContextEngine: React.FC<ContextEngineProps> = ({
     );
 
     if (officialSites.length > 0) {
-        setWizardPhase(`Crawling ${officialSites[0].url} for sub-pages...`);
+        const host = (() => { try { return new URL(officialSites[0].url).hostname; } catch { return officialSites[0].url; } })();
+        setWizardPhase(`Crawling ${host} for sub-pages (officials, agendas, departments)…`);
         try {
             const crawlRes = await fetch(`${getRelayUrl()}/api/context/discover-links`, {
                 method: 'POST',
@@ -326,13 +396,14 @@ const ContextEngine: React.FC<ContextEngineProps> = ({
                         allResults.push(link);
                     }
                 }
+                setWizardPhase(`Discovered ${crawlData.links.length} sub-page${crawlData.links.length === 1 ? '' : 's'} on ${host}`);
             }
         } catch (e) {
             console.warn('[Wizard] Link discovery failed:', e);
         }
     }
 
-    setWizardPhase('');
+    setTimeout(() => setWizardPhase(''), 1200);
     setIsProcessing(false);
 
     if (allResults.length === 0) {
@@ -342,11 +413,106 @@ const ContextEngine: React.FC<ContextEngineProps> = ({
 
     setSearchResults(allResults);
     setSelectedSources(allResults.map((_: any, i: number) => i));
-    if (wizardInline) {
-        // Stay on main view — results shown inline
-    } else {
-        setView('wizard_select');
-    }
+    if (!wizardInline) setView('wizard_select');
+  };
+
+  // Stream a single URL's scrape via SSE — yields fine-grained phases plus
+  // entry batches so the UI can show a live feed. Falls back to the
+  // non-streaming endpoint on any error so we never get stuck.
+  const streamScrape = (
+    url: string,
+    onPhase: (phase: WizardPhase, detail: string, extra?: any) => void,
+    onEntries: (batch: any[]) => void,
+  ): Promise<{ entries: any[]; ok: boolean; error?: string }> => {
+    return new Promise(async (resolve) => {
+        const collected: any[] = [];
+        try {
+            const apiKeyToSend = getApiKey();
+            const res = await fetch(`${getRelayUrl()}/api/context/scrape-stream`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json', 'X-Api-Key': apiKeyToSend, 'Accept': 'text/event-stream' },
+                body: JSON.stringify({ url, apiKey: apiKeyToSend }),
+            });
+            if (!res.ok || !res.body) throw new Error(`HTTP ${res.status}`);
+
+            const reader = res.body.getReader();
+            const decoder = new TextDecoder();
+            let buffer = '';
+
+            while (true) {
+                const { value, done } = await reader.read();
+                if (done) break;
+                buffer += decoder.decode(value, { stream: true });
+                // SSE messages are separated by \n\n
+                let idx;
+                while ((idx = buffer.indexOf('\n\n')) >= 0) {
+                    const raw = buffer.slice(0, idx);
+                    buffer = buffer.slice(idx + 2);
+                    const dataLine = raw.split('\n').find(l => l.startsWith('data:'));
+                    if (!dataLine) continue;
+                    try {
+                        const ev = JSON.parse(dataLine.slice(5).trim());
+                        switch (ev.phase) {
+                            case 'fetching':
+                                onPhase('fetching', 'Connecting to server…');
+                                break;
+                            case 'fetched':
+                                onPhase('fetched', `Server responded (${ev.contentType?.split(';')[0] || 'unknown'})`, { contentType: ev.contentType });
+                                break;
+                            case 'parsing':
+                                onPhase('parsing', ev.sourceType === 'pdf' ? `Parsing PDF (${Math.round((ev.bytes || 0) / 1024)} KB)` : `Stripping HTML (${Math.round((ev.bytes || 0) / 1024)} KB)`, { sourceType: ev.sourceType });
+                                break;
+                            case 'parsed':
+                                onPhase('parsed', `Extracted ${ev.textLength?.toLocaleString() || '?'} chars of text`, { textLength: ev.textLength, sourceType: ev.sourceType });
+                                break;
+                            case 'extracting':
+                                onPhase('extracting', `Asking Gemini to find names, places, acronyms…`);
+                                break;
+                            case 'entries':
+                                if (Array.isArray(ev.batch)) {
+                                    collected.push(...ev.batch);
+                                    onEntries(ev.batch);
+                                    onPhase('extracting', `Streaming entries: ${collected.length} so far…`);
+                                }
+                                break;
+                            case 'done':
+                                onPhase('done', `Done in ${((ev.totalMs || 0) / 1000).toFixed(1)}s — ${ev.totalEntries ?? collected.length} entries`, { totalMs: ev.totalMs });
+                                resolve({ entries: collected, ok: true });
+                                return;
+                            case 'error':
+                                onPhase('failed', ev.error || 'Failed', { error: ev.error });
+                                resolve({ entries: collected, ok: false, error: ev.error });
+                                return;
+                        }
+                    } catch {}
+                }
+            }
+            // Stream ended without an explicit done event
+            resolve({ entries: collected, ok: true });
+        } catch (e) {
+            // Fall back to non-streaming endpoint
+            try {
+                onPhase('extracting', 'Streaming unavailable — using direct scrape…');
+                const res = await fetch(`${getRelayUrl()}/api/context/scrape`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json', 'X-Api-Key': getApiKey() },
+                    body: JSON.stringify({ url, apiKey: getApiKey() }),
+                });
+                const data = await res.json();
+                if (data.ok && data.entries?.length > 0) {
+                    onEntries(data.entries);
+                    onPhase('done', `Done — ${data.entries.length} entries (fallback)`);
+                    resolve({ entries: data.entries, ok: true });
+                } else {
+                    onPhase('done', data.warning || 'No entries found');
+                    resolve({ entries: [], ok: true });
+                }
+            } catch (err) {
+                onPhase('failed', (err as Error).message);
+                resolve({ entries: [], ok: false, error: (err as Error).message });
+            }
+        }
+    });
   };
 
   const handleBuildEngine = async () => {
@@ -360,45 +526,89 @@ const ContextEngine: React.FC<ContextEngineProps> = ({
     }));
     setWizardProgress(progress);
     setWizardExtracted([]);
+    setRecentEntries([]);
+    setWizardEtaMs(null);
+    setWizardLive(selectedData.map((d: any) => ({
+        url: d.url, phase: 'queued' as WizardPhase, detail: 'Queued', entries: 0,
+        startedAt: 0, elapsedMs: 0,
+    })));
     if (!wizardInline) setView('wizard_analyze');
 
     // Scrape each URL sequentially via the relay server
-    const allEntries: DictionaryEntry[] = [];
     const existingKeys = new Set(dictionary.map(e => `${e.original.toLowerCase()}→${e.replacement.toLowerCase()}`));
+    const perUrlTimes: number[] = [];
 
     for (let i = 0; i < selectedData.length; i++) {
-        // Update progress: mark current as scraping
+        const startedAt = Date.now();
+        // Mark current as scraping in both legacy progress + new live state
         setWizardProgress(prev => prev.map((p, j) => j === i ? { ...p, status: 'scraping' } : p));
+        setWizardLive(prev => prev.map((p, j) => j === i
+            ? { ...p, phase: 'fetching', detail: 'Starting…', startedAt, elapsedMs: 0 }
+            : p));
+
+        // Tick elapsed every 200ms for the currently active row
+        const tickInterval = setInterval(() => {
+            setWizardLive(prev => prev.map((p, j) =>
+                j === i && p.phase !== 'done' && p.phase !== 'failed'
+                    ? { ...p, elapsedMs: Date.now() - startedAt }
+                    : p
+            ));
+        }, 200);
 
         try {
-            const res = await fetch(`${getRelayUrl()}/api/context/scrape`, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json', 'X-Api-Key': getApiKey() },
-                body: JSON.stringify({ url: selectedData[i].url, apiKey: getApiKey() }),
-            });
-            const data = await res.json();
+            const result = await streamScrape(
+                selectedData[i].url,
+                (phase, detail, extra) => {
+                    setWizardLive(prev => prev.map((p, j) => j === i
+                        ? { ...p, phase, detail, ...(extra || {}), elapsedMs: Date.now() - startedAt }
+                        : p));
+                },
+                (batch) => {
+                    // Deduplicate against existing dictionary and already-extracted entries
+                    const novel = batch.filter((e: any) => {
+                        if (!e.original || !e.replacement) return false;
+                        const key = `${e.original.toLowerCase()}→${e.replacement.toLowerCase()}`;
+                        if (existingKeys.has(key)) return false;
+                        existingKeys.add(key);
+                        return true;
+                    }).map((e: any) => ({
+                        original: e.original,
+                        replacement: e.replacement,
+                        type: e.type || 'proper_noun',
+                    }));
+                    if (novel.length > 0) {
+                        setWizardExtracted(prev => [...prev, ...novel]);
+                        setRecentEntries(prev => [...novel.slice(-12), ...prev].slice(0, 30));
+                        setWizardLive(prev => prev.map((p, j) => j === i ? { ...p, entries: p.entries + novel.length } : p));
+                    }
+                },
+            );
 
-            if (data.ok && data.entries?.length > 0) {
-                // Deduplicate against existing dictionary and already-extracted entries
-                const novel = data.entries.filter((e: any) => {
-                    if (!e.original || !e.replacement) return false;
-                    const key = `${e.original.toLowerCase()}→${e.replacement.toLowerCase()}`;
-                    if (existingKeys.has(key)) return false;
-                    existingKeys.add(key);
-                    return true;
-                }).map((e: any) => ({
-                    original: e.original,
-                    replacement: e.replacement,
-                    type: e.type || 'proper_noun',
-                }));
+            clearInterval(tickInterval);
+            const elapsed = Date.now() - startedAt;
+            perUrlTimes.push(elapsed);
 
-                allEntries.push(...novel);
-                setWizardExtracted(prev => [...prev, ...novel]);
-                setWizardProgress(prev => prev.map((p, j) => j === i ? { ...p, status: 'done', entries: novel.length } : p));
+            const finalPhase: WizardPhase = result.ok ? 'done' : 'failed';
+            setWizardLive(prev => prev.map((p, j) => j === i
+                ? { ...p, phase: finalPhase, elapsedMs: elapsed, error: result.error }
+                : p));
+            setWizardProgress(prev => prev.map((p, j) => j === i
+                ? { ...p, status: result.ok ? 'done' : 'failed', entries: result.entries.length, error: result.error || (result.entries.length === 0 ? 'No entries found' : undefined) }
+                : p));
+
+            // Recompute ETA from the avg of completed URLs
+            const remaining = selectedData.length - (i + 1);
+            if (remaining > 0 && perUrlTimes.length > 0) {
+                const avg = perUrlTimes.reduce((a, b) => a + b, 0) / perUrlTimes.length;
+                setWizardEtaMs(Math.round(avg * remaining));
             } else {
-                setWizardProgress(prev => prev.map((p, j) => j === i ? { ...p, status: 'done', entries: 0, error: data.warning || 'No entries found' } : p));
+                setWizardEtaMs(0);
             }
         } catch (e) {
+            clearInterval(tickInterval);
+            setWizardLive(prev => prev.map((p, j) => j === i
+                ? { ...p, phase: 'failed', detail: 'Network error', error: (e as Error).message, elapsedMs: Date.now() - startedAt }
+                : p));
             setWizardProgress(prev => prev.map((p, j) => j === i ? { ...p, status: 'failed', error: (e as Error).message } : p));
         }
     }
@@ -815,16 +1025,106 @@ const ContextEngine: React.FC<ContextEngineProps> = ({
                 ) : view === 'main' ? (
                     <div className="p-6 space-y-6 animate-fade-in overflow-y-auto custom-scrollbar">
 
+                        {/* === API KEY STATUS BANNER — always visible at the top === */}
+                        <div className={`rounded-2xl border-2 p-4 transition-all ${
+                            hasUsableKey()
+                                ? 'bg-green-50 border-green-200'
+                                : 'bg-amber-50 border-amber-300 shadow-lg shadow-amber-100'
+                        }`}>
+                            <div className="flex items-center gap-3">
+                                <div className={`w-10 h-10 rounded-xl flex items-center justify-center shrink-0 ${hasUsableKey() ? 'bg-green-500 text-white' : 'bg-amber-500 text-white animate-pulse'}`}>
+                                    <Key size={20} />
+                                </div>
+                                <div className="flex-1 min-w-0">
+                                    {hasUsableKey() ? (
+                                        <>
+                                            <div className="flex items-center gap-2">
+                                                <p className="text-sm font-bold text-green-800">Gemini AI is Connected</p>
+                                                <span className="text-[9px] bg-green-200 text-green-800 px-1.5 py-0.5 rounded font-bold uppercase">
+                                                    {serverKey?.source === 'env_local' ? '.env.local' :
+                                                     serverKey?.source === 'env' ? 'env var' :
+                                                     serverKey?.source === 'runtime' ? 'user set' :
+                                                     serverKey?.source === 'builtin' ? 'built-in' :
+                                                     'browser'}
+                                                </span>
+                                            </div>
+                                            <p className="text-[11px] text-green-700 mt-0.5">
+                                                Municipality search, PDF extraction, and Auto-Learn are ready.
+                                                {serverKey?.masked && ` Key: ${serverKey.masked}`}
+                                            </p>
+                                        </>
+                                    ) : (
+                                        <>
+                                            <p className="text-sm font-bold text-amber-900">Add a Gemini API Key to Continue</p>
+                                            <p className="text-[11px] text-amber-800 mt-0.5">
+                                                The Municipality Wizard, PDF extraction, and Auto-Learn all require a free Gemini key.{' '}
+                                                <a href="https://aistudio.google.com/apikey" target="_blank" rel="noopener" className="underline font-bold">Get one here →</a>
+                                            </p>
+                                        </>
+                                    )}
+                                </div>
+                                {!hasUsableKey() ? (
+                                    <button
+                                        onClick={() => setShowInlineKeyForm(s => !s)}
+                                        className="px-3 py-1.5 bg-amber-600 hover:bg-amber-700 text-white text-xs font-bold rounded-lg shrink-0"
+                                    >
+                                        Add Key
+                                    </button>
+                                ) : (
+                                    <button
+                                        onClick={() => setShowInlineKeyForm(s => !s)}
+                                        className="text-[10px] font-bold text-green-700 hover:text-green-900 underline shrink-0"
+                                    >
+                                        {showInlineKeyForm ? 'Hide' : 'Change'}
+                                    </button>
+                                )}
+                            </div>
+                            {showInlineKeyForm && (
+                                <div className="mt-3 flex gap-2">
+                                    <input
+                                        type="password"
+                                        value={tempKey}
+                                        onChange={e => setTempKey(e.target.value)}
+                                        placeholder="Paste your Gemini API key (starts with AIzaSy…)"
+                                        className="flex-1 px-3 py-2 rounded-lg border border-amber-300 text-xs focus:outline-none focus:border-amber-500 bg-white font-mono"
+                                    />
+                                    <button
+                                        onClick={async () => {
+                                            if (tempKey && tempKey.length > 10) {
+                                                localStorage.setItem('cc_api_key', tempKey);
+                                                await fetch(`${getRelayUrl()}/api/polisher/apikey`, {
+                                                    method: 'POST',
+                                                    headers: { 'Content-Type': 'application/json' },
+                                                    body: JSON.stringify({ key: tempKey }),
+                                                }).catch(() => {});
+                                                await refreshServerKey();
+                                                setShowInlineKeyForm(false);
+                                            }
+                                        }}
+                                        disabled={!tempKey || tempKey.length < 10}
+                                        className="px-4 py-2 bg-forest-dark text-white text-xs font-bold rounded-lg disabled:opacity-40"
+                                    >
+                                        Save
+                                    </button>
+                                </div>
+                            )}
+                        </div>
+
                         {/* === MUNICIPALITY WIZARD — inline at top === */}
-                        <div className="bg-gradient-to-br from-forest-dark to-forest-light rounded-2xl shadow-xl relative overflow-hidden">
+                        <div className={`bg-gradient-to-br from-forest-dark to-forest-light rounded-2xl shadow-xl relative overflow-hidden ${!hasUsableKey() ? 'opacity-60' : ''}`}>
                             <div className="absolute top-0 right-0 w-32 h-32 bg-white/10 rounded-full -translate-y-1/2 translate-x-1/2 blur-2xl"></div>
                             <div className="p-5 relative z-10">
                                 <div className="flex items-center gap-3 mb-3">
                                     <div className="w-10 h-10 bg-white/20 rounded-xl flex items-center justify-center text-white">
                                         <Globe size={22} />
                                     </div>
-                                    <div>
-                                        <h4 className="font-bold text-base text-white">Municipality Wizard</h4>
+                                    <div className="flex-1">
+                                        <div className="flex items-center gap-2">
+                                            <h4 className="font-bold text-base text-white">Municipality Wizard</h4>
+                                            {!hasUsableKey() && (
+                                                <span className="text-[9px] bg-amber-400 text-amber-900 px-1.5 py-0.5 rounded font-bold uppercase">Needs API Key</span>
+                                            )}
+                                        </div>
                                         <p className="text-sage-100 text-[10px] opacity-80">AI finds and scrapes your town's official web pages</p>
                                     </div>
                                 </div>
@@ -834,14 +1134,14 @@ const ContextEngine: React.FC<ContextEngineProps> = ({
                                     <input
                                         value={searchQuery}
                                         onChange={e => setSearchQuery(e.target.value)}
-                                        onKeyDown={e => e.key === 'Enter' && !isProcessing && searchQuery.trim() && (() => { setWizardInline(true); handleMunicipalitySearch(); })()}
-                                        placeholder="e.g. Brookline, MA"
-                                        className="flex-1 px-4 py-2.5 rounded-xl text-sm bg-white/95 text-forest-dark placeholder:text-stone-400 outline-none focus:ring-2 focus:ring-white/50"
-                                        disabled={isProcessing}
+                                        onKeyDown={e => e.key === 'Enter' && !isProcessing && searchQuery.trim() && hasUsableKey() && (() => { setWizardInline(true); handleMunicipalitySearch(); })()}
+                                        placeholder={hasUsableKey() ? "e.g. Brookline, MA" : "Add an API key above to enable search"}
+                                        className="flex-1 px-4 py-2.5 rounded-xl text-sm bg-white/95 text-forest-dark placeholder:text-stone-400 outline-none focus:ring-2 focus:ring-white/50 disabled:bg-white/60"
+                                        disabled={isProcessing || !hasUsableKey()}
                                     />
                                     <button
                                         onClick={() => { setWizardInline(true); handleMunicipalitySearch(); }}
-                                        disabled={isProcessing || !searchQuery.trim()}
+                                        disabled={isProcessing || !searchQuery.trim() || !hasUsableKey()}
                                         className="px-4 py-2.5 bg-white text-forest-dark rounded-xl font-bold text-sm hover:bg-sage-50 transition-colors disabled:opacity-50 flex items-center gap-1.5"
                                     >
                                         {isProcessing ? <Loader2 size={14} className="animate-spin" /> : <Search size={14} />}
@@ -849,7 +1149,13 @@ const ContextEngine: React.FC<ContextEngineProps> = ({
                                     </button>
                                 </div>
                                 {isProcessing && wizardPhase && (
-                                    <p className="text-[10px] text-sage-100 mt-2 animate-pulse">{wizardPhase}</p>
+                                    <p className="text-[11px] text-white mt-2 flex items-center gap-2 bg-white/10 px-2.5 py-1.5 rounded-lg">
+                                        <Loader2 size={11} className="animate-spin shrink-0" />
+                                        <span className="font-medium">{wizardPhase}</span>
+                                    </p>
+                                )}
+                                {!isProcessing && wizardPhase && (
+                                    <p className="text-[11px] text-sage-100 mt-2 px-2.5 py-1.5 rounded-lg bg-white/10">{wizardPhase}</p>
                                 )}
                             </div>
 
@@ -893,40 +1199,97 @@ const ContextEngine: React.FC<ContextEngineProps> = ({
                                 </div>
                             )}
 
-                            {/* Inline scraping progress */}
+                            {/* Inline scraping progress — live stream with phases + ETA + entry feed */}
                             {wizardInline && wizardProgress.length > 0 && (
-                                <div className="bg-white rounded-b-2xl p-4 space-y-2 border-t border-stone-200">
+                                <div className="bg-white rounded-b-2xl p-4 space-y-3 border-t border-stone-200">
+                                    {/* Header row: status + ETA */}
                                     <div className="flex justify-between items-center">
                                         <p className="text-xs font-bold text-forest-dark">
                                             {wizardProgress.every(p => p.status === 'done' || p.status === 'failed')
-                                                ? `Done! Found ${wizardExtracted.length} entries`
-                                                : `Scraping ${wizardProgress.filter(p => p.status === 'done').length + 1} of ${wizardProgress.length}...`}
+                                                ? `Done — extracted ${wizardExtracted.length} new entries from ${wizardProgress.filter(p => p.status === 'done').length} pages`
+                                                : `Scraping page ${wizardProgress.filter(p => p.status !== 'pending').length} of ${wizardProgress.length}`}
                                         </p>
+                                        {wizardEtaMs !== null && wizardEtaMs > 0 && (
+                                            <span className="text-[10px] font-mono bg-sage-100 text-sage-700 px-2 py-0.5 rounded">
+                                                ~{(wizardEtaMs / 1000).toFixed(0)}s remaining
+                                            </span>
+                                        )}
                                     </div>
                                     {/* Progress bar */}
                                     <div className="w-full bg-stone-100 rounded-full h-1.5">
                                         <div className="bg-sage-500 h-1.5 rounded-full transition-all duration-500" style={{ width: `${Math.round((wizardProgress.filter(p => p.status === 'done' || p.status === 'failed').length / Math.max(wizardProgress.length, 1)) * 100)}%` }} />
                                     </div>
-                                    <div className="max-h-28 overflow-y-auto space-y-1">
-                                        {wizardProgress.map((p, i) => (
-                                            <div key={i} className={`p-1.5 rounded-lg flex items-center gap-2 text-[10px] ${p.status === 'scraping' ? 'bg-sage-50' : p.status === 'done' ? 'bg-green-50' : p.status === 'failed' ? 'bg-red-50' : ''}`}>
-                                                {p.status === 'pending' && <div className="w-3 h-3 rounded-full border border-stone-200 shrink-0" />}
-                                                {p.status === 'scraping' && <Loader2 size={12} className="animate-spin text-sage-600 shrink-0" />}
-                                                {p.status === 'done' && <CheckCircle size={12} className="text-green-600 shrink-0" />}
-                                                {p.status === 'failed' && <X size={12} className="text-red-500 shrink-0" />}
-                                                <a href={p.url} target="_blank" rel="noopener noreferrer" className="font-mono text-sage-600 hover:text-sage-800 underline truncate">{p.url}</a>
-                                                {p.status === 'done' && p.entries > 0 && <span className="text-green-600 font-bold shrink-0">+{p.entries}</span>}
-                                            </div>
-                                        ))}
+
+                                    {/* Live per-URL feed */}
+                                    <div className="max-h-44 overflow-y-auto space-y-1.5">
+                                        {wizardLive.map((p, i) => {
+                                            const host = (() => { try { return new URL(p.url).hostname.replace(/^www\./, ''); } catch { return p.url; } })();
+                                            return (
+                                                <div key={i} className={`p-2 rounded-lg border text-[10px] ${
+                                                    p.phase === 'queued' ? 'bg-white border-stone-100' :
+                                                    p.phase === 'done' ? 'bg-green-50 border-green-200' :
+                                                    p.phase === 'failed' ? 'bg-red-50 border-red-200' :
+                                                    'bg-sage-50 border-sage-200'
+                                                }`}>
+                                                    <div className="flex items-center gap-2">
+                                                        {p.phase === 'queued' && <div className="w-3 h-3 rounded-full border border-stone-200 shrink-0" />}
+                                                        {(p.phase === 'fetching' || p.phase === 'fetched' || p.phase === 'parsing' || p.phase === 'parsed' || p.phase === 'extracting') && <Loader2 size={12} className="animate-spin text-sage-600 shrink-0" />}
+                                                        {p.phase === 'done' && <CheckCircle size={12} className="text-green-600 shrink-0" />}
+                                                        {p.phase === 'failed' && <X size={12} className="text-red-500 shrink-0" />}
+                                                        <a href={p.url} target="_blank" rel="noopener noreferrer" className="font-mono text-sage-700 hover:text-sage-900 underline truncate flex-1">{host}</a>
+                                                        {p.entries > 0 && <span className="text-green-700 font-bold shrink-0">+{p.entries}</span>}
+                                                        {p.phase !== 'queued' && p.elapsedMs > 0 && (
+                                                            <span className="font-mono text-stone-400 shrink-0 text-[9px]">{(p.elapsedMs / 1000).toFixed(1)}s</span>
+                                                        )}
+                                                    </div>
+                                                    {p.detail && p.phase !== 'queued' && (
+                                                        <p className={`ml-5 mt-0.5 ${p.phase === 'failed' ? 'text-red-600' : 'text-stone-500'}`}>
+                                                            {p.detail}
+                                                        </p>
+                                                    )}
+                                                </div>
+                                            );
+                                        })}
                                     </div>
+
+                                    {/* Live entry stream — appears as they're extracted */}
+                                    {recentEntries.length > 0 && (
+                                        <div className="bg-stone-50 rounded-lg border border-stone-200 p-2.5">
+                                            <div className="flex items-center justify-between mb-1.5">
+                                                <p className="text-[9px] font-bold text-stone-500 uppercase tracking-wider">Latest entries</p>
+                                                <span className="text-[9px] font-mono text-sage-600">{wizardExtracted.length} total</span>
+                                            </div>
+                                            <div className="flex flex-wrap gap-1">
+                                                {recentEntries.slice(0, 12).map((e, i) => (
+                                                    <span key={i} className={`text-[10px] px-1.5 py-0.5 rounded border animate-fade-in ${
+                                                        e.type === 'acronym' ? 'bg-purple-50 border-purple-200 text-purple-700' :
+                                                        e.type === 'place' ? 'bg-green-50 border-green-200 text-green-700' :
+                                                        'bg-white border-stone-200 text-stone-700'
+                                                    }`}>
+                                                        {e.replacement}
+                                                    </span>
+                                                ))}
+                                            </div>
+                                        </div>
+                                    )}
+
                                     {/* Accept button when done */}
                                     {wizardProgress.every(p => p.status === 'done' || p.status === 'failed') && wizardExtracted.length > 0 && (
                                         <div className="flex gap-2 pt-1">
                                             <button onClick={handleWizardAccept} className="flex-1 py-2 bg-forest-dark text-white rounded-xl text-xs font-bold hover:bg-forest-light transition-colors">
                                                 Add {wizardExtracted.length} Entries
                                             </button>
-                                            <button onClick={() => { setWizardExtracted([]); setWizardProgress([]); setSearchResults([]); setWizardInline(false); }} className="px-3 py-2 bg-white border border-stone-200 rounded-xl text-xs font-bold text-stone-500 hover:bg-stone-50">
+                                            <button onClick={() => { setWizardExtracted([]); setWizardProgress([]); setWizardLive([]); setRecentEntries([]); setSearchResults([]); setWizardInline(false); }} className="px-3 py-2 bg-white border border-stone-200 rounded-xl text-xs font-bold text-stone-500 hover:bg-stone-50">
                                                 Discard
+                                            </button>
+                                        </div>
+                                    )}
+                                    {/* Empty result */}
+                                    {wizardProgress.every(p => p.status === 'done' || p.status === 'failed') && wizardExtracted.length === 0 && (
+                                        <div className="text-center py-2">
+                                            <p className="text-[10px] text-stone-500">No new entries found. Try a different search or upload an agenda PDF directly.</p>
+                                            <button onClick={() => { setWizardProgress([]); setWizardLive([]); setSearchResults([]); setWizardInline(false); }} className="mt-2 text-[10px] font-bold text-sage-600 hover:text-sage-800 underline">
+                                                Dismiss
                                             </button>
                                         </div>
                                     )}
@@ -1285,14 +1648,22 @@ const ContextEngine: React.FC<ContextEngineProps> = ({
 
                         {view === 'wizard_analyze' && (
                             <div className="flex-1 flex flex-col">
-                                <div className="mb-4">
-                                    <h3 className="text-xl font-display font-bold text-forest-dark mb-1">Scraping & Extracting</h3>
-                                    <p className="text-stone-500 text-sm">
-                                        {wizardProgress.every(p => p.status === 'done' || p.status === 'failed')
-                                            ? `Done! Found ${wizardExtracted.length} dictionary entries.`
-                                            : `Scraping ${wizardProgress.filter(p => p.status === 'done').length + 1} of ${wizardProgress.length}...`
-                                        }
-                                    </p>
+                                <div className="mb-4 flex items-end justify-between gap-4">
+                                    <div>
+                                        <h3 className="text-xl font-display font-bold text-forest-dark mb-1">Scraping & Extracting</h3>
+                                        <p className="text-stone-500 text-sm">
+                                            {wizardProgress.every(p => p.status === 'done' || p.status === 'failed')
+                                                ? `Done! Found ${wizardExtracted.length} new dictionary entries.`
+                                                : `Working on page ${wizardProgress.filter(p => p.status !== 'pending').length} of ${wizardProgress.length}…`
+                                            }
+                                        </p>
+                                    </div>
+                                    {wizardEtaMs !== null && wizardEtaMs > 0 && (
+                                        <div className="text-right">
+                                            <p className="text-[10px] text-stone-400 uppercase font-bold tracking-wider">Est. remaining</p>
+                                            <p className="text-lg font-mono font-bold text-sage-600">{(wizardEtaMs / 1000).toFixed(0)}s</p>
+                                        </div>
+                                    )}
                                 </div>
 
                                 {/* Progress bar */}
@@ -1303,51 +1674,59 @@ const ContextEngine: React.FC<ContextEngineProps> = ({
                                     />
                                 </div>
 
-                                {/* Per-URL progress */}
+                                {/* Per-URL streaming detail */}
                                 <div className="flex-1 overflow-y-auto space-y-2 pr-2 custom-scrollbar">
-                                    {wizardProgress.map((p, i) => (
-                                        <div key={i} className={`p-3 rounded-lg border flex items-center gap-3 ${
-                                            p.status === 'scraping' ? 'border-sage-300 bg-sage-50' :
-                                            p.status === 'done' ? 'border-green-200 bg-green-50' :
-                                            p.status === 'failed' ? 'border-red-200 bg-red-50' :
-                                            'border-stone-100 bg-white'
-                                        }`}>
-                                            <div className="shrink-0">
-                                                {p.status === 'pending' && <div className="w-5 h-5 rounded-full border-2 border-stone-200" />}
-                                                {p.status === 'scraping' && <Loader2 size={20} className="animate-spin text-sage-600" />}
-                                                {p.status === 'done' && <CheckCircle size={20} className="text-green-600" />}
-                                                {p.status === 'failed' && <X size={20} className="text-red-500" />}
+                                    {wizardLive.map((p, i) => {
+                                        const host = (() => { try { return new URL(p.url).hostname.replace(/^www\./, ''); } catch { return p.url; } })();
+                                        return (
+                                            <div key={i} className={`p-3 rounded-lg border ${
+                                                p.phase === 'queued' ? 'border-stone-100 bg-white' :
+                                                p.phase === 'done' ? 'border-green-200 bg-green-50' :
+                                                p.phase === 'failed' ? 'border-red-200 bg-red-50' :
+                                                'border-sage-300 bg-sage-50'
+                                            }`}>
+                                                <div className="flex items-center gap-3">
+                                                    <div className="shrink-0">
+                                                        {p.phase === 'queued' && <div className="w-5 h-5 rounded-full border-2 border-stone-200" />}
+                                                        {(p.phase === 'fetching' || p.phase === 'fetched' || p.phase === 'parsing' || p.phase === 'parsed' || p.phase === 'extracting') && <Loader2 size={20} className="animate-spin text-sage-600" />}
+                                                        {p.phase === 'done' && <CheckCircle size={20} className="text-green-600" />}
+                                                        {p.phase === 'failed' && <X size={20} className="text-red-500" />}
+                                                    </div>
+                                                    <div className="flex-1 min-w-0">
+                                                        <div className="flex items-center gap-2">
+                                                            <a href={p.url} target="_blank" rel="noopener noreferrer" className="text-xs font-mono text-sage-700 hover:text-sage-900 underline truncate">{host}</a>
+                                                            {p.entries > 0 && <span className="text-[10px] bg-green-200 text-green-800 font-bold px-1.5 py-0.5 rounded shrink-0">+{p.entries}</span>}
+                                                        </div>
+                                                        {p.detail && p.phase !== 'queued' && (
+                                                            <p className={`text-[11px] mt-0.5 ${p.phase === 'failed' ? 'text-red-600' : p.phase === 'done' ? 'text-green-700' : 'text-sage-700'}`}>
+                                                                {p.detail}
+                                                            </p>
+                                                        )}
+                                                    </div>
+                                                    {p.phase !== 'queued' && p.elapsedMs > 0 && (
+                                                        <span className="text-[10px] font-mono text-stone-400 shrink-0">{(p.elapsedMs / 1000).toFixed(1)}s</span>
+                                                    )}
+                                                </div>
                                             </div>
-                                            <div className="flex-1 min-w-0">
-                                                <a href={p.url} target="_blank" rel="noopener noreferrer" className="text-xs font-mono text-sage-600 hover:text-sage-800 underline truncate block">{p.url}</a>
-                                                {p.status === 'done' && p.entries > 0 && (
-                                                    <p className="text-[10px] text-green-600 font-bold mt-0.5">+{p.entries} entries extracted</p>
-                                                )}
-                                                {p.status === 'done' && p.entries === 0 && (
-                                                    <p className="text-[10px] text-stone-400 mt-0.5">{p.error || 'No extractable content'}</p>
-                                                )}
-                                                {p.status === 'failed' && (
-                                                    <p className="text-[10px] text-red-500 mt-0.5">{p.error || 'Failed to fetch'}</p>
-                                                )}
-                                                {p.status === 'scraping' && (
-                                                    <p className="text-[10px] text-sage-600 mt-0.5 animate-pulse">Fetching and analyzing...</p>
-                                                )}
-                                            </div>
-                                        </div>
-                                    ))}
+                                        );
+                                    })}
                                 </div>
 
-                                {/* Extracted entries preview */}
-                                {wizardExtracted.length > 0 && (
+                                {/* Live extracted entries — appears as Gemini returns them */}
+                                {recentEntries.length > 0 && (
                                     <div className="mt-3 p-3 bg-stone-50 rounded-lg border border-stone-200 max-h-32 overflow-y-auto">
-                                        <p className="text-[10px] font-bold text-stone-400 uppercase tracking-wider mb-2">Preview ({wizardExtracted.length} entries)</p>
+                                        <div className="flex items-center justify-between mb-2">
+                                            <p className="text-[10px] font-bold text-stone-400 uppercase tracking-wider">Live Stream — {wizardExtracted.length} new entries</p>
+                                            <span className="text-[9px] font-mono text-sage-600">most recent first</span>
+                                        </div>
                                         <div className="flex flex-wrap gap-1">
-                                            {wizardExtracted.slice(0, 20).map((e, i) => (
-                                                <span key={i} className="text-[10px] bg-white border border-stone-200 rounded px-1.5 py-0.5 text-stone-600">{e.replacement}</span>
+                                            {recentEntries.slice(0, 30).map((e, i) => (
+                                                <span key={i} className={`text-[10px] px-1.5 py-0.5 rounded border animate-fade-in ${
+                                                    e.type === 'acronym' ? 'bg-purple-50 border-purple-200 text-purple-700' :
+                                                    e.type === 'place' ? 'bg-green-50 border-green-200 text-green-700' :
+                                                    'bg-white border-stone-200 text-stone-700'
+                                                }`}>{e.replacement}</span>
                                             ))}
-                                            {wizardExtracted.length > 20 && (
-                                                <span className="text-[10px] text-stone-400">+{wizardExtracted.length - 20} more</span>
-                                            )}
                                         </div>
                                     </div>
                                 )}
@@ -1355,7 +1734,7 @@ const ContextEngine: React.FC<ContextEngineProps> = ({
                                 {/* Action buttons */}
                                 {wizardProgress.every(p => p.status === 'done' || p.status === 'failed') && (
                                     <div className="pt-4 mt-auto flex gap-2">
-                                        <button onClick={() => { setWizardExtracted([]); setWizardProgress([]); setView('wizard_select'); }} className="px-4 py-3 rounded-xl font-bold text-sm text-stone-500 hover:bg-stone-100 transition-colors">
+                                        <button onClick={() => { setWizardExtracted([]); setWizardProgress([]); setWizardLive([]); setRecentEntries([]); setView('wizard_select'); }} className="px-4 py-3 rounded-xl font-bold text-sm text-stone-500 hover:bg-stone-100 transition-colors">
                                             Back
                                         </button>
                                         <button

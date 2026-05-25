@@ -10,8 +10,9 @@ import { PrerecordedStudio } from './components/PrerecordedStudio';
 import GlobalSettings from './components/GlobalSettings';
 import LocalSetup from './components/LocalSetup';
 import HighlightStudio from './components/HighlightStudio';
+import CaptionInjection from './components/CaptionInjection';
 import { AppState, Caption, DictionaryEntry, UILanguage, SessionStats, Session, ContextSettings, HighlightClip } from './types';
-import { Mic, FileVideo, Settings, Loader2, Server, Globe, Download, Monitor, CheckCircle, ArrowRight, ShieldCheck, Terminal, ExternalLink, Github } from 'lucide-react';
+import { Mic, FileVideo, Settings, Loader2, Server, Globe, Download, Monitor, CheckCircle, ArrowRight, ShieldCheck, Terminal, ExternalLink, Github, Zap } from 'lucide-react';
 import { GoogleGenAI, LiveServerMessage, Modality } from "@google/genai";
 import { translateText } from './services/geminiService';
 
@@ -931,23 +932,39 @@ function App() {
               <button onClick={() => setAppState(p => ({...p, view: 'deployment_choice'}))} className="absolute top-8 left-8 text-stone-500 font-bold">Back</button>
               
               <h1 className="text-4xl font-display font-bold text-forest-dark mb-12">Web App Workspace</h1>
-              <div className="grid grid-cols-1 md:grid-cols-3 gap-8 max-w-6xl w-full">
-                  <div onClick={() => setAppState(p => ({...p, view: 'dashboard'}))} className="bg-white p-8 rounded-2xl border-2 border-stone-200 hover:border-sage-500 hover:shadow-xl cursor-pointer transition-all group">
-                      <div className="bg-sage-100 w-16 h-16 rounded-full flex items-center justify-center text-forest-dark mb-6 group-hover:scale-110 transition-transform"><Mic size={32} /></div>
-                      <h2 className="text-2xl font-bold text-stone-800 mb-2">Live Session</h2>
-                      <p className="text-stone-500 leading-relaxed">Real-time captioning. Browser or Cloud mode.</p>
+              <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-4 gap-6 max-w-7xl w-full">
+                  <div onClick={() => setAppState(p => ({...p, view: 'dashboard'}))} className="bg-white p-7 rounded-2xl border-2 border-stone-200 hover:border-sage-500 hover:shadow-xl cursor-pointer transition-all group">
+                      <div className="bg-sage-100 w-14 h-14 rounded-full flex items-center justify-center text-forest-dark mb-5 group-hover:scale-110 transition-transform"><Mic size={28} /></div>
+                      <h2 className="text-xl font-bold text-stone-800 mb-2">Live Session</h2>
+                      <p className="text-stone-500 leading-relaxed text-sm">Real-time captioning. Browser or Cloud mode.</p>
                   </div>
 
-                  <div onClick={() => setAppState(p => ({...p, view: 'prerecorded'}))} className="bg-white p-8 rounded-2xl border-2 border-stone-200 hover:border-sage-500 hover:shadow-xl cursor-pointer transition-all group">
-                      <div className="bg-sage-100 w-16 h-16 rounded-full flex items-center justify-center text-forest-dark mb-6 group-hover:scale-110 transition-transform"><FileVideo size={32} /></div>
-                      <h2 className="text-2xl font-bold text-stone-800 mb-2">Prerecorded</h2>
-                      <p className="text-stone-500 leading-relaxed">Upload files. Process with Cloud or Local AI.</p>
+                  {/* New: Caption Injection workflow */}
+                  <div
+                      onClick={() => setAppState(p => ({...p, view: 'caption_injection'}))}
+                      className="bg-gradient-to-br from-purple-500 to-pink-500 text-white p-7 rounded-2xl border-2 border-purple-400 hover:shadow-2xl hover:shadow-purple-200 cursor-pointer transition-all group relative overflow-hidden"
+                  >
+                      <div className="absolute -top-4 -right-4 w-24 h-24 bg-white/15 rounded-full blur-2xl"></div>
+                      <div className="relative z-10">
+                          <div className="bg-white/20 w-14 h-14 rounded-full flex items-center justify-center mb-5 group-hover:scale-110 transition-transform"><Zap size={28} /></div>
+                          <div className="flex items-center gap-2 mb-2">
+                              <h2 className="text-xl font-bold">Caption Injection</h2>
+                              <span className="text-[9px] bg-white/25 px-1.5 py-0.5 rounded font-bold uppercase">New</span>
+                          </div>
+                          <p className="text-purple-50 leading-relaxed text-sm">Embed CEA-608/708 into your SDI feed for web-presenter passthrough to YouTube.</p>
+                      </div>
                   </div>
-                  
-                  <div onClick={() => setAppState(p => ({...p, view: 'local_setup'}))} className="bg-white p-8 rounded-2xl border-2 border-stone-200 hover:border-sage-500 hover:shadow-xl cursor-pointer transition-all group opacity-75">
-                      <div className="bg-stone-100 w-16 h-16 rounded-full flex items-center justify-center text-stone-600 mb-6 group-hover:scale-110 transition-transform"><Server size={32} /></div>
-                      <h2 className="text-2xl font-bold text-stone-800 mb-2">Connect Local AI</h2>
-                      <p className="text-stone-500 leading-relaxed">Connect this web app to a local Whisper server via WebSocket.</p>
+
+                  <div onClick={() => setAppState(p => ({...p, view: 'prerecorded'}))} className="bg-white p-7 rounded-2xl border-2 border-stone-200 hover:border-sage-500 hover:shadow-xl cursor-pointer transition-all group">
+                      <div className="bg-sage-100 w-14 h-14 rounded-full flex items-center justify-center text-forest-dark mb-5 group-hover:scale-110 transition-transform"><FileVideo size={28} /></div>
+                      <h2 className="text-xl font-bold text-stone-800 mb-2">Prerecorded</h2>
+                      <p className="text-stone-500 leading-relaxed text-sm">Upload files. Process with Cloud or Local AI.</p>
+                  </div>
+
+                  <div onClick={() => setAppState(p => ({...p, view: 'local_setup'}))} className="bg-white p-7 rounded-2xl border-2 border-stone-200 hover:border-sage-500 hover:shadow-xl cursor-pointer transition-all group opacity-75">
+                      <div className="bg-stone-100 w-14 h-14 rounded-full flex items-center justify-center text-stone-600 mb-5 group-hover:scale-110 transition-transform"><Server size={28} /></div>
+                      <h2 className="text-xl font-bold text-stone-800 mb-2">Connect Local AI</h2>
+                      <p className="text-stone-500 leading-relaxed text-sm">Connect this web app to a local Whisper server via WebSocket.</p>
                   </div>
               </div>
           </div>
@@ -1037,11 +1054,18 @@ function App() {
       )}
 
       {appState.view === 'studio' && (
-          <HighlightStudio 
+          <HighlightStudio
             clips={appState.highlightCart}
             sourceFile={appState.uploadedVideoFile} // In a real app we'd pass this from PrerecordedStudio or allow upload here
             localServerUrl={appState.localServerUrl}
             onBack={() => setAppState(p => ({...p, view: 'analytics'}))}
+          />
+      )}
+
+      {appState.view === 'caption_injection' && (
+          <CaptionInjection
+              onBack={() => setAppState(p => ({...p, view: 'choice'}))}
+              apiKey={appState.apiKey}
           />
       )}
 

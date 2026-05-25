@@ -173,32 +173,71 @@ let captionMetrics = {
     startTime: Date.now(),
 };
 
-// Load Gemini API key — check env var, .env.local, then built-in default
+// Load Gemini API key — check env var, .env.local, then built-in default.
+// Tracks the source so the UI can show users where the active key came from.
+let geminiKeySource = 'none'; // 'env' | 'env_local' | 'builtin' | 'runtime' | 'none'
+let geminiKeyActive = '';
+
 function loadGeminiApiKey() {
     // 1. Environment variable (highest priority)
     if (process.env.GEMINI_API_KEY && process.env.GEMINI_API_KEY !== 'PLACEHOLDER_API_KEY') {
+        geminiKeySource = 'env';
         return process.env.GEMINI_API_KEY.trim();
     }
-    // 2. .env.local file
-    try {
-        const envPath = path.join(baseDir, '.env.local');
-        if (fs.existsSync(envPath)) {
-            const envContent = fs.readFileSync(envPath, 'utf-8');
-            const match = envContent.match(/GEMINI_API_KEY=(.+)/);
-            if (match && match[1] && match[1] !== 'PLACEHOLDER_API_KEY') {
-                return match[1].trim();
+    // 2. .env.local file — check both project root and process cwd
+    const candidatePaths = [
+        path.join(baseDir, '.env.local'),
+        path.join(process.cwd(), '.env.local'),
+    ];
+    for (const envPath of candidatePaths) {
+        try {
+            if (fs.existsSync(envPath)) {
+                const envContent = fs.readFileSync(envPath, 'utf-8');
+                const match = envContent.match(/GEMINI_API_KEY\s*=\s*(.+)/);
+                if (match && match[1]) {
+                    const trimmed = match[1].trim().replace(/^["']|["']$/g, '');
+                    if (trimmed && trimmed !== 'PLACEHOLDER_API_KEY') {
+                        geminiKeySource = 'env_local';
+                        return trimmed;
+                    }
+                }
             }
-        }
-    } catch (e) {}
-    // 3. Built-in default key (bundled for out-of-box translation support)
-    return 'AIzaSyBfhLU81pK-sKfqhZ4CMcK9UNV2Bi9u7BI';
+        } catch (e) {}
+    }
+    // 3. No key found — surface this in the UI rather than embedding a key
+    //    in source. Distributed binaries ship with .env.local next to them.
+    geminiKeySource = 'none';
+    return '';
 }
 
-const geminiKey = loadGeminiApiKey();
-setPolisherApiKey(geminiKey);
-setLearnerApiKey(geminiKey);
-setTranslationApiKey(geminiKey);
-console.log('[Config] Gemini API key loaded');
+geminiKeyActive = loadGeminiApiKey();
+if (geminiKeyActive) {
+    setPolisherApiKey(geminiKeyActive);
+    setLearnerApiKey(geminiKeyActive);
+    setTranslationApiKey(geminiKeyActive);
+    console.log(`[Config] Gemini API key loaded (source: ${geminiKeySource}, length: ${geminiKeyActive.length})`);
+} else {
+    console.log(`[Config] No Gemini API key found — set one in the Context Engine UI or place a .env.local next to the executable.`);
+}
+
+// Update the in-memory key + source when a client provides one at runtime.
+function applyRuntimeApiKey(key) {
+    if (!key || typeof key !== 'string') return false;
+    const trimmed = key.trim();
+    if (trimmed.length < 10) return false;
+    geminiKeyActive = trimmed;
+    geminiKeySource = 'runtime';
+    setPolisherApiKey(trimmed);
+    setLearnerApiKey(trimmed);
+    setTranslationApiKey(trimmed);
+    return true;
+}
+
+function maskKey(k) {
+    if (!k) return '';
+    if (k.length <= 8) return '****';
+    return k.slice(0, 4) + '…' + k.slice(-4);
+}
 
 // Profanity word list (word-boundary matched — won't hit "assemble", "class", etc.)
 const PROFANITY_WORDS = [
@@ -551,6 +590,150 @@ app.post('/api/decklink/clear', (req, res) => {
     }
 });
 
+// --- Caption Injection Mode ---
+// Unified entry point: the UI describes the source kind and the server
+// routes to the right native handler (DeckLink passthrough, NDI passthrough,
+// or standalone). The whole point of this mode is to take a live video
+// source and embed CEA-608/708 captions in the outgoing SDI so a downstream
+// web presenter (Wowza, Resi, Streamlabs, etc.) can pass them through to
+// YouTube as broadcast captions.
+//
+// Body: {
+//   sourceKind: 'sdi' | 'ndi' | 'standalone',
+//   inputDevice?: number,   // for sdi
+//   ndiSource?: string,     // for ndi
+//   outputDevice: number,
+//   displayMode: number,
+//   frameRate?: string,
+//   encodingMode?: 'cea608' | 'dtvcc',
+// }
+app.post('/api/inject/start', async (req, res) => {
+    if (!decklink) {
+        return res.status(400).json({ ok: false, error: 'DeckLink addon not loaded — install Blackmagic Desktop Video and place decklink_addon.node next to the executable.' });
+    }
+    const {
+        sourceKind = 'sdi',
+        inputDevice = 0,
+        ndiSource,
+        outputDevice = 0,
+        displayMode = 0,
+        frameRate = '29.97',
+        encodingMode,
+    } = req.body || {};
+
+    console.log('[Inject] Start:', JSON.stringify(req.body));
+
+    if (encodingMode && ['cea608', 'dtvcc'].includes(encodingMode)) {
+        captionConfig.encodingMode = encodingMode;
+    }
+
+    try {
+        if (deckLinkRunning) {
+            stopFrameLoop();
+            decklink.stopOutput();
+            deckLinkRunning = false;
+            if (cea608Encoder) cea608Encoder.reset();
+            if (dtvccEncoder) dtvccEncoder.reset();
+            if (cea708Builder) cea708Builder.reset();
+        }
+    } catch (e) {
+        console.warn('[Inject] Stop during restart failed:', e.message);
+    }
+
+    try {
+        await initCaptionEncoder();
+        let ok = false;
+        let mode = '';
+
+        if (sourceKind === 'ndi') {
+            if (!decklink.startNdiPassthrough) {
+                return res.status(400).json({ ok: false, error: 'NDI passthrough not built into this addon. Use SDI input instead, or rebuild the native addon with NDI SDK.' });
+            }
+            if (!ndiSource) {
+                return res.status(400).json({ ok: false, error: 'ndiSource required for NDI mode' });
+            }
+            ok = decklink.startNdiPassthrough(ndiSource, outputDevice, displayMode);
+            mode = 'inject_ndi';
+        } else if (sourceKind === 'standalone') {
+            // Black frames + captions — useful when the video pipeline is elsewhere
+            // and you want captions on a dedicated SDI feed for the presenter.
+            ok = decklink.startOutput(outputDevice, displayMode);
+            mode = 'inject_standalone';
+        } else {
+            // SDI input → SDI output + captions (the canonical injection mode)
+            ok = decklink.startPassthrough(inputDevice, outputDevice, displayMode);
+            mode = 'inject_sdi';
+        }
+
+        if (!ok) {
+            return res.json({ ok: false, error: 'Failed to start output. The DeckLink port may be in use by another app (ATEM Software, OBS, Resolve).' });
+        }
+
+        deckLinkRunning = true;
+        deckLinkMode = mode;
+        deckLinkFrameRate = frameRate;
+        startFrameLoop(deckLinkFrameRate);
+
+        res.json({
+            ok: true,
+            mode,
+            sourceKind,
+            encodingMode: captionConfig.encodingMode,
+            frameRate: deckLinkFrameRate,
+        });
+    } catch (e) {
+        console.error('[Inject] Exception:', e.message);
+        res.status(500).json({ ok: false, error: e.message });
+    }
+});
+
+app.post('/api/inject/stop', (req, res) => {
+    if (!decklink) return res.status(400).json({ ok: false, error: 'DeckLink addon not loaded' });
+    try {
+        stopFrameLoop();
+        decklink.stopOutput();
+        deckLinkRunning = false;
+        deckLinkMode = null;
+        if (cea608Encoder) cea608Encoder.reset();
+        if (dtvccEncoder) dtvccEncoder.reset();
+        if (cea708Builder) cea708Builder.reset();
+        res.json({ ok: true });
+    } catch (e) {
+        res.status(500).json({ ok: false, error: e.message });
+    }
+});
+
+app.get('/api/inject/status', (req, res) => {
+    const protocol = req.headers['x-forwarded-proto'] || req.protocol;
+    const host = req.get('host');
+    const presenterUrl = publicTunnelUrl || backupTunnelUrl || `${protocol}://${host}`;
+    let nativeStatus = { running: false, mode: 'stopped', framesOutput: 0, droppedFrames: 0 };
+    try { if (decklink) nativeStatus = decklink.getStatus(); } catch {}
+
+    res.json({
+        running: deckLinkRunning && /^inject_/.test(deckLinkMode || ''),
+        mode: deckLinkMode,
+        frameRate: deckLinkFrameRate,
+        encodingMode: captionConfig.encodingMode,
+        framesOutput: nativeStatus.framesOutput || 0,
+        droppedFrames: nativeStatus.droppedFrames || 0,
+        encoderQueueDepth: (captionConfig.encodingMode === 'dtvcc' ? dtvccEncoder?.queueLength : cea608Encoder?.queueLength) || 0,
+        cea708BridgeClients: cea708Clients.size,
+        presenterUrl: `${presenterUrl}/?view=audience&session=demo`,
+        addonLoaded: !!decklink,
+        ndiAvailable: !!(decklink && decklink.startNdiPassthrough),
+    });
+});
+
+// Direct caption push into the encoder (so the injection panel can send
+// captions without going through the main session WebSocket).
+app.post('/api/inject/caption', (req, res) => {
+    const { text, isFinal = true } = req.body || {};
+    if (!text || typeof text !== 'string') return res.status(400).json({ ok: false, error: 'text required' });
+    feedCaptionToEncoder({ type: 'caption', isFinal: !!isFinal, payload: { text } });
+    res.json({ ok: true });
+});
+
 // --- Caption Encoding Config API ---
 app.get('/api/caption/config', (req, res) => {
     res.json(captionConfig);
@@ -656,10 +839,22 @@ app.post('/api/polisher/toggle', (req, res) => {
 
 app.post('/api/polisher/apikey', (req, res) => {
     const { key } = req.body;
-    setPolisherApiKey(key);
-    setLearnerApiKey(key);
-    setTranslationApiKey(key);
-    res.json({ ok: true });
+    const ok = applyRuntimeApiKey(key);
+    if (!ok) {
+        return res.status(400).json({ ok: false, error: 'Key missing or too short' });
+    }
+    res.json({ ok: true, source: geminiKeySource, masked: maskKey(geminiKeyActive) });
+});
+
+// Public Gemini key status — used by the Context Engine UI to show a clear banner
+// (loaded vs missing) and where the active key came from.
+app.get('/api/gemini/status', (req, res) => {
+    res.json({
+        loaded: !!geminiKeyActive && geminiKeyActive.length >= 10,
+        source: geminiKeySource,
+        masked: maskKey(geminiKeyActive),
+        keyLength: geminiKeyActive ? geminiKeyActive.length : 0,
+    });
 });
 
 // --- Local Proper Noun Extraction (no AI needed) ---
@@ -825,7 +1020,7 @@ app.post('/api/context/scrape', async (req, res) => {
     const { url, apiKey: bodyKey } = req.body;
     if (!url) return res.status(400).json({ ok: false, error: 'url required' });
     const apiKey = bodyKey || req.headers['x-api-key'] || null;
-    if (apiKey) { setPolisherApiKey(apiKey); setLearnerApiKey(apiKey); }
+    if (apiKey) applyRuntimeApiKey(apiKey);
 
     try {
         console.log(`[Context] Scraping URL: ${url}`);
@@ -889,6 +1084,145 @@ app.post('/api/context/scrape', async (req, res) => {
     } catch (e) {
         console.warn(`[Context] Scrape error: ${e.message}`);
         res.status(500).json({ ok: false, error: e.message });
+    }
+});
+
+// Server-side municipality search — used when the browser has no API key
+// but the server has one loaded (e.g. from .env.local). Mirrors the shape
+// returned by services/geminiService.ts: [{title, url, type, why}].
+app.post('/api/context/search-municipality', async (req, res) => {
+    const { query, apiKey: bodyKey } = req.body || {};
+    if (!query || typeof query !== 'string') return res.status(400).json({ ok: false, error: 'query required' });
+    const apiKey = (bodyKey && bodyKey.length > 10) ? bodyKey : geminiKeyActive;
+    if (!apiKey) return res.status(400).json({ ok: false, error: 'No Gemini API key loaded on the server' });
+
+    try {
+        const { GoogleGenAI } = await import('@google/genai');
+        const ai = new GoogleGenAI({ apiKey });
+        const response = await ai.models.generateContent({
+            model: 'gemini-2.5-flash',
+            contents: `Find the official municipal website for "${query}" and list the most useful pages for learning proper nouns (elected officials, department staff, boards/commissions, meeting agendas/minutes). For each page found, give the title, full URL, a category, and why it's useful for live captioning.`,
+            config: { tools: [{ googleSearch: {} }] },
+        });
+
+        const chunks = response?.candidates?.[0]?.groundingMetadata?.groundingChunks || [];
+        const out = [];
+        const seen = new Set();
+        for (const chunk of chunks) {
+            const url = chunk?.web?.uri;
+            const title = chunk?.web?.title;
+            if (!url || !title || seen.has(url)) continue;
+            seen.add(url);
+            const lower = (url + ' ' + title).toLowerCase();
+            let type = 'General';
+            if (/official|elected|mayor|council|select.*board|government|alderm/i.test(lower)) type = 'Officials';
+            else if (/meeting|agenda|minute|calendar/i.test(lower)) type = 'Meetings';
+            else if (/department|staff|directory|contact/i.test(lower)) type = 'Departments';
+            else if (/commission|committee|advisory/i.test(lower)) type = 'Committees';
+            out.push({ title, url, type, why: `Found via Google Search for ${query}` });
+        }
+
+        // Fallback: parse URLs out of the raw text if grounding returned nothing
+        if (out.length === 0) {
+            const text = response.text || '';
+            const matches = text.match(/https?:\/\/[^\s)<>"]+/g) || [];
+            for (const u of matches) {
+                const clean = u.replace(/[.,;:!?)]+$/, '');
+                if (seen.has(clean)) continue;
+                seen.add(clean);
+                out.push({ title: clean.split('/').pop()?.replace(/-/g, ' ') || 'Web Page', url: clean, type: 'General', why: 'Extracted from search results' });
+            }
+        }
+
+        res.json({ ok: true, results: out.slice(0, 8) });
+    } catch (e) {
+        console.warn('[Wizard] Server search failed:', e.message);
+        res.status(500).json({ ok: false, error: e.message });
+    }
+});
+
+// Streaming scrape endpoint — emits phase events via SSE so the wizard
+// can show real-time progress for ONE URL (fetching → parsed → extracting → done).
+// Body: { url, apiKey? }
+app.post('/api/context/scrape-stream', async (req, res) => {
+    const { url, apiKey: bodyKey } = req.body;
+    if (!url) return res.status(400).json({ ok: false, error: 'url required' });
+    const apiKey = bodyKey || req.headers['x-api-key'] || null;
+    if (apiKey) applyRuntimeApiKey(apiKey);
+
+    res.setHeader('Content-Type', 'text/event-stream');
+    res.setHeader('Cache-Control', 'no-cache, no-transform');
+    res.setHeader('Connection', 'keep-alive');
+    res.setHeader('X-Accel-Buffering', 'no');
+    res.flushHeaders?.();
+
+    const emit = (phase, data = {}) => {
+        try { res.write(`data: ${JSON.stringify({ phase, t: Date.now(), ...data })}\n\n`); } catch {}
+    };
+
+    const start = Date.now();
+    emit('fetching', { url });
+
+    try {
+        const response = await fetch(url, {
+            headers: { 'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Community Captioner' },
+            signal: AbortSignal.timeout(15000),
+            redirect: 'follow',
+        });
+
+        if (!response.ok) {
+            emit('error', { error: `HTTP ${response.status}` });
+            return res.end();
+        }
+
+        const contentType = response.headers.get('content-type') || '';
+        emit('fetched', { contentType, status: response.status, elapsedMs: Date.now() - start });
+
+        let text = '';
+        let sourceType = 'html';
+
+        if (contentType.includes('application/pdf') && pdfParse) {
+            const buffer = Buffer.from(await response.arrayBuffer());
+            emit('parsing', { sourceType: 'pdf', bytes: buffer.length });
+            const pdf = await pdfParse(buffer);
+            text = pdf.text?.trim() || '';
+            sourceType = 'pdf';
+        } else {
+            const html = await response.text();
+            emit('parsing', { sourceType: 'html', bytes: html.length });
+            text = html.replace(/<script[^>]*>[\s\S]*?<\/script>/gi, '')
+                       .replace(/<style[^>]*>[\s\S]*?<\/style>/gi, '')
+                       .replace(/<[^>]+>/g, ' ')
+                       .replace(/&nbsp;/g, ' ')
+                       .replace(/&amp;/g, '&')
+                       .replace(/&lt;/g, '<')
+                       .replace(/&gt;/g, '>')
+                       .replace(/\s+/g, ' ')
+                       .trim();
+        }
+
+        emit('parsed', { textLength: text.length, sourceType });
+
+        if (text.length < 50) {
+            emit('done', { entries: [], warning: 'Page has little text content', sourceType });
+            return res.end();
+        }
+
+        emit('extracting', { textLength: text.length, model: 'gemini-2.5-flash' });
+
+        const entries = await extractDictionary(text, geminiKeyActive);
+
+        // Stream entries in chunks so the UI can show them appearing
+        const CHUNK = 10;
+        for (let i = 0; i < entries.length; i += CHUNK) {
+            emit('entries', { batch: entries.slice(i, i + CHUNK), total: entries.length, sent: Math.min(i + CHUNK, entries.length) });
+        }
+
+        emit('done', { totalEntries: entries.length, totalMs: Date.now() - start, sourceType });
+        res.end();
+    } catch (e) {
+        emit('error', { error: e.message });
+        res.end();
     }
 });
 
@@ -963,7 +1297,7 @@ if (upload) {
 
         // Accept API key from header for extraction
         const apiKey = req.headers['x-api-key'] || null;
-        if (apiKey) { setPolisherApiKey(apiKey); setLearnerApiKey(apiKey); }
+        if (apiKey) applyRuntimeApiKey(apiKey);
 
         try {
             const contentType = req.file.mimetype || '';
@@ -1023,10 +1357,10 @@ app.post('/api/context/names', async (req, res) => {
         return res.status(400).json({ ok: false, error: 'names array required' });
     }
     const extractKey = bodyKey || req.headers['x-api-key'] || null;
-    if (extractKey) { setPolisherApiKey(extractKey); setLearnerApiKey(extractKey); }
+    if (extractKey) applyRuntimeApiKey(extractKey);
 
     try {
-        const entries = await generateMishearings(names.slice(0, 50), extractKey);
+        const entries = await generateMishearings(names.slice(0, 50), extractKey || geminiKeyActive);
         console.log(`[Context] Quick Names: ${names.length} names → ${entries.length} entries`);
         res.json({ ok: true, entries });
     } catch (e) {
@@ -1040,9 +1374,9 @@ app.post('/api/context/extract', async (req, res) => {
     const { text, apiKey: bodyKey } = req.body;
     if (!text) return res.status(400).json({ ok: false, error: 'text required' });
     const extractKey = bodyKey || req.headers['x-api-key'] || null;
-    if (extractKey) { setPolisherApiKey(extractKey); setLearnerApiKey(extractKey); }
+    if (extractKey) applyRuntimeApiKey(extractKey);
 
-    const entries = await extractDictionary(text, extractKey);
+    const entries = await extractDictionary(text, extractKey || geminiKeyActive);
     res.json({ ok: true, entries });
 });
 
