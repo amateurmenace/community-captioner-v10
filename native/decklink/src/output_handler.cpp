@@ -29,7 +29,7 @@ bool OutputHandler::Start(uint32_t deviceIndex, BMDDisplayMode displayMode) {
     if (m_running) return false;
 
     // Find the device by index
-    IDeckLinkIterator* iterator = CreateDeckLinkIteratorInstance();
+    IDeckLinkIterator* iterator = CreateDeckLinkIterator();
     if (!iterator) {
         fprintf(stderr, "[DeckLink] No driver installed\n");
         return false;
@@ -112,8 +112,8 @@ bool OutputHandler::Start(uint32_t deviceIndex, BMDDisplayMode displayMode) {
     // Fill frames with black (UYVY black = 0x10 for Y, 0x80 for U/V)
     void* bufA = nullptr;
     void* bufB = nullptr;
-    m_frameA->GetBytes(&bufA);
-    m_frameB->GetBytes(&bufB);
+    GetFrameBytes(m_frameA, &bufA);
+    GetFrameBytes(m_frameB, &bufB);
     if (bufA) {
         uint8_t* p = (uint8_t*)bufA;
         for (int32_t i = 0; i < m_height * rowBytes; i += 4) {

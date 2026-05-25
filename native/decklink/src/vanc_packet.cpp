@@ -19,12 +19,20 @@ HRESULT CaptionAncillaryPacket::QueryInterface(REFIID iid, void** ppv) {
     }
 
     // Also support IUnknown
+#ifdef _WIN32
+    if (memcmp(&iid, &IID_IUnknown, sizeof(REFIID)) == 0) {
+        *ppv = static_cast<IDeckLinkAncillaryPacket*>(this);
+        AddRef();
+        return S_OK;
+    }
+#else
     CFUUIDBytes iunknown = CFUUIDGetUUIDBytes(IUnknownUUID);
     if (memcmp(&iid, &iunknown, sizeof(REFIID)) == 0) {
         *ppv = static_cast<IDeckLinkAncillaryPacket*>(this);
         AddRef();
         return S_OK;
     }
+#endif
 
     *ppv = nullptr;
     return E_NOINTERFACE;
@@ -69,3 +77,10 @@ uint32_t CaptionAncillaryPacket::GetLineNumber() {
 uint8_t CaptionAncillaryPacket::GetDataStreamIndex() {
     return 0;
 }
+
+#ifdef _WIN32
+BMDAncillaryDataSpace CaptionAncillaryPacket::GetDataSpace() {
+    // CEA-708 CDP packets are carried in the vertical ancillary data space.
+    return bmdAncillaryDataSpaceVANC;
+}
+#endif

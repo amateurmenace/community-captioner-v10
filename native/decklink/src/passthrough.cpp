@@ -23,7 +23,7 @@ PassthroughHandler::~PassthroughHandler() {
 }
 
 static IDeckLink* GetDeviceByIndex(uint32_t index) {
-    IDeckLinkIterator* iterator = CreateDeckLinkIteratorInstance();
+    IDeckLinkIterator* iterator = CreateDeckLinkIterator();
     if (!iterator) return nullptr;
 
     IDeckLink* deckLink = nullptr;
@@ -162,8 +162,8 @@ HRESULT PassthroughHandler::VideoInputFrameArrived(IDeckLinkVideoInputFrame* vid
     // Copy pixel data from input to output
     void* inBuf = nullptr;
     void* outBuf = nullptr;
-    videoFrame->GetBytes(&inBuf);
-    outFrame->GetBytes(&outBuf);
+    GetFrameBytes(videoFrame, &inBuf);
+    GetFrameBytes(outFrame, &outBuf);
 
     if (inBuf && outBuf) {
         memcpy(outBuf, inBuf, m_height * m_rowBytes);

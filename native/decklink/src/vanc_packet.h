@@ -25,6 +25,10 @@ public:
     uint8_t GetSDID() override;
     uint32_t GetLineNumber() override;
     uint8_t GetDataStreamIndex() override;
+#ifdef _WIN32
+    // Present in the Windows COM interface, absent from the macOS framework.
+    BMDAncillaryDataSpace GetDataSpace() override;
+#endif
 
 private:
     std::vector<uint8_t> m_data;

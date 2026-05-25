@@ -75,9 +75,12 @@ try {
 }
 
 # 3. Check MSVC (cl.exe)
+# Use Get-Command rather than running cl.exe directly: in Windows PowerShell 5.1,
+# `cl 2>&1` wraps stderr lines as ErrorRecords and trips $ErrorActionPreference='Stop'
+# even when cl is installed (cl with no args writes its banner to stderr).
 try {
-    $clVersion = (& cl 2>&1 | Select-Object -First 1)
-    Write-Host "MSVC:    $clVersion"
+    $clPath = (Get-Command cl -ErrorAction Stop).Source
+    Write-Host "MSVC:    $clPath"
 } catch {
     Write-Host ""
     Write-Error @"

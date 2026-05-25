@@ -18,7 +18,7 @@ InputHandler::~InputHandler() {
 bool InputHandler::Start(uint32_t deviceIndex, BMDDisplayMode displayMode) {
     if (m_running) return false;
 
-    IDeckLinkIterator* iterator = CreateDeckLinkIteratorInstance();
+    IDeckLinkIterator* iterator = CreateDeckLinkIterator();
     if (!iterator) return false;
 
     IDeckLink* deckLink = nullptr;

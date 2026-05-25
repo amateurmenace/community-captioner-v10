@@ -7,7 +7,9 @@
 #include <string>
 
 #ifdef _WIN32
+    #ifndef NOMINMAX
     #define NOMINMAX
+    #endif
     #include <windows.h>
     #include <comdef.h>
     #include <comutil.h>
@@ -28,6 +30,18 @@
         IDeckLinkIterator* it = nullptr;
         HRESULT hr = CoCreateInstance(CLSID_CDeckLinkIterator, nullptr, CLSCTX_ALL, IID_IDeckLinkIterator, (void**)&it);
         return SUCCEEDED(hr) ? it : nullptr;
+    }
+
+    // On Windows the pixel-buffer accessor is on IDeckLinkVideoBuffer, obtained
+    // via QueryInterface from any frame. On macOS it's directly on the frame.
+    inline HRESULT GetFrameBytes(IDeckLinkVideoFrame* frame, void** buffer) {
+        if (!frame || !buffer) return E_INVALIDARG;
+        IDeckLinkVideoBuffer* buf = nullptr;
+        HRESULT hr = frame->QueryInterface(IID_IDeckLinkVideoBuffer, (void**)&buf);
+        if (FAILED(hr) || !buf) return hr;
+        hr = buf->GetBytes(buffer);
+        buf->Release();
+        return hr;
     }
 
     // RAII for COM init on the current thread
@@ -57,6 +71,11 @@
 
     inline IDeckLinkIterator* CreateDeckLinkIterator() {
         return CreateDeckLinkIteratorInstance();
+    }
+
+    inline HRESULT GetFrameBytes(IDeckLinkVideoFrame* frame, void** buffer) {
+        if (!frame || !buffer) return E_INVALIDARG;
+        return frame->GetBytes(buffer);
     }
 
     // No-op COM init on macOS

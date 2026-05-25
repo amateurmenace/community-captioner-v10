@@ -76,10 +76,16 @@ elseif(WIN32)
 
     include_directories(${BMD_GEN_DIR})
 
+    # CMAKE_JS_SRC = win_delay_load_hook.cc — required so that delay-loaded
+    # NODE.EXE symbols resolve against the host binary when the addon is loaded
+    # inside a pkg-bundled executable (where the host is CommunityCaptioner.exe,
+    # not node.exe). Without this hook, the addon segfaults on require() inside
+    # the standalone build.
     add_library(${PROJECT_NAME} SHARED
         ${COMMON_SOURCES}
         ${BMD_HEADER}
         ${BMD_IID}
+        ${CMAKE_JS_SRC}
     )
 
     target_link_libraries(${PROJECT_NAME}
