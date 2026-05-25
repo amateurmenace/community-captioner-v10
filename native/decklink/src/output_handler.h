@@ -1,7 +1,7 @@
 #pragma once
 
 #include <napi.h>
-#include "DeckLinkAPI.h"
+#include "platform.h"
 #include <mutex>
 #include <vector>
 #include <atomic>

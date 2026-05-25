@@ -1,7 +1,7 @@
 #pragma once
 
 #include <napi.h>
-#include "DeckLinkAPI.h"
+#include "platform.h"
 
 namespace DeviceManager {
     // Returns array of {name, index, hasInput, hasOutput, displayModes}

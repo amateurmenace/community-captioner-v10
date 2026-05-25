@@ -397,12 +397,51 @@ import '../server/relay.js';
     );
 
     if (fs.existsSync(winExe)) {
+      // Stage a distribution folder so users get .exe + helpers + .env.local
+      // together in one zip.
+      const winBundle = path.join(BUILD, 'windows-bundle');
+      if (fs.existsSync(winBundle)) fs.rmSync(winBundle, { recursive: true });
+      fs.mkdirSync(winBundle, { recursive: true });
+
+      fs.copyFileSync(winExe, path.join(winBundle, 'CommunityCaptioner.exe'));
+
+      // Bundle .env.local (Gemini key) so the Context Engine works out-of-box
+      const envSrc = path.join(ROOT, '.env.local');
+      if (fs.existsSync(envSrc)) {
+        fs.copyFileSync(envSrc, path.join(winBundle, '.env.local'));
+      }
+
+      // Bundle Windows setup helpers (SETUP.md, setup-decklink.bat) so
+      // DeckLink users have a clear path to enable SDI injection.
+      const extrasDir = path.join(ROOT, 'distribution', 'windows-extras');
+      if (fs.existsSync(extrasDir)) {
+        for (const f of fs.readdirSync(extrasDir)) {
+          fs.copyFileSync(path.join(extrasDir, f), path.join(winBundle, f));
+        }
+      }
+
+      // Try to bundle a Windows-built decklink_addon.node if one exists
+      // locally (e.g. downloaded from the CI workflow). Otherwise leave it
+      // out — the in-app setup card explains how to fetch it.
+      const winAddonCandidates = [
+        path.join(ROOT, 'native', 'decklink', 'prebuilt', 'decklink_addon-windows-x64.node'),
+        path.join(ROOT, 'decklink_addon-windows-x64.node'),
+      ];
+      for (const c of winAddonCandidates) {
+        if (fs.existsSync(c)) {
+          fs.copyFileSync(c, path.join(winBundle, 'decklink_addon.node'));
+          console.log(`  Bundled Windows DeckLink addon from ${c}`);
+          break;
+        }
+      }
+
       const size = (fs.statSync(winExe).size / 1024 / 1024).toFixed(1);
       console.log(`\n  Built: ${winExe} (${size} MB)`);
+      console.log(`  Staged bundle: ${winBundle}/`);
       console.log(`\n  To deploy on Windows:`);
-      console.log(`    1. Copy CommunityCaptioner.exe to the target machine`);
-      console.log(`    2. Double-click the .exe — browser opens automatically`);
-      console.log(`    3. No Node.js installation required\n`);
+      console.log(`    1. Zip the windows-bundle/ folder`);
+      console.log(`    2. Recipient unzips and double-clicks CommunityCaptioner.exe`);
+      console.log(`    3. For SDI injection: run setup-decklink.bat (downloads the prebuilt addon)\n`);
     }
   }
 

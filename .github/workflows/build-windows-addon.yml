@@ -1,0 +1,117 @@
+name: Build Windows DeckLink addon
+
+# Builds decklink_addon.node for Windows x64 and uploads it as a release asset.
+# Triggers:
+#   - Manually via the "Run workflow" button (workflow_dispatch)
+#   - On every push of a v* tag (auto-attaches to the matching GitHub Release)
+#
+# Required repository secret:
+#   BMD_SDK_URL — direct download URL for the Blackmagic DeckLink SDK .zip
+#     (must contain Win/include/DeckLinkAPI.idl and friends after unpacking).
+#     The SDK is gated behind blackmagicdesign.com registration; host the .zip
+#     somewhere you control (S3, R2, private GitHub release, etc.) and put the
+#     URL in this secret.
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: 'Existing release tag to attach the addon to (e.g. v6.3.1). Leave blank to skip upload.'
+        required: false
+        type: string
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  build:
+    runs-on: windows-2022
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install npm dependencies
+        run: npm ci
+
+      - name: Validate BMD_SDK_URL secret is set
+        shell: pwsh
+        run: |
+          if (-not "${{ secrets.BMD_SDK_URL }}") {
+            Write-Error "BMD_SDK_URL repository secret is not set. Upload the DeckLink SDK .zip somewhere you control and add its URL as a secret named BMD_SDK_URL."
+            exit 1
+          }
+
+      - name: Download DeckLink SDK
+        shell: pwsh
+        env:
+          BMD_SDK_URL: ${{ secrets.BMD_SDK_URL }}
+        run: |
+          New-Item -ItemType Directory -Force -Path bmd-sdk | Out-Null
+          Invoke-WebRequest -Uri $env:BMD_SDK_URL -OutFile bmd-sdk.zip
+          Expand-Archive -Path bmd-sdk.zip -DestinationPath bmd-sdk -Force
+          # Locate the Win/include directory inside the unpacked SDK
+          $includeDir = Get-ChildItem -Path bmd-sdk -Recurse -Directory -Filter 'include' |
+            Where-Object { Test-Path (Join-Path $_.FullName 'DeckLinkAPI.idl') } |
+            Select-Object -First 1
+          if (-not $includeDir) {
+            Write-Error "DeckLink SDK download did not contain DeckLinkAPI.idl under any include/ directory. Confirm the zip layout."
+            exit 1
+          }
+          echo "BMD_SDK_DIR=$($includeDir.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Append
+          Write-Host "Using SDK at $($includeDir.FullName)"
+
+      - name: Set up MSVC dev environment
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Configure + build native addon
+        shell: pwsh
+        run: |
+          # cmake-js with extra cmake args pointing at the SDK
+          npx cmake-js compile --directory native/decklink --CDBMD_SDK_DIR="$env:BMD_SDK_DIR" --config Release
+
+      - name: Show output + checksum
+        shell: pwsh
+        run: |
+          $node = 'native/decklink/build/Release/decklink_addon.node'
+          if (-not (Test-Path $node)) {
+            Write-Error "Build did not produce $node"
+            exit 1
+          }
+          $size = (Get-Item $node).Length
+          $hash = (Get-FileHash $node -Algorithm SHA256).Hash
+          Write-Host "Built: $node ($size bytes)"
+          Write-Host "SHA256: $hash"
+          Copy-Item $node "decklink_addon-windows-x64.node"
+
+      - name: Upload as workflow artifact (always)
+        uses: actions/upload-artifact@v4
+        with:
+          name: decklink_addon-windows-x64
+          path: decklink_addon-windows-x64.node
+
+      - name: Resolve release tag
+        id: tag
+        shell: pwsh
+        run: |
+          if ("${{ github.event_name }}" -eq "push") {
+            $t = "${{ github.ref_name }}"
+          } else {
+            $t = "${{ github.event.inputs.release_tag }}"
+          }
+          echo "tag=$t" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          Write-Host "Resolved release tag: $t"
+
+      - name: Attach addon to GitHub Release
+        if: steps.tag.outputs.tag != ''
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.tag }}
+          files: decklink_addon-windows-x64.node
+          fail_on_unmatched_files: false

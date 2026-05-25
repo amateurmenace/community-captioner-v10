@@ -925,6 +925,20 @@ function App() {
       );
   }
 
+  // Detect platform + DeckLink addon status so the workflow picker can
+  // surface a heads-up on the Caption Injection card.
+  const [addonStatus, setAddonStatus] = useState<{ loaded: boolean; platform: string } | null>(null);
+  useEffect(() => {
+    if (appState.view !== 'choice') return;
+    const port = window.location.port;
+    const p = parseInt(port || '0');
+    const relayPort = (p >= 5170 && p <= 5199) ? '8080' : (port || '80');
+    fetch(`${window.location.protocol}//${window.location.hostname}:${relayPort}/api/inject/status`)
+      .then(r => r.json())
+      .then(d => setAddonStatus({ loaded: !!d.addonLoaded, platform: /Windows/i.test(navigator.userAgent) ? 'windows' : /Mac/i.test(navigator.userAgent) ? 'mac' : 'other' }))
+      .catch(() => {});
+  }, [appState.view]);
+
   // --- EXISTING: Web App Workflow Selection (Renamed intent slightly) ---
   if (appState.view === 'choice') {
       return (
@@ -952,6 +966,12 @@ function App() {
                               <span className="text-[9px] bg-white/25 px-1.5 py-0.5 rounded font-bold uppercase">New</span>
                           </div>
                           <p className="text-purple-50 leading-relaxed text-sm">Embed CEA-608/708 into your SDI feed for web-presenter passthrough to YouTube.</p>
+                          {addonStatus && !addonStatus.loaded && (
+                              <div className="mt-3 px-2.5 py-1.5 bg-amber-300/30 border border-amber-200/40 rounded-lg text-[11px] font-medium flex items-center gap-1.5">
+                                  <span className="w-1.5 h-1.5 rounded-full bg-amber-200" />
+                                  Setup required — DeckLink driver not loaded{addonStatus.platform === 'windows' ? ' on Windows' : ''}
+                              </div>
+                          )}
                       </div>
                   </div>
 

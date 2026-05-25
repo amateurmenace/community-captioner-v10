@@ -1,24 +1,12 @@
 #include "device_manager.h"
-#include <CoreFoundation/CoreFoundation.h>
-
-// Helper to convert CFString to std::string
-static std::string CFStringToStdString(CFStringRef cfStr) {
-    if (!cfStr) return "";
-    CFIndex len = CFStringGetLength(cfStr);
-    CFIndex maxSize = CFStringGetMaximumSizeForEncoding(len, kCFStringEncodingUTF8) + 1;
-    std::string result(maxSize, '\0');
-    if (CFStringGetCString(cfStr, &result[0], maxSize, kCFStringEncodingUTF8)) {
-        result.resize(strlen(result.c_str()));
-        return result;
-    }
-    return "";
-}
+#include "platform.h"
 
 Napi::Value DeviceManager::EnumerateDevices(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
     Napi::Array devices = Napi::Array::New(env);
 
-    IDeckLinkIterator* iterator = CreateDeckLinkIteratorInstance();
+    ComInit comInit;
+    IDeckLinkIterator* iterator = CreateDeckLinkIterator();
     if (!iterator) {
         // No DeckLink driver installed
         return devices;
@@ -31,10 +19,10 @@ Napi::Value DeviceManager::EnumerateDevices(const Napi::CallbackInfo& info) {
         Napi::Object device = Napi::Object::New(env);
 
         // Get device name
-        CFStringRef name = nullptr;
+        BMDString name = nullptr;
         if (deckLink->GetDisplayName(&name) == S_OK && name) {
-            device.Set("name", Napi::String::New(env, CFStringToStdString(name)));
-            CFRelease(name);
+            device.Set("name", Napi::String::New(env, BMDStringToStd(name)));
+            BMDStringFree(name);
         } else {
             device.Set("name", Napi::String::New(env, "Unknown Device"));
         }
@@ -62,10 +50,10 @@ Napi::Value DeviceManager::EnumerateDevices(const Napi::CallbackInfo& info) {
                 while (modeIter->Next(&mode) == S_OK) {
                     Napi::Object modeObj = Napi::Object::New(env);
 
-                    CFStringRef modeName = nullptr;
+                    BMDString modeName = nullptr;
                     if (mode->GetName(&modeName) == S_OK && modeName) {
-                        modeObj.Set("name", Napi::String::New(env, CFStringToStdString(modeName)));
-                        CFRelease(modeName);
+                        modeObj.Set("name", Napi::String::New(env, BMDStringToStd(modeName)));
+                        BMDStringFree(modeName);
                     }
 
                     modeObj.Set("mode", Napi::Number::New(env, (double)mode->GetDisplayMode()));

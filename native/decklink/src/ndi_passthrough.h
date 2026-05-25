@@ -1,6 +1,6 @@
 #pragma once
 
-#include "DeckLinkAPI.h"
+#include "platform.h"
 #include <Processing.NDI.Lib.h>
 #include <mutex>
 #include <vector>

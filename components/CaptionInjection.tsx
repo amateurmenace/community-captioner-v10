@@ -2,7 +2,7 @@ import React, { useState, useEffect, useRef, useCallback } from 'react';
 import {
     ArrowRight, Cast, Cpu, Copy, CheckCircle, Loader2, Mic, Monitor,
     Play, RefreshCw, Signal, Square, Tv, Wifi, Youtube, Plug, Radio,
-    AlertTriangle, Zap, Send, Settings as SettingsIcon
+    AlertTriangle, Zap, Send, Settings as SettingsIcon, ExternalLink
 } from 'lucide-react';
 import { DeckLinkDevice } from '../types';
 
@@ -291,6 +291,144 @@ const CaptionInjection: React.FC<CaptionInjectionProps> = ({ onBack, apiKey }) =
     };
 
     const running = !!status?.running;
+    // OS detection for platform-specific setup instructions
+    const ua = (typeof navigator !== 'undefined' ? navigator.userAgent : '') || '';
+    const platform = /Windows/i.test(ua) ? 'windows' : /Mac/i.test(ua) ? 'mac' : /Linux/i.test(ua) ? 'linux' : 'unknown';
+    const showSetupCard = !addonAvailable && status !== null; // we've loaded status and it's still missing
+
+    if (showSetupCard) {
+        const addonReleaseUrl = `https://github.com/amateurmenace/community-captioner-v10/releases/latest`;
+        return (
+            <div className="absolute inset-0 z-40 bg-cream flex flex-col animate-fade-in font-sans overflow-y-auto">
+                <div className="h-20 border-b border-stone-200 px-8 flex items-center justify-between bg-white sticky top-0 z-20 shadow-sm">
+                    <div className="flex items-center gap-4">
+                        <button onClick={onBack} className="text-stone-500 font-bold flex items-center gap-2 hover:text-forest-dark"><ArrowRight className="rotate-180" size={16} /> Back</button>
+                        <div className="w-12 h-12 bg-amber-500 rounded-xl flex items-center justify-center text-white shadow-lg shadow-amber-200">
+                            <AlertTriangle size={22} />
+                        </div>
+                        <div>
+                            <h2 className="text-xl font-bold font-display leading-tight">Caption Injection — Setup Required</h2>
+                            <p className="text-xs text-stone-500 font-medium">The native DeckLink driver isn't loaded on this machine</p>
+                        </div>
+                    </div>
+                </div>
+
+                <div className="flex-1 flex justify-center p-8">
+                    <div className="max-w-3xl w-full space-y-6">
+                        {/* What's happening */}
+                        <div className="bg-white border border-amber-200 rounded-2xl p-6 shadow-sm">
+                            <div className="flex items-start gap-4">
+                                <div className="w-12 h-12 bg-amber-50 rounded-xl flex items-center justify-center text-amber-600 shrink-0">
+                                    <AlertTriangle size={24} />
+                                </div>
+                                <div className="flex-1">
+                                    <h3 className="text-lg font-bold text-stone-800 mb-1">DeckLink hardware support is missing</h3>
+                                    <p className="text-sm text-stone-600 leading-relaxed">
+                                        Caption Injection needs the native <code className="bg-stone-100 px-1.5 py-0.5 rounded text-xs">decklink_addon.node</code> driver
+                                        to talk to your Blackmagic DeckLink card. It's a one-time setup — once installed, captions are embedded
+                                        in SDI VANC and passed through to your web presenter automatically.
+                                    </p>
+                                    {addonError && (
+                                        <div className="mt-3 p-2.5 bg-stone-50 border border-stone-200 rounded-lg">
+                                            <p className="text-[10px] font-bold text-stone-400 uppercase mb-1">Server reported</p>
+                                            <p className="text-[11px] font-mono text-stone-600">{addonError}</p>
+                                        </div>
+                                    )}
+                                </div>
+                            </div>
+                        </div>
+
+                        {/* Platform-specific setup */}
+                        {platform === 'windows' && (
+                            <div className="bg-white rounded-2xl shadow-lg border border-stone-200 overflow-hidden">
+                                <div className="bg-gradient-to-r from-blue-500 to-blue-600 p-5 text-white">
+                                    <p className="text-[10px] font-bold uppercase tracking-wider opacity-80">Windows setup</p>
+                                    <h3 className="text-xl font-bold mt-0.5">Three options — easiest first</h3>
+                                </div>
+                                <div className="p-6 space-y-5">
+                                    {/* Option 1 — download prebuilt addon */}
+                                    <div className="flex gap-4">
+                                        <div className="w-10 h-10 bg-green-500 text-white rounded-full flex items-center justify-center font-bold shrink-0 shadow-sm">1</div>
+                                        <div className="flex-1">
+                                            <p className="font-bold text-stone-800">Download the prebuilt addon (recommended)</p>
+                                            <p className="text-sm text-stone-600 mt-0.5">If we've published a Windows build for your version, you can drop it next to <code className="bg-stone-100 px-1 rounded text-xs">CommunityCaptioner.exe</code>.</p>
+                                            <ol className="text-sm text-stone-600 mt-2 space-y-1 list-decimal list-inside">
+                                                <li>Open the latest release page</li>
+                                                <li>Download <code className="bg-stone-100 px-1 rounded text-xs">decklink_addon-windows-x64.node</code></li>
+                                                <li>Rename it to <code className="bg-stone-100 px-1 rounded text-xs">decklink_addon.node</code></li>
+                                                <li>Place it in the same folder as <code className="bg-stone-100 px-1 rounded text-xs">CommunityCaptioner.exe</code></li>
+                                                <li>Restart the app</li>
+                                            </ol>
+                                            <a href={addonReleaseUrl} target="_blank" rel="noopener noreferrer" className="inline-flex items-center gap-2 mt-3 px-4 py-2 bg-green-500 hover:bg-green-600 text-white text-sm font-bold rounded-lg shadow-sm">
+                                                Open GitHub Releases <ExternalLink size={14} />
+                                            </a>
+                                        </div>
+                                    </div>
+
+                                    {/* Option 2 — install drivers + addon manually */}
+                                    <div className="border-t border-stone-100 pt-5 flex gap-4">
+                                        <div className="w-10 h-10 bg-blue-500 text-white rounded-full flex items-center justify-center font-bold shrink-0 shadow-sm">2</div>
+                                        <div className="flex-1">
+                                            <p className="font-bold text-stone-800">Install Blackmagic drivers (always required for the card itself)</p>
+                                            <p className="text-sm text-stone-600 mt-0.5">Even with the prebuilt addon, you need Blackmagic's drivers so Windows can talk to the DeckLink hardware.</p>
+                                            <a href="https://www.blackmagicdesign.com/support/family/capture-and-playback" target="_blank" rel="noopener noreferrer" className="inline-flex items-center gap-2 mt-3 px-4 py-2 bg-blue-500 hover:bg-blue-600 text-white text-sm font-bold rounded-lg shadow-sm">
+                                                Download Desktop Video <ExternalLink size={14} />
+                                            </a>
+                                        </div>
+                                    </div>
+
+                                    {/* Option 3 — build from source */}
+                                    <div className="border-t border-stone-100 pt-5 flex gap-4">
+                                        <div className="w-10 h-10 bg-stone-400 text-white rounded-full flex items-center justify-center font-bold shrink-0 shadow-sm">3</div>
+                                        <div className="flex-1">
+                                            <p className="font-bold text-stone-800">Build from source (developer fallback)</p>
+                                            <p className="text-sm text-stone-600 mt-0.5">If no prebuilt is available, compile it yourself.</p>
+                                            <ol className="text-sm text-stone-600 mt-2 space-y-1 list-decimal list-inside">
+                                                <li>Install <a href="https://nodejs.org/" className="text-blue-600 underline">Node.js 20</a></li>
+                                                <li>Install <a href="https://visualstudio.microsoft.com/visual-cpp-build-tools/" className="text-blue-600 underline">Visual Studio Build Tools</a> (C++ workload)</li>
+                                                <li>Download the <a href="https://www.blackmagicdesign.com/developer/" className="text-blue-600 underline">DeckLink SDK</a> (free registration)</li>
+                                                <li>Clone <a href="https://github.com/amateurmenace/community-captioner-v10" className="text-blue-600 underline">the repo</a>, run <code className="bg-stone-100 px-1 rounded text-xs">npm install</code> then <code className="bg-stone-100 px-1 rounded text-xs">npm run build:native</code></li>
+                                                <li>Copy <code className="bg-stone-100 px-1 rounded text-xs">native/decklink/build/Release/decklink_addon.node</code> next to <code className="bg-stone-100 px-1 rounded text-xs">CommunityCaptioner.exe</code></li>
+                                            </ol>
+                                        </div>
+                                    </div>
+                                </div>
+                            </div>
+                        )}
+
+                        {platform === 'mac' && (
+                            <div className="bg-white rounded-2xl shadow-lg border border-stone-200 overflow-hidden">
+                                <div className="bg-gradient-to-r from-stone-700 to-stone-800 p-5 text-white">
+                                    <p className="text-[10px] font-bold uppercase tracking-wider opacity-80">macOS setup</p>
+                                    <h3 className="text-xl font-bold mt-0.5">Reinstall or rebuild the addon</h3>
+                                </div>
+                                <div className="p-6 space-y-4">
+                                    <p className="text-sm text-stone-600">The official macOS .app should ship with the addon pre-bundled. If you're seeing this:</p>
+                                    <ol className="text-sm text-stone-600 space-y-1 list-decimal list-inside">
+                                        <li>Confirm <a href="https://www.blackmagicdesign.com/support/family/capture-and-playback" className="text-blue-600 underline">Blackmagic Desktop Video</a> is installed</li>
+                                        <li>Re-download the latest <a href={addonReleaseUrl} className="text-blue-600 underline">Community Captioner.app</a></li>
+                                        <li>If you're running from source, run <code className="bg-stone-100 px-1 rounded text-xs">npm run build:native</code> and restart</li>
+                                    </ol>
+                                </div>
+                            </div>
+                        )}
+
+                        {/* What still works without DeckLink */}
+                        <div className="bg-stone-50 border border-stone-200 rounded-2xl p-5">
+                            <p className="text-[10px] font-bold text-stone-400 uppercase tracking-wider mb-2">Meanwhile, these still work without DeckLink</p>
+                            <ul className="text-sm text-stone-600 space-y-1 list-disc list-inside">
+                                <li><strong>Live Session</strong> — browser-based captioning with overlay output</li>
+                                <li><strong>Audience phone view</strong> — QR-code accessible captions on mobile</li>
+                                <li><strong>Context Engine</strong> — agenda upload, municipality wizard, dictionary management</li>
+                                <li><strong>Translations</strong> — server-side per-language translation for audience members</li>
+                            </ul>
+                            <button onClick={onBack} className="mt-3 text-sm font-bold text-forest-dark hover:underline">← Back to workflow picker</button>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        );
+    }
 
     return (
         <div className="absolute inset-0 z-40 bg-cream flex flex-col animate-fade-in font-sans overflow-hidden">

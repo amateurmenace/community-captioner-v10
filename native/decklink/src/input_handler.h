@@ -1,6 +1,6 @@
 #pragma once
 
-#include "DeckLinkAPI.h"
+#include "platform.h"
 #include <mutex>
 #include <atomic>
 #include <functional>
