@@ -27,6 +27,14 @@
     inline void BMDStringFree(BMDString s) { if (s) SysFreeString(s); }
 
     inline IDeckLinkIterator* CreateDeckLinkIterator() {
+        // Ensure COM is initialized on the calling thread. CoInitializeEx is
+        // reference-counted per thread; calling it from multiple code paths is
+        // safe. We intentionally don't pair this with CoUninitialize — the JS
+        // thread keeps COM live for the lifetime of the addon. Without this,
+        // call sites other than EnumerateDevices (which uses ComInit) hit
+        // CO_E_NOTINITIALIZED and CoCreateInstance returns null, surfacing
+        // as a bogus "No driver installed" / "device in use" error.
+        CoInitializeEx(nullptr, COINIT_MULTITHREADED);
         IDeckLinkIterator* it = nullptr;
         HRESULT hr = CoCreateInstance(CLSID_CDeckLinkIterator, nullptr, CLSCTX_ALL, IID_IDeckLinkIterator, (void**)&it);
         return SUCCEEDED(hr) ? it : nullptr;
