@@ -40,17 +40,34 @@
         return SUCCEEDED(hr) ? it : nullptr;
     }
 
-    // On Windows the pixel-buffer accessor is on IDeckLinkVideoBuffer, obtained
-    // via QueryInterface from any frame. On macOS it's directly on the frame.
-    inline HRESULT GetFrameBytes(IDeckLinkVideoFrame* frame, void** buffer) {
-        if (!frame || !buffer) return E_INVALIDARG;
-        IDeckLinkVideoBuffer* buf = nullptr;
-        HRESULT hr = frame->QueryInterface(IID_IDeckLinkVideoBuffer, (void**)&buf);
-        if (FAILED(hr) || !buf) return hr;
-        hr = buf->GetBytes(buffer);
-        buf->Release();
-        return hr;
-    }
+    // RAII helper for the pixel buffer of a DeckLink frame. On Windows the
+    // SDK requires the IDeckLinkVideoBuffer interface to be kept alive AND
+    // StartAccess()/EndAccess() to bracket every read/write — without this
+    // GetBytes() returns a pointer to invalid memory and downstream encoders
+    // see zeroed UYVY (renders as a solid green frame).
+    struct VideoFrameAccess {
+        IDeckLinkVideoBuffer* m_buf;
+        BMDBufferAccessFlags  m_flags;
+        void*                 data;
+
+        VideoFrameAccess(IDeckLinkVideoFrame* frame, BMDBufferAccessFlags flags)
+            : m_buf(nullptr), m_flags(flags), data(nullptr) {
+            if (!frame) return;
+            if (FAILED(frame->QueryInterface(IID_IDeckLinkVideoBuffer, (void**)&m_buf)) || !m_buf) return;
+            if (FAILED(m_buf->StartAccess(flags))) { m_buf->Release(); m_buf = nullptr; return; }
+            if (FAILED(m_buf->GetBytes(&data))) {
+                data = nullptr;
+                m_buf->EndAccess(flags);
+                m_buf->Release();
+                m_buf = nullptr;
+            }
+        }
+        ~VideoFrameAccess() {
+            if (m_buf) { m_buf->EndAccess(m_flags); m_buf->Release(); }
+        }
+        VideoFrameAccess(const VideoFrameAccess&) = delete;
+        VideoFrameAccess& operator=(const VideoFrameAccess&) = delete;
+    };
 
     // RAII for COM init on the current thread
     struct ComInit {
@@ -81,10 +98,23 @@
         return CreateDeckLinkIteratorInstance();
     }
 
-    inline HRESULT GetFrameBytes(IDeckLinkVideoFrame* frame, void** buffer) {
-        if (!frame || !buffer) return E_INVALIDARG;
-        return frame->GetBytes(buffer);
-    }
+    // BMDBufferAccessFlags isn't exposed on the macOS framework header — declare
+    // a stand-in so the cross-platform call sites compile without #ifdefs. It's
+    // unused on Mac because IDeckLinkVideoFrame::GetBytes works without locking.
+    using BMDBufferAccessFlags = int;
+    static const BMDBufferAccessFlags bmdBufferAccessRead  = 1;
+    static const BMDBufferAccessFlags bmdBufferAccessWrite = 2;
+
+    struct VideoFrameAccess {
+        void* data;
+        VideoFrameAccess(IDeckLinkVideoFrame* frame, BMDBufferAccessFlags /*flags*/)
+            : data(nullptr) {
+            if (frame) frame->GetBytes(&data);
+        }
+        ~VideoFrameAccess() {}
+        VideoFrameAccess(const VideoFrameAccess&) = delete;
+        VideoFrameAccess& operator=(const VideoFrameAccess&) = delete;
+    };
 
     // No-op COM init on macOS
     struct ComInit { bool ok = true; ComInit() {} ~ComInit() {} };

@@ -109,22 +109,23 @@ bool OutputHandler::Start(uint32_t deviceIndex, BMDDisplayMode displayMode) {
         return false;
     }
 
-    // Fill frames with black (UYVY black = 0x10 for Y, 0x80 for U/V)
-    void* bufA = nullptr;
-    void* bufB = nullptr;
-    GetFrameBytes(m_frameA, &bufA);
-    GetFrameBytes(m_frameB, &bufB);
-    if (bufA) {
-        uint8_t* p = (uint8_t*)bufA;
-        for (int32_t i = 0; i < m_height * rowBytes; i += 4) {
-            p[i]     = 0x80; // Cb
-            p[i + 1] = 0x10; // Y0
-            p[i + 2] = 0x80; // Cr
-            p[i + 3] = 0x10; // Y1
+    // Fill frames with black (UYVY black = 0x10 for Y, 0x80 for U/V).
+    // VideoFrameAccess handles the Windows StartAccess/EndAccess pattern.
+    {
+        VideoFrameAccess accA(m_frameA, bmdBufferAccessWrite);
+        VideoFrameAccess accB(m_frameB, bmdBufferAccessWrite);
+        if (accA.data) {
+            uint8_t* p = (uint8_t*)accA.data;
+            for (int32_t i = 0; i < m_height * rowBytes; i += 4) {
+                p[i]     = 0x80; // Cb
+                p[i + 1] = 0x10; // Y0
+                p[i + 2] = 0x80; // Cr
+                p[i + 3] = 0x10; // Y1
+            }
         }
-    }
-    if (bufB) {
-        memcpy(bufB, bufA, m_height * rowBytes);
+        if (accB.data && accA.data) {
+            memcpy(accB.data, accA.data, m_height * rowBytes);
+        }
     }
 
     // Set callback and start scheduled playback
@@ -163,28 +164,49 @@ void OutputHandler::Stop() {
 
 void OutputHandler::PushCDP(const uint8_t* data, size_t size) {
     std::lock_guard<std::mutex> lock(m_cdpMutex);
-    m_currentCDP.assign(data, data + size);
+    if (m_cdpQueue.size() < 60) {
+        m_cdpQueue.push(std::vector<uint8_t>(data, data + size));
+    }
 }
 
+// Preroll only — used to push the first few frames into the device queue.
+// Alternates m_frameA / m_frameB so the device has something to display while
+// the steady-state callback loop spins up.
 void OutputHandler::ScheduleNextFrame() {
     if (!m_running || !m_output) return;
-
     IDeckLinkMutableVideoFrame* frame = m_useFrameA ? m_frameA : m_frameB;
     m_useFrameA = !m_useFrameA;
+    RescheduleFrame(frame);
+}
 
-    // Attach VANC caption data if we have a CDP
+// Steady-state path. Called with the frame the device just finished outputting,
+// so it's guaranteed out of the playback queue and safe to mutate. Modifying a
+// frame that's still queued (the previous bug) caused VANC packets to be
+// rewritten mid-flight and produced visible flashing.
+void OutputHandler::RescheduleFrame(IDeckLinkVideoFrame* frame) {
+    if (!m_running || !m_output || !frame) return;
+
+    // Attach exactly one CDP per scheduled frame; detach the leftover from the
+    // last time this frame was scheduled so packets don't pile up.
     {
         std::lock_guard<std::mutex> lock(m_cdpMutex);
-        if (!m_currentCDP.empty()) {
-            IDeckLinkVideoFrameAncillaryPackets* packets = nullptr;
-            if (frame->QueryInterface(IID_IDeckLinkVideoFrameAncillaryPackets,
-                                       (void**)&packets) == S_OK) {
-                CaptionAncillaryPacket* pkt = new CaptionAncillaryPacket(
-                    m_currentCDP.data(), m_currentCDP.size());
-                packets->AttachPacket(pkt);
-                pkt->Release(); // AttachPacket adds its own ref
-                packets->Release();
+        IDeckLinkVideoFrameAncillaryPackets* packets = nullptr;
+        if (frame->QueryInterface(IID_IDeckLinkVideoFrameAncillaryPackets,
+                                   (void**)&packets) == S_OK) {
+            IDeckLinkAncillaryPacket* prev = nullptr;
+            if (packets->GetFirstPacketByID(0x61, 0x01, &prev) == S_OK && prev) {
+                packets->DetachPacket(prev);
+                prev->Release();
             }
+            if (!m_cdpQueue.empty()) {
+                auto& cdp = m_cdpQueue.front();
+                CaptionAncillaryPacket* pkt = new CaptionAncillaryPacket(
+                    cdp.data(), cdp.size());
+                packets->AttachPacket(pkt);
+                pkt->Release();
+                m_cdpQueue.pop();
+            }
+            packets->Release();
         }
     }
 
@@ -203,9 +225,9 @@ HRESULT OutputHandler::ScheduledFrameCompleted(IDeckLinkVideoFrame* completedFra
         m_droppedFrames++;
     }
 
-    // Schedule the next frame
-    ScheduleNextFrame();
-
+    // Recycle THIS just-completed frame (now safely out of the device's queue)
+    // — matches the Blackmagic SDK ClosedCaptions sample's pattern.
+    RescheduleFrame(completedFrame);
     return S_OK;
 }
 

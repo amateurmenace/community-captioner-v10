@@ -27,6 +27,110 @@ interface InjectStatus {
     encodingMode: string;
 }
 
+// Small panel for YouTube's Caption Ingestion URL — the only working way to
+// get live captions onto YouTube when streaming through a Blackmagic Web
+// Presenter (its RTMP encoder discards SDI VANC CC).
+const YouTubeCaptionIngestPanel: React.FC = () => {
+    const getRelayUrl = () => {
+        const port = window.location.port || '80';
+        const relayPort = (parseInt(port) >= 5170 && parseInt(port) <= 5199) ? '8080' : port;
+        return `${window.location.protocol}//${window.location.hostname}:${relayPort}`;
+    };
+    const [url, setUrl] = useState('');
+    const [saved, setSaved] = useState<string | null>(null);
+    const [status, setStatus] = useState<{ lastError: string | null; lastPostMs: number; sequence: number } | null>(null);
+    const [saving, setSaving] = useState(false);
+
+    useEffect(() => {
+        const load = async () => {
+            try {
+                const r = await fetch(`${getRelayUrl()}/api/youtube/caption-url`);
+                if (r.ok) {
+                    const j = await r.json();
+                    if (j.url) { setUrl(j.url); setSaved(j.url); }
+                    setStatus({ lastError: j.lastError, lastPostMs: j.lastPostMs, sequence: j.sequence });
+                }
+            } catch {}
+        };
+        load();
+        const t = setInterval(load, 3000);
+        return () => clearInterval(t);
+    }, []);
+
+    const save = async () => {
+        setSaving(true);
+        try {
+            const r = await fetch(`${getRelayUrl()}/api/youtube/caption-url`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ url: url.trim() }),
+            });
+            const j = await r.json();
+            if (j.ok) setSaved(j.url);
+        } finally { setSaving(false); }
+    };
+
+    const clear = async () => {
+        setUrl('');
+        await fetch(`${getRelayUrl()}/api/youtube/caption-url`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ url: '' }),
+        });
+        setSaved(null);
+    };
+
+    const dirty = url.trim() !== (saved || '');
+    const active = !!saved;
+    const secondsSinceLast = status?.lastPostMs ? Math.round((Date.now() - status.lastPostMs) / 1000) : null;
+
+    return (
+        <div className="bg-white border border-stone-200 rounded-2xl p-4">
+            <div className="flex items-center gap-2 mb-2">
+                <Youtube size={16} className="text-red-600" />
+                <p className="text-[10px] font-bold text-stone-400 uppercase tracking-wider">YouTube caption ingestion URL</p>
+                {active && (
+                    <span className="ml-auto text-[10px] font-bold px-2 py-0.5 rounded-full bg-green-100 text-green-700">
+                        Active{status?.sequence ? ` · ${status.sequence - 1} sent` : ''}
+                    </span>
+                )}
+            </div>
+            <p className="text-[11px] text-stone-500 mb-3 leading-relaxed">
+                Blackmagic Web Presenter doesn&apos;t forward SDI captions into RTMP, so YouTube doesn&apos;t see them. Paste the
+                caption ingestion URL from YouTube Studio (Live → Closed Captions → &quot;Caption ingestion URL&quot;) here and the
+                captioner will POST captions directly to YouTube alongside the broadcast.
+            </p>
+            <div className="flex gap-2">
+                <input
+                    type="text"
+                    value={url}
+                    onChange={(e) => setUrl(e.target.value)}
+                    placeholder="http://upload.youtube.com/closedcaption?cid=..."
+                    className="flex-1 px-3 py-2 rounded-lg text-[11px] bg-stone-50 border border-stone-200 font-mono outline-none focus:border-sage-400"
+                />
+                <button
+                    onClick={save}
+                    disabled={!dirty || saving || !url.trim()}
+                    className="px-3 py-2 bg-sage-600 text-white text-xs font-bold rounded-lg disabled:bg-stone-300 hover:bg-sage-700"
+                >
+                    {saving ? 'Saving…' : 'Save'}
+                </button>
+                {active && (
+                    <button onClick={clear} className="px-3 py-2 bg-stone-100 text-stone-600 text-xs font-bold rounded-lg hover:bg-stone-200">
+                        Clear
+                    </button>
+                )}
+            </div>
+            {status?.lastError && (
+                <p className="text-[10px] text-red-600 mt-2">Last POST error: {status.lastError}</p>
+            )}
+            {active && !status?.lastError && secondsSinceLast !== null && (
+                <p className="text-[10px] text-stone-400 mt-2">Last POST: {secondsSinceLast}s ago</p>
+            )}
+        </div>
+    );
+};
+
 const CaptionInjection: React.FC<CaptionInjectionProps> = ({ onBack, apiKey }) => {
     const getRelayUrl = () => {
         const port = window.location.port || '80';
@@ -833,6 +937,9 @@ const CaptionInjection: React.FC<CaptionInjectionProps> = ({ onBack, apiKey }) =
                             )}
                         </div>
                     </div>
+
+                    {/* YouTube Caption Ingestion URL — bypasses encoder CC forwarding */}
+                    <YouTubeCaptionIngestPanel />
 
                     {/* Tech reference */}
                     <div className="bg-white border border-stone-200 rounded-2xl p-4">

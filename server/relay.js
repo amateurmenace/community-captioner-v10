@@ -131,6 +131,67 @@ let captionConfig = {
     profanityFilter: false,        // bleep profanity with ***
 };
 
+// YouTube Live caption ingestion. When the user enables "Closed Captions:
+// Caption ingestion URL" in YouTube Studio for a live stream, YouTube gives
+// them an upload.youtube.com URL with a cid query parameter. POSTing
+// timecoded caption text to it overlays captions on the broadcast — this
+// bypasses the RTMP encoder entirely, which matters because the Blackmagic
+// Web Presenter HD/4K does NOT forward SDI VANC captions into the H.264 SEI
+// of its RTMP output. The ingestion-URL path is the only working way to get
+// captions on YouTube when streaming through a Web Presenter.
+let youtubeCaptionState = {
+    url: null,            // full upload.youtube.com URL including ?cid=...
+    sessionStartMs: null, // wall-clock when URL was set; used to compute relative timecodes
+    sequence: 1,          // monotonic counter incremented per POST (YT requires &seq= to increase)
+    lastPostMs: 0,        // throttle stats
+    lastError: null,
+};
+
+function formatYouTubeTimecode(ms) {
+    // YouTube accepts "HH:MM:SS.mmm" relative to stream start.
+    const totalMs = Math.max(0, ms);
+    const hours = Math.floor(totalMs / 3600000);
+    const minutes = Math.floor((totalMs % 3600000) / 60000);
+    const seconds = Math.floor((totalMs % 60000) / 1000);
+    const millis = totalMs % 1000;
+    const pad = (n, w = 2) => n.toString().padStart(w, '0');
+    return `${pad(hours)}:${pad(minutes)}:${pad(seconds)}.${pad(millis, 3)}`;
+}
+
+async function forwardToYouTube(text) {
+    if (!youtubeCaptionState.url || !text) return;
+    try {
+        const now = Date.now();
+        if (!youtubeCaptionState.sessionStartMs) youtubeCaptionState.sessionStartMs = now;
+        const offset = now - youtubeCaptionState.sessionStartMs;
+        const seq = youtubeCaptionState.sequence++;
+        // Build URL with &seq= appended (replace if already present)
+        const baseUrl = youtubeCaptionState.url.replace(/[?&]seq=\d+/, '');
+        const sep = baseUrl.includes('?') ? '&' : '?';
+        const url = `${baseUrl}${sep}seq=${seq}`;
+        const body = `${formatYouTubeTimecode(offset)}\n${text}\n`;
+        const controller = new AbortController();
+        const timer = setTimeout(() => controller.abort(), 2000);
+        const resp = await fetch(url, {
+            method: 'POST',
+            headers: { 'Content-Type': 'text/plain' },
+            body,
+            signal: controller.signal,
+        });
+        clearTimeout(timer);
+        if (!resp.ok) {
+            youtubeCaptionState.lastError = `HTTP ${resp.status}`;
+            console.warn(`[YouTube CC] POST failed: ${resp.status} ${resp.statusText}`);
+        } else {
+            youtubeCaptionState.lastError = null;
+            youtubeCaptionState.lastPostMs = now;
+        }
+    } catch (e) {
+        youtubeCaptionState.lastError = e.message;
+        console.warn(`[YouTube CC] POST error: ${e.message}`);
+    }
+}
+
 // Caption history for SRT export (stores all final captions with timestamps)
 let captionHistory = [];
 let captionSessionStart = null;
@@ -844,6 +905,42 @@ app.post('/api/polisher/apikey', (req, res) => {
         return res.status(400).json({ ok: false, error: 'Key missing or too short' });
     }
     res.json({ ok: true, source: geminiKeySource, masked: maskKey(geminiKeyActive) });
+});
+
+// --- YouTube Caption Ingestion URL ---
+// In YouTube Studio for a live stream, set Closed Captions = "Caption ingestion URL"
+// and YT will give you a URL that looks like:
+//   http://upload.youtube.com/closedcaption?cid=ABCDE-12345-...
+// Paste it here and every final caption gets POSTed to YT with a timecode.
+app.get('/api/youtube/caption-url', (req, res) => {
+    res.json({
+        url: youtubeCaptionState.url,
+        sessionStartMs: youtubeCaptionState.sessionStartMs,
+        sequence: youtubeCaptionState.sequence,
+        lastPostMs: youtubeCaptionState.lastPostMs,
+        lastError: youtubeCaptionState.lastError,
+    });
+});
+
+app.post('/api/youtube/caption-url', (req, res) => {
+    const { url } = req.body || {};
+    if (url && typeof url === 'string' && url.trim()) {
+        const trimmed = url.trim();
+        if (!/^https?:\/\//i.test(trimmed)) {
+            return res.status(400).json({ ok: false, error: 'URL must start with http:// or https://' });
+        }
+        youtubeCaptionState.url = trimmed;
+        youtubeCaptionState.sessionStartMs = Date.now();
+        youtubeCaptionState.sequence = 1;
+        youtubeCaptionState.lastError = null;
+        console.log(`[YouTube CC] Ingestion URL set, session start ${new Date(youtubeCaptionState.sessionStartMs).toISOString()}`);
+    } else {
+        youtubeCaptionState.url = null;
+        youtubeCaptionState.sessionStartMs = null;
+        youtubeCaptionState.lastError = null;
+        console.log('[YouTube CC] Ingestion URL cleared');
+    }
+    res.json({ ok: true, url: youtubeCaptionState.url });
 });
 
 // Public Gemini key status — used by the Context Engine UI to show a clear banner
@@ -1611,6 +1708,17 @@ wss.on('connection', (ws, req) => {
                     // Forward to CEA-708 bridge and encoder with polished text (English only)
                     forwardToCea708(polishedData);
                     feedCaptionToEncoder(polishedData);
+
+                    // Also POST to YouTube's caption ingestion URL if configured.
+                    // This is the only working path for captions to reach YouTube
+                    // when streaming through a Blackmagic Web Presenter (its
+                    // RTMP encoder doesn't forward SDI VANC CC into H.264 SEI).
+                    {
+                        const polishedText = (typeof polishedData.payload === 'string')
+                            ? polishedData.payload
+                            : (polishedData.payload?.text || '');
+                        if (polishedText) forwardToYouTube(polishedText);
+                    }
                 });
                 return; // Don't fall through to unpolished broadcast
             }

@@ -152,6 +152,8 @@ Audio → Gemini/Whisper/WebSpeech → Text
 | `/api/context/scrape` | POST | Scrape a URL for proper nouns (requires Gemini API key) |
 | `/api/context/extract` | POST | Extract proper nouns from pasted text |
 | `/api/context/upload-pdf` | POST | Upload PDF/text file, extract proper nouns (multipart form) |
+| `/api/youtube/caption-url` | GET | Current YouTube caption ingestion URL + last-POST status |
+| `/api/youtube/caption-url` | POST | Set/clear YouTube caption ingestion URL (body: `{url: "..."}` or `{url: ""}` to clear) |
 
 ## WebSocket Paths
 
@@ -291,6 +293,27 @@ Configurable via Output Settings UI → Caption Processing section, or `POST /ap
 - **Summarize**: Gemini AI condenses speech to fit within limit. Requires API key. Falls back to truncate on timeout (800ms).
 - **Verbatim**: Full text, no truncation. May lag behind fast speakers with CEA-608.
 
+## YouTube Caption Ingestion URL
+
+The Blackmagic Web Presenter HD/4K **does not forward SDI VANC closed captions into the H.264 SEI of its RTMP output**. Captions are detected and shown on the WP dashboard but never reach YouTube via the encoder path. The captioner ships a parallel path that POSTs captions directly to YouTube's per-stream ingestion endpoint, bypassing the encoder entirely.
+
+### How to use
+1. In YouTube Studio, edit your live stream → set **Closed Captions** to "Caption ingestion URL". YouTube displays a URL like `http://upload.youtube.com/closedcaption?cid=ABCDE-...`.
+2. In the captioner UI (Caption Injection screen, scroll to bottom), paste that URL in the **YouTube caption ingestion URL** panel and hit Save. Or `POST /api/youtube/caption-url` with `{url: "..."}`.
+3. Every final, polished caption from the captioner is POSTed to that URL with an incrementing `seq=N` query param and a body of:
+   ```
+   HH:MM:SS.mmm
+   caption text
+   ```
+4. YouTube overlays the caption on the live stream within ~1–2 seconds of the POST.
+
+### Implementation (server/relay.js)
+- `youtubeCaptionState = { url, sessionStartMs, sequence, lastPostMs, lastError }` — module-scoped state
+- `forwardToYouTube(text)` — async POST with 2s AbortController timeout; non-blocking
+- Hooked at the end of the WS final-caption polish block (after `forwardToCea708` + `feedCaptionToEncoder`)
+- `sessionStartMs` is set when the URL is configured; timecodes are relative to that
+- Sequence number must increase monotonically across POSTs for the same stream — YouTube rejects out-of-order
+
 ## Caption Polisher (server/caption-polisher.js)
 
 **Layer 1 — Local rules (zero latency, always active)**:
@@ -350,6 +373,36 @@ Accessible at `/?view=audience&session=demo` or via QR code from Dashboard.
 3. **NDI Passthrough** — NdiPassthroughHandler: NDI receive → SDI output + audio resample (any rate → 48kHz) + VANC
 
 **CDP Queue**: All three handlers use `std::queue<std::vector<uint8_t>> m_cdpQueue` — each CDP is pushed by JS and popped once per output frame. This prevents the repeated-character bug where a single CDP was re-attached to every frame.
+
+### Windows-specific addon notes
+
+Several gotchas that don't apply on macOS:
+
+1. **COM init per-thread.** `CreateDeckLinkIterator()` (in `src/platform.h`) calls `CoInitializeEx(nullptr, COINIT_MULTITHREADED)` before `CoCreateInstance`. Without it, every code path other than `EnumerateDevices` (which has its own `ComInit` RAII) hits `CO_E_NOTINITIALIZED` and surfaces as a bogus "No driver installed" / "device in use" error.
+
+2. **Pixel buffer access requires lock/unlock.** Windows `IDeckLinkVideoFrame` doesn't expose `GetBytes` directly — it's on a separate `IDeckLinkVideoBuffer` interface obtained via `QueryInterface`. AND the pointer is only valid between `StartAccess(flags)` and `EndAccess(flags)`. The `VideoFrameAccess` RAII helper in `platform.h` does this; on macOS it's a no-op shim that calls `GetBytes` directly.
+
+3. **`win_delay_load_hook.cc` MUST be linked.** `CMakeLists.txt` adds `${CMAKE_JS_SRC}` to the Windows source list — without it, the addon's `/DELAYLOAD:NODE.EXE` imports can't resolve when loaded inside a pkg-bundled `CommunityCaptioner.exe` (because the host binary isn't named `node.exe`). The addon segfaults at `require()` time. Standalone `node` works without this hook by coincidence.
+
+4. **Scheduled video playback requires audio output enabled.** Per the BMD `InputLoopThrough` SDK sample, you must `EnableAudioOutput` + `BeginAudioPreroll` + schedule audio samples before/alongside `StartScheduledPlayback`. Without it, the device's playback clock doesn't advance past the initial buffer drain and video stalls at ~35 frames (the device's pending-schedule queue limit). The passthrough handler schedules silent samples when no input audio is enabled, real samples from `EnableAudioInput` otherwise.
+
+5. **Pre-allocate output frames; don't `CreateVideoFrame` per callback.** The DeckLink driver caps distinct in-flight frame references at ~35. Allocating a fresh `IDeckLinkMutableVideoFrame` for every input callback would exhaust that limit. `PassthroughHandler` uses a 4-frame ring buffer (`m_frames[kFrameCount]`) and gates reuse via `m_nextWriteIdx`/`m_nextCompletedIdx` so the input callback waits for a frame to complete before reusing its slot.
+
+6. **Re-schedule the `completedFrame` argument**, not an alternating-toggle frame. `OutputHandler::ScheduledFrameCompleted` passes its `completedFrame` parameter back into `RescheduleFrame()`. The previous toggle-based approach modified VANC packets on frames that were *still queued in the device*, producing visible flashing — matches the SDK ClosedCaptions sample's pattern.
+
+### Frame & buffer access pattern (Windows)
+
+```cpp
+{
+    VideoFrameAccess in(videoFrame, bmdBufferAccessRead);
+    VideoFrameAccess out(outFrame, bmdBufferAccessWrite);
+    if (in.data && out.data) {
+        memcpy(out.data, in.data, height * rowBytes);
+    }
+} // RAII unlocks both before frame is scheduled
+```
+
+Always release IDeckLinkVideoBuffer after the access scope and BEFORE handing the frame to `ScheduleVideoFrame` — the SDK rejects frames whose buffer is still locked.
 
 ## CEA-608/708 Encoding Details
 
@@ -417,6 +470,19 @@ Requires: (1) Gemini API key set, (2) Auto-Learn toggled ON, (3) Active captioni
 
 ### Web presenter shows CEA-608 even in DTVCC mode
 Expected behavior — DTVCC mode sends CEA-608 in Field 1 for backward compatibility. Most web presenters and consumer decoders only read CEA-608. The DTVCC data is in the remaining triplets for modern decoders.
+
+### Web Presenter detects captions but YouTube doesn't show them
+The Blackmagic Web Presenter HD/4K detects incoming VANC captions for its dashboard display but **does not embed them into the H.264 SEI of the RTMP output**. YouTube's "Embedded captions" mode therefore sees nothing. Workarounds, in order of preference:
+1. Use the **YouTube Caption Ingestion URL** path (see section above) — POSTs captions to YouTube directly, independent of the encoder.
+2. Replace the Web Presenter with an encoder that does forward CC into H.264 SEI: vMix (CEA-608 native), OBS with `obs-closed-captions` plugin, Wowza, Teradek hardware encoders.
+3. Switch encodingMode to `dtvcc` — some encoders specifically look for digital service blocks rather than Field 1 CEA-608 (your mileage will vary by WP firmware version).
+
+### Passthrough output stalls at exactly N frames (often ~35)
+Two requirements for scheduled video playback to advance continuously on DeckLink:
+1. **Audio output must be enabled** (`EnableAudioOutput` + `BeginAudioPreroll`) and audio samples scheduled alongside video — silence is fine. Without this, the playback clock doesn't advance past the initial buffer drain.
+2. **Output frames must be re-used from a fixed pool**, not allocated fresh per input frame. The driver caps distinct in-flight frame refs at ~35; the passthrough handler uses a 4-frame ring buffer.
+
+If you see exactly-N-frames-then-stall, check both of the above are in place.
 
 ### No audio in NDI→SDI passthrough
 NDI sources may use non-48kHz sample rates (e.g., 44100Hz). The native addon resamples to 48kHz via linear interpolation. Audio uses `WriteAudioSamplesSync` (continuous mode), NOT `ScheduleAudioSamples`.

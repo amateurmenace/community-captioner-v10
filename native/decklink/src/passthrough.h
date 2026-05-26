@@ -4,13 +4,15 @@
 #include "input_handler.h"
 #include <mutex>
 #include <vector>
+#include <queue>
 #include <atomic>
 
 /**
  * Pass-through mode: captures SDI input, copies frames to output,
  * and injects CEA-708 VANC data on every output frame.
  */
-class PassthroughHandler : public IDeckLinkInputCallback {
+class PassthroughHandler : public IDeckLinkInputCallback,
+                            public IDeckLinkVideoOutputCallback {
 public:
     PassthroughHandler();
     virtual ~PassthroughHandler();
@@ -32,6 +34,11 @@ public:
                                      IDeckLinkDisplayMode* newDisplayMode,
                                      BMDDetectedVideoInputFormatFlags flags) override;
 
+    // IDeckLinkVideoOutputCallback
+    HRESULT ScheduledFrameCompleted(IDeckLinkVideoFrame* completedFrame,
+                                     BMDOutputFrameCompletionResult result) override;
+    HRESULT ScheduledPlaybackHasStopped() override;
+
     // IUnknown
     HRESULT QueryInterface(REFIID iid, void** ppv) override;
     ULONG AddRef() override;
@@ -46,9 +53,26 @@ private:
     int32_t m_width;
     int32_t m_height;
     int32_t m_rowBytes;
+    BMDDisplayMode m_currentMode;
+    BMDTimeValue m_frameDuration;
+    BMDTimeScale m_timeScale;
+    std::atomic<bool> m_playbackStarted;
+    BMDTimeValue m_outputFrameCount;
+    int m_prerollCount;
+
+    // Fixed pool of pre-allocated output frames. The device caps the number
+    // of distinct frame references it tracks in flight (we saw ~35), so we
+    // reuse a small set of frames in round-robin order instead of allocating
+    // a fresh IDeckLinkMutableVideoFrame on every input callback.
+    static const int kFrameCount = 4;
+    IDeckLinkMutableVideoFrame* m_frames[kFrameCount];
+    std::atomic<uint64_t> m_nextWriteIdx;       // input-side: next index to fill
+    std::atomic<uint64_t> m_nextCompletedIdx;   // device-side: highest index the device has finished
+    void AllocateFramePool();
+    void ReleaseFramePool();
 
     std::mutex m_cdpMutex;
-    std::vector<uint8_t> m_currentCDP;
+    std::queue<std::vector<uint8_t>> m_cdpQueue;
 
     std::atomic<bool> m_running;
     std::atomic<uint64_t> m_framesOutput;

@@ -4,6 +4,7 @@
 #include "platform.h"
 #include <mutex>
 #include <vector>
+#include <queue>
 #include <atomic>
 
 /**
@@ -38,7 +39,8 @@ public:
     ULONG Release() override;
 
 private:
-    void ScheduleNextFrame();
+    void ScheduleNextFrame();              // preroll only — alternates m_frameA/m_frameB
+    void RescheduleFrame(IDeckLinkVideoFrame* frame);  // recycle the just-completed frame
     void CreateBlackFrame();
 
     IDeckLink* m_deckLink;
@@ -54,7 +56,7 @@ private:
     BMDTimeValue m_totalFrames;
 
     std::mutex m_cdpMutex;
-    std::vector<uint8_t> m_currentCDP;
+    std::queue<std::vector<uint8_t>> m_cdpQueue;
 
     std::atomic<bool> m_running;
     std::atomic<uint64_t> m_framesOutput;
