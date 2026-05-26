@@ -5,12 +5,17 @@ name: Build Windows DeckLink addon
 #   - Manually via the "Run workflow" button (workflow_dispatch)
 #   - On every push of a v* tag (auto-attaches to the matching GitHub Release)
 #
-# Required repository secret:
-#   BMD_SDK_URL — direct download URL for the Blackmagic DeckLink SDK .zip
-#     (must contain Win/include/DeckLinkAPI.idl and friends after unpacking).
-#     The SDK is gated behind blackmagicdesign.com registration; host the .zip
-#     somewhere you control (S3, R2, private GitHub release, etc.) and put the
-#     URL in this secret.
+# SDK source (in priority order):
+#   1. A draft release in this repo tagged `sdk-internal-do-not-publish` with
+#      a .zip asset containing Win/include/DeckLinkAPI.idl. Drafts are not
+#      publicly visible; the workflow's GITHUB_TOKEN can still read them.
+#      This is the default setup.
+#   2. Optional: BMD_SDK_URL repository secret pointing at an external .zip
+#      URL you host yourself (S3/R2/etc.). Takes precedence if both are set.
+#
+# Blackmagic's SDK EULA prohibits public redistribution; the draft-release
+# approach keeps the headers private to the repo's collaborators while
+# letting CI build the addon automatically.
 
 on:
   workflow_dispatch:
@@ -22,6 +27,9 @@ on:
   push:
     tags:
       - 'v*'
+
+permissions:
+  contents: write  # needed to read draft release assets AND attach addon to release
 
 jobs:
   build:
@@ -35,16 +43,27 @@ jobs:
         with:
           node-version: '20'
 
-      - name: Check whether BMD_SDK_URL secret is configured
+      - name: Resolve SDK source
         id: sdk_check
         shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           if ("${{ secrets.BMD_SDK_URL }}") {
+            echo "source=external" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+            Write-Host "Using BMD_SDK_URL secret as SDK source."
             echo "has_sdk=true" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
-            Write-Host "BMD_SDK_URL is set — proceeding with the addon build."
           } else {
-            echo "has_sdk=false" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
-            Write-Host "::notice::BMD_SDK_URL repository secret is not set; skipping the auto-build. Addons attached to releases manually are unaffected. To enable CI builds: host the DeckLink SDK .zip somewhere private and add its URL as the BMD_SDK_URL secret."
+            # Probe for the draft release that holds the SDK zip
+            $draft = gh release view sdk-internal-do-not-publish --repo ${{ github.repository }} --json tagName,isDraft 2>$null
+            if ($LASTEXITCODE -eq 0 -and $draft) {
+              echo "source=draft" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+              echo "has_sdk=true" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+              Write-Host "Using draft release 'sdk-internal-do-not-publish' as SDK source."
+            } else {
+              echo "has_sdk=false" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+              Write-Host "::notice::No SDK source configured (neither BMD_SDK_URL secret nor 'sdk-internal-do-not-publish' draft release). Skipping CI addon build; releases need a manually-attached addon. To enable CI: upload Win/include as a zip to a draft release tagged 'sdk-internal-do-not-publish'."
+            }
           }
 
       - name: Install npm dependencies
@@ -56,9 +75,15 @@ jobs:
         shell: pwsh
         env:
           BMD_SDK_URL: ${{ secrets.BMD_SDK_URL }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           New-Item -ItemType Directory -Force -Path bmd-sdk | Out-Null
-          Invoke-WebRequest -Uri $env:BMD_SDK_URL -OutFile bmd-sdk.zip
+          if ("${{ steps.sdk_check.outputs.source }}" -eq "external") {
+            Invoke-WebRequest -Uri $env:BMD_SDK_URL -OutFile bmd-sdk.zip
+          } else {
+            # Pull from the draft release. gh release download --pattern grabs the matching asset.
+            gh release download sdk-internal-do-not-publish --repo ${{ github.repository }} --pattern "*.zip" --output bmd-sdk.zip
+          }
           Expand-Archive -Path bmd-sdk.zip -DestinationPath bmd-sdk -Force
           # Locate the Win/include directory inside the unpacked SDK
           $includeDir = Get-ChildItem -Path bmd-sdk -Recurse -Directory -Filter 'include' |
