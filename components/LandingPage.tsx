@@ -1,9 +1,13 @@
 
 import React, { useState, useEffect } from 'react';
-import { Users, ArrowRight, Database, Layers, Lock, Github, ShieldCheck, Cpu, Mic, Radio, Captions, Zap, Brain, Layout, BarChart3, ChevronDown, HelpCircle, CheckCircle, XCircle, Heart, Globe, MessageSquare, Feather, Code } from 'lucide-react';
+import { Users, ArrowRight, Database, Layers, Lock, Github, ShieldCheck, Cpu, Mic, Radio, Captions, Zap, Brain, Layout, BarChart3, ChevronDown, HelpCircle, CheckCircle, XCircle, Heart, Globe, MessageSquare, Feather, Code, Download } from 'lucide-react';
+import { GITHUB_REPO_URL, RELEASES_URL } from '../utils/appLinks';
 
 interface LandingPageProps {
+  /** Jump straight into a live browser captioning session */
   onStart: () => void;
+  /** Open the workflow/deployment picker (the "choose your own adventure" flow) */
+  onChooseMode: () => void;
 }
 
 // --- Logo Component ---
@@ -265,7 +269,7 @@ const FaqItem = ({ q, a }: { q: string, a: string }) => (
     </div>
 );
 
-const LandingPage: React.FC<LandingPageProps> = ({ onStart }) => {
+const LandingPage: React.FC<LandingPageProps> = ({ onStart, onChooseMode }) => {
   const scrollToSection = (id: string) => {
     const element = document.getElementById(id);
     if (element) {
@@ -288,7 +292,7 @@ const LandingPage: React.FC<LandingPageProps> = ({ onStart }) => {
                  <button onClick={() => scrollToSection('features')} className="hover:text-forest-dark transition-colors">Features</button>
                  <button onClick={() => scrollToSection('how-it-works')} className="hover:text-forest-dark transition-colors">How It Works</button>
                  <button onClick={() => scrollToSection('values')} className="hover:text-forest-dark transition-colors">Our Values</button>
-                 <button onClick={onStart} className="bg-stone-900 text-white px-4 py-2 rounded-lg hover:bg-forest-light transition-colors shadow-lg hover:shadow-xl transform hover:-translate-y-0.5">Launch App</button>
+                 <button onClick={onChooseMode} className="bg-stone-900 text-white px-4 py-2 rounded-lg hover:bg-forest-light transition-colors shadow-lg hover:shadow-xl transform hover:-translate-y-0.5">Launch App</button>
             </div>
         </div>
       </nav>
@@ -303,10 +307,16 @@ const LandingPage: React.FC<LandingPageProps> = ({ onStart }) => {
                 Open source, AI-powered live captioning for community media. <br/>
                 <span className="font-bold text-forest-dark">Zero cost. Easy Setup. Total Privacy.</span>
             </p>
-            <div className="flex flex-col sm:flex-row items-center justify-center gap-4 mb-16">
+            <div className="flex flex-col sm:flex-row sm:flex-wrap items-center justify-center gap-4 mb-16">
                 <button onClick={onStart} className="bg-forest-dark hover:bg-forest-light text-white px-10 py-5 rounded-2xl font-bold text-xl transition-all shadow-xl hover:shadow-2xl transform hover:-translate-y-1 flex items-center gap-3">
                     Start Captioning <ArrowRight />
                 </button>
+                <button onClick={onChooseMode} className="bg-white border-2 border-stone-200 hover:border-sage-500 text-forest-dark px-8 py-5 rounded-2xl font-bold text-xl transition-all shadow-md hover:shadow-xl transform hover:-translate-y-1 flex items-center gap-3">
+                    Or Choose Your Mode <Layers size={22} />
+                </button>
+                <a href={RELEASES_URL} target="_blank" rel="noopener noreferrer" className="bg-white border-2 border-stone-200 hover:border-sage-500 text-forest-dark px-8 py-5 rounded-2xl font-bold text-xl transition-all shadow-md hover:shadow-xl transform hover:-translate-y-1 flex items-center gap-3">
+                    Download Local Version <Download size={22} />
+                </a>
                 <button onClick={() => scrollToSection('features')} className="text-stone-500 font-bold hover:text-forest-dark px-6 py-4 flex items-center gap-2 transition-colors">
                     Learn More <ChevronDown size={20} />
                 </button>
@@ -488,7 +498,7 @@ const LandingPage: React.FC<LandingPageProps> = ({ onStart }) => {
                      <div className="text-xs text-stone-500 uppercase tracking-widest font-bold">NonCommercial ShareAlike</div>
                  </div>
                  
-                 <a href="https://github.com/amateurmenace/community-captioner-v5" className="flex items-center gap-2 text-stone-400 hover:text-white transition-colors font-bold text-sm mt-4">
+                 <a href={GITHUB_REPO_URL} target="_blank" rel="noopener noreferrer" className="flex items-center gap-2 text-stone-400 hover:text-white transition-colors font-bold text-sm mt-4">
                     <Github size={16} /> View Source on GitHub
                  </a>
              </div>

@@ -2,6 +2,7 @@
 import React, { useState, useRef, useEffect } from 'react';
 import { X, Layout, Cast, Check, Move, Type, Tv, Copy, RefreshCw, Trash2, Signal, AlertTriangle, Monitor, Play, Square } from 'lucide-react';
 import { OverlaySettings, DeckLinkDevice, DeckLinkStatus } from '../types';
+import { RELEASES_URL, MAC_DOWNLOAD_URL, WINDOWS_DOWNLOAD_URL } from '../utils/appLinks';
 
 interface Cea708Status {
   endpoint: string;
@@ -579,18 +580,20 @@ const OutputSettings: React.FC<OutputSettingsProps> = ({ settings, setSettings, 
                             </div>
                         </div>
                         <div className="space-y-2">
-                            <a href="https://github.com/amateurmenace/community-captioner-v10/releases/latest"
+                            <a href={RELEASES_URL}
                                target="_blank" rel="noopener noreferrer"
                                className="w-full p-3 rounded-lg bg-forest-dark hover:bg-forest-light text-white text-sm font-bold flex items-center justify-center gap-2 transition-all">
                                 <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
                                 Download Desktop App
                             </a>
                             <div className="grid grid-cols-2 gap-2">
-                                <a href="https://github.com/amateurmenace/community-captioner-v10/releases/latest/download/Community.Captioner-6.1.0-arm64.dmg"
+                                <a href={MAC_DOWNLOAD_URL}
+                                   target="_blank" rel="noopener noreferrer"
                                    className="p-2 rounded-lg border border-stone-200 text-xs font-bold text-stone-600 hover:bg-stone-100 text-center transition-all">
                                     macOS (Apple Silicon)
                                 </a>
-                                <a href="https://github.com/amateurmenace/community-captioner-v10/releases/latest/download/CommuntiCaptioner.exe"
+                                <a href={WINDOWS_DOWNLOAD_URL}
+                                   target="_blank" rel="noopener noreferrer"
                                    className="p-2 rounded-lg border border-stone-200 text-xs font-bold text-stone-600 hover:bg-stone-100 text-center transition-all">
                                     Windows (x64)
                                 </a>

@@ -13,6 +13,7 @@ import HighlightStudio from './components/HighlightStudio';
 import CaptionInjection from './components/CaptionInjection';
 import { AppState, Caption, DictionaryEntry, UILanguage, SessionStats, Session, ContextSettings, HighlightClip } from './types';
 import { Mic, FileVideo, Settings, Loader2, Server, Globe, Download, Monitor, CheckCircle, ArrowRight, ShieldCheck, Terminal, ExternalLink, Github, Zap } from 'lucide-react';
+import { GITHUB_REPO_URL, GITHUB_CLONE_URL, RELEASES_URL, MAC_DOWNLOAD_URL, WINDOWS_DOWNLOAD_URL } from './utils/appLinks';
 import { GoogleGenAI, LiveServerMessage, Modality } from "@google/genai";
 import { translateText } from './services/geminiService';
 
@@ -137,6 +138,23 @@ function App() {
   const [showGlobalSettings, setShowGlobalSettings] = useState(false);
   const [globalSettingsTab, setGlobalSettingsTab] = useState<'general'|'cloud'|'local'|'guide'>('general');
   const [relayStatus, setRelayStatus] = useState<'connected'|'disconnected'>('disconnected');
+
+  // Detect platform + DeckLink addon status so the workflow picker can
+  // surface a heads-up on the Caption Injection card.
+  // NOTE: must stay up here with the other hooks — declaring it after the
+  // conditional view returns below changes the hook count between renders
+  // and crashes React when navigating between views.
+  const [addonStatus, setAddonStatus] = useState<{ loaded: boolean; platform: string } | null>(null);
+  useEffect(() => {
+    if (appState.view !== 'choice') return;
+    const port = window.location.port;
+    const p = parseInt(port || '0');
+    const relayPort = (p >= 5170 && p <= 5199) ? '8080' : (port || '80');
+    fetch(`${window.location.protocol}//${window.location.hostname}:${relayPort}/api/inject/status`)
+      .then(r => r.json())
+      .then(d => setAddonStatus({ loaded: !!d.addonLoaded, platform: /Windows/i.test(navigator.userAgent) ? 'windows' : /Mac/i.test(navigator.userAgent) ? 'mac' : 'other' }))
+      .catch(() => {});
+  }, [appState.view]);
   
   // Audio Refs
   const recognitionRef = useRef<any>(null);
@@ -871,41 +889,60 @@ function App() {
                  </div>
                  <h1 className="text-3xl font-display font-bold mb-4">Download Community Captioner</h1>
                  <p className="text-stone-400 mb-10">
-                     To run locally with maximum privacy, you need to build the Electron app.
-                     <br/>Since this is an open-source project, you currently build it from source.
+                     Grab the prebuilt desktop app for your platform — no install steps, just unzip and launch.
+                     <br/>Prefer to build it yourself? The source commands are below.
                  </p>
+
+                 <div className="flex flex-wrap gap-4 justify-center mb-4">
+                     <a
+                        href={MAC_DOWNLOAD_URL}
+                        target="_blank"
+                        rel="noreferrer"
+                        className="bg-white text-stone-900 px-6 py-3 rounded-lg font-bold hover:bg-stone-200 transition-colors flex items-center gap-2"
+                     >
+                         <Download size={18} /> Mac (Apple Silicon)
+                     </a>
+                     <a
+                        href={WINDOWS_DOWNLOAD_URL}
+                        target="_blank"
+                        rel="noreferrer"
+                        className="bg-white text-stone-900 px-6 py-3 rounded-lg font-bold hover:bg-stone-200 transition-colors flex items-center gap-2"
+                     >
+                         <Download size={18} /> Windows (x64)
+                     </a>
+                 </div>
+                 <a
+                    href={RELEASES_URL}
+                    target="_blank"
+                    rel="noreferrer"
+                    className="inline-block text-stone-500 hover:text-stone-300 text-sm font-bold mb-10 transition-colors"
+                 >
+                     All releases →
+                 </a>
 
                  <div className="bg-black p-6 rounded-xl border border-stone-700 text-left mb-8 shadow-2xl">
                      <div className="flex items-center gap-2 text-stone-400 font-bold text-xs uppercase tracking-wider mb-4 border-b border-stone-800 pb-2">
-                         <Terminal size={14} /> Terminal Commands
+                         <Terminal size={14} /> Build From Source
                      </div>
                      <div className="space-y-4 font-mono text-sm">
                          <div>
                              <p className="text-stone-500 mb-1"># 1. Clone the repository</p>
-                             <p className="text-green-400">git clone https://github.com/amateurmenace/community-captioner-5.git</p>
+                             <p className="text-green-400">git clone {GITHUB_CLONE_URL}</p>
                          </div>
                          <div>
                              <p className="text-stone-500 mb-1"># 2. Install dependencies</p>
                              <p className="text-green-400">npm install</p>
                          </div>
                          <div>
-                             <p className="text-stone-500 mb-1"># 3. Build the Windows/Mac Installer</p>
-                             <p className="text-green-400">npm run dist</p>
+                             <p className="text-stone-500 mb-1"># 3. Build the Windows/Mac app</p>
+                             <p className="text-green-400">npm run build:app</p>
                          </div>
                      </div>
                  </div>
 
                  <div className="flex gap-4 justify-center">
-                     <a 
-                        href="https://github.com/amateurmenace/community-captioner-5/releases/latest" 
-                        target="_blank"
-                        rel="noreferrer"
-                        className="bg-white text-stone-900 px-6 py-3 rounded-lg font-bold hover:bg-stone-200 transition-colors flex items-center gap-2"
-                     >
-                         <Download size={18} /> Download Installer
-                     </a>
-                     <a 
-                        href="https://github.com/amateurmenace/community-captioner-5" 
+                     <a
+                        href={GITHUB_REPO_URL}
                         target="_blank"
                         rel="noreferrer"
                         className="text-stone-400 font-bold hover:text-white px-6 py-3 flex items-center gap-2 transition-colors"
@@ -924,20 +961,6 @@ function App() {
         </div>
       );
   }
-
-  // Detect platform + DeckLink addon status so the workflow picker can
-  // surface a heads-up on the Caption Injection card.
-  const [addonStatus, setAddonStatus] = useState<{ loaded: boolean; platform: string } | null>(null);
-  useEffect(() => {
-    if (appState.view !== 'choice') return;
-    const port = window.location.port;
-    const p = parseInt(port || '0');
-    const relayPort = (p >= 5170 && p <= 5199) ? '8080' : (port || '80');
-    fetch(`${window.location.protocol}//${window.location.hostname}:${relayPort}/api/inject/status`)
-      .then(r => r.json())
-      .then(d => setAddonStatus({ loaded: !!d.addonLoaded, platform: /Windows/i.test(navigator.userAgent) ? 'windows' : /Mac/i.test(navigator.userAgent) ? 'mac' : 'other' }))
-      .catch(() => {});
-  }, [appState.view]);
 
   // --- EXISTING: Web App Workflow Selection (Renamed intent slightly) ---
   if (appState.view === 'choice') {
@@ -1002,13 +1025,19 @@ function App() {
         <Settings size={28} />
       </button>
 
-      {appState.view === 'landing' && <LandingPage onStart={() => {
+      {appState.view === 'landing' && <LandingPage
+        onStart={() => {
+          // "Start Captioning" jumps straight into the live browser captioning session
+          setAppState(p => ({...p, view: 'dashboard'}));
+        }}
+        onChooseMode={() => {
           // Skip the Desktop vs Cloud choice when running locally (from the .app/.exe)
           // Only show it on cloud-hosted deployments where users might need to download
           const host = window.location.hostname;
           const isLocal = host === 'localhost' || host === '127.0.0.1' || host.startsWith('192.168.') || host.startsWith('10.') || host.startsWith('172.');
           setAppState(p => ({...p, view: isLocal ? 'choice' : 'deployment_choice'}));
-      }} />}
+        }}
+      />}
       
       {appState.view === 'dashboard' && (
         <Dashboard 

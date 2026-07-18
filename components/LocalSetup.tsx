@@ -1,6 +1,7 @@
 import React, { useState } from 'react';
 import { Server, CheckCircle, AlertCircle, ArrowRight, ArrowLeft, Terminal, Cpu, Download, RefreshCw, XCircle, Monitor, Command, Copy, ExternalLink, Zap, Target, Layers, Rocket, Code, Box, FileDown, Play, HelpCircle, AlertTriangle } from 'lucide-react';
 import { checkOllamaConnection } from '../services/localAIService';
+import { MAC_DOWNLOAD_URL, WINDOWS_DOWNLOAD_URL } from '../utils/appLinks';
 
 interface LocalSetupProps {
     onBack: () => void;
@@ -193,12 +194,12 @@ if __name__ == "__main__":
                             <p className="text-sm font-bold text-amber-800">Best with the Desktop App</p>
                             <p className="text-xs text-amber-700 mt-1">Local captioning works best when run natively. Download the desktop app for the full local experience with DeckLink SDI output.</p>
                             <div className="flex gap-2 mt-3">
-                                <a href="https://github.com/amateurmenace/community-captioner-v10/releases/latest/download/Community.Captioner-6.1.0-arm64.dmg"
+                                <a href={MAC_DOWNLOAD_URL}
                                    target="_blank" rel="noopener noreferrer"
                                    className="px-3 py-1.5 rounded-lg bg-forest-dark text-white text-xs font-bold hover:bg-forest-light transition-all flex items-center gap-1.5">
                                     <Command size={12} /> macOS
                                 </a>
-                                <a href="https://github.com/amateurmenace/community-captioner-v10/releases/latest/download/CommuntiCaptioner.exe"
+                                <a href={WINDOWS_DOWNLOAD_URL}
                                    target="_blank" rel="noopener noreferrer"
                                    className="px-3 py-1.5 rounded-lg bg-forest-dark text-white text-xs font-bold hover:bg-forest-light transition-all flex items-center gap-1.5">
                                     <Monitor size={12} /> Windows
