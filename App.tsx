@@ -13,7 +13,7 @@ import HighlightStudio from './components/HighlightStudio';
 import CaptionInjection from './components/CaptionInjection';
 import { AppState, Caption, DictionaryEntry, UILanguage, SessionStats, Session, ContextSettings, HighlightClip, LocalEngineInfo } from './types';
 import type { BrowserEngineInfo } from './types';
-import { diagLog } from './utils/diagnostics';
+import { diagLog, osMicSettingsHint } from './utils/diagnostics';
 import { Mic, FileVideo, Settings, Loader2, Server, Globe, Download, Monitor, CheckCircle, ArrowRight, ShieldCheck, Terminal, ExternalLink, Github, Zap } from 'lucide-react';
 import { GITHUB_REPO_URL, GITHUB_CLONE_URL, RELEASES_URL, MAC_DOWNLOAD_URL, WINDOWS_DOWNLOAD_URL } from './utils/appLinks';
 import { GoogleGenAI, LiveServerMessage, Modality } from "@google/genai";
@@ -1016,7 +1016,7 @@ function App() {
             console.error("Recording init error", e);
             const name = e?.name || '';
             const message =
-                name === 'NotAllowedError' || name === 'SecurityError' ? 'Microphone access is blocked. Allow the microphone for this site in the browser (the lock or "aA" icon in the address bar) and, on macOS, in System Settings → Privacy & Security → Microphone for the browser you are using.' :
+                name === 'NotAllowedError' || name === 'SecurityError' ? 'Microphone access is blocked. Allow the microphone for this site in the browser (the lock or "aA" icon in the address bar) and ' + osMicSettingsHint() + '.' :
                 name === 'NotFoundError' ? 'No microphone or audio input was found on this computer. Plug one in or pick a loopback device, then press Start again.' :
                 name === 'NotReadableError' || name === 'AbortError' ? 'The microphone is in use by another application or could not be opened. Close other apps using it and press Start again.' :
                 `Could not start the session: ${e?.message || name || 'unknown error'}. Open Help & Settings → Diagnostics and copy the report.`;

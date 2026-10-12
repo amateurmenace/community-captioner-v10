@@ -38,6 +38,15 @@ export function diagText(entries = log): string {
 }
 export function relayLogDownloadUrl() { return `${relayHttp()}/api/logs/download`; }
 
+const IS_WINDOWS = typeof navigator !== 'undefined' && /Windows/i.test(navigator.userAgent);
+
+/** Where the operating system's own microphone switch lives, for error messages. */
+export function osMicSettingsHint(): string {
+    if (IS_WINDOWS) return 'in Windows Settings → Privacy → Microphone (Privacy & security on Windows 11), where microphone access, app access and desktop-app access must be on';
+    if (typeof navigator !== 'undefined' && /Mac/i.test(navigator.userAgent)) return 'on macOS in System Settings → Privacy & Security → Microphone for the browser you are using';
+    return 'in the operating system\'s privacy settings for the microphone';
+}
+
 const relayHttp = () => {
     const manual = localStorage.getItem('cc_relay_url');
     if (manual) return manual.replace(/^wss:/, 'https:').replace(/^ws:/, 'http:');
@@ -76,7 +85,7 @@ export async function collectDiagnostics(extra: Record<string, unknown> = {}): P
     try {
         const perm: any = await withTimeout((navigator.permissions as any)?.query?.({ name: 'microphone' as any }) ?? Promise.resolve(null), 1500, null);
         add('micPermission', perm?.state ?? 'unknown');
-        if (perm?.state === 'denied') problems.push('Microphone permission is denied for this site. Allow it in the browser\'s site settings (lock / "aA" icon in the address bar) and on macOS under System Settings → Privacy & Security → Microphone.');
+        if (perm?.state === 'denied') problems.push('Microphone permission is denied for this site. Allow it in the browser\'s site settings (lock / "aA" icon in the address bar) and ' + osMicSettingsHint() + '.');
     } catch { add('micPermission', 'unknown'); }
     try {
         const devs = await withTimeout(navigator.mediaDevices.enumerateDevices(), 2000, [] as MediaDeviceInfo[]);
@@ -88,7 +97,7 @@ export async function collectDiagnostics(extra: Record<string, unknown> = {}): P
     add('rememberedAudioSource', extra.audioSourceId ?? '(default)');
 
     // Relay
-    const relayProblem = `The relay at ${relayHttp()} did not answer. Local mode, the audience view, translation and the Context Engine need it. In the desktop app, keep its Terminal window open; if it closed, launch the app again (port 8080 must be free).`;
+    const relayProblem = `The relay at ${relayHttp()} did not answer. Local mode, the audience view, translation and the Context Engine need it. In the desktop app, keep its ${IS_WINDOWS ? 'console' : 'Terminal'} window open; if it closed, launch the app again (port 8080 must be free).`;
     try {
         const r = await withTimeout(fetch(`${relayHttp()}/api/app/info`).then(x => x.json()).catch(() => null), 3000, null as any);
         add('relay', r ? `${relayHttp()} · app ${r.version} · desktopApp ${r.desktopApp} · addon ${r.addonLoaded}` : 'unreachable');

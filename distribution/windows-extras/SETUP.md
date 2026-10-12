@@ -11,9 +11,13 @@ That's it for the standard features. Stop here if you don't need SDI hardware ca
 
 ## Embedded SDI captions (DeckLink users)
 
-Caption Injection — embedding CEA-608/708 captions into a live SDI feed for a web presenter to pass through to YouTube — needs a tiny native driver (`decklink_addon.node`) that we couldn't bundle in the Windows installer because it has to be compiled on Windows itself.
+Caption Injection — embedding CEA-608/708 captions into a live SDI feed for a web presenter to pass through to YouTube — needs a small native driver, `decklink_addon.node`. **It is already in this zip, next to `CommunityCaptioner.exe`**; you only need Blackmagic Desktop Video (below). Caption Injection lists your DeckLink devices when it is working.
 
-You have **three ways** to get it working:
+### NDI sources → SDI with captions
+
+Caption Injection can also take an **NDI** source (a camera, vMix, OBS, a switcher's NDI output) and send it out of a DeckLink SDI port with the captions embedded, audio resampled to 48 kHz. This needs the free **NDI runtime**: install **NDI Tools** or the **NDI 6 Runtime** from https://ndi.video/tools/ and restart the app. Without it the NDI option says "Not available" and SDI injection works as usual. NDI|HX cameras work (tested with Sony and Panasonic NDI|HX PTZ cameras into 1080p29.97).
+
+If the addon is missing (an older download, or you deleted it), you have **three ways** to get it back:
 
 ### Option 1 — Run the setup script (easiest)
 
