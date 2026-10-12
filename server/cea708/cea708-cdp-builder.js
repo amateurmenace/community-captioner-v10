@@ -76,7 +76,10 @@ export class Cea708CdpBuilder {
      */
     buildCDP(cc1, cc2, frameRate = '29.97') {
         const frCode = FRAME_RATE_CODES[frameRate] || 0x04;
-        const ccCount = CC_COUNT_BY_RATE[frameRate] || 3;
+        // Standard cc_count for the frame rate (20 at 29.97): a short count is legal on paper, but
+        // decoders that assume the standard layout (the Web Presenter → YouTube path did) read
+        // past the data into the footer and show its sequence counter as text.
+        const ccCount = FULL_CC_COUNT_BY_RATE[frameRate] || 20;
         const totalTriplets = ccCount;
 
         // CDP layout matches the Blackmagic SDK reference encoder:
@@ -144,7 +147,7 @@ export class Cea708CdpBuilder {
         cdp[pos++] = 0x65;                               // 'e'
         cdp[pos++] = 0x6E;                               // 'n'
         cdp[pos++] = 0x67;                               // 'g'
-        cdp[pos++] = 0x80 | 1;                           // digital_cc=1 | caption_service_number=1  = 0x81
+        cdp[pos++] = 0x7E;                               // digital_cc=0 (this is a line-21 CEA-608 service), reserved bits 1, line21_field=0 (field 1)
         cdp[pos++] = 0x7F;                               // !easy_reader, 16:9 aspect, reserved
         cdp[pos++] = 0xFF;                               // reserved
 
@@ -186,6 +189,12 @@ export class Cea708CdpBuilder {
      * @param {number} cc1 - CEA-608 byte 1 (parity bit set)
      * @param {number} cc2 - CEA-608 byte 2 (parity bit set)
      */
+    /** DTVCC payload bytes that fit in one frame at this rate (one packet: header + odd payload). */
+    dtvccCapacity(frameRate = '29.97') {
+        const triplets = (FULL_CC_COUNT_BY_RATE[frameRate] || 20) - 2;
+        return triplets * 2 - 2;
+    }
+
     buildCDP_DTVCC(dtvccData, frameRate = '29.97', cc1 = 0x80, cc2 = 0x80) {
         const frCode = FRAME_RATE_CODES[frameRate] || 0x04;
         const totalTriplets = FULL_CC_COUNT_BY_RATE[frameRate] || 20;
@@ -198,11 +207,16 @@ export class Cea708CdpBuilder {
         if (dtvccData && dtvccData.length > 0) {
             // The packet payload (after the 1-byte DTVCC header) must be an
             // even number of bytes. Pad if needed.
+            // CEA-708 packet header: sequence_number in bits 7-6, packet_size_code in bits 5-0.
+            // Packet size = code * 2 bytes (code 0 = 128) and it includes the header byte, so the
+            // payload is padded to an odd length. (It used to be (words << 2) | sequence, which
+            // declared the wrong size to every 708 decoder.)
             let payload = Array.from(dtvccData);
-            if (payload.length % 2 !== 0) payload.push(0x00);
-            const payloadWords = payload.length / 2;
-            if (payloadWords >= 1 && payloadWords <= 63) {
-                const dtvccHeader = (payloadWords << 2) | (this.dtvccSequence & 0x03);
+            if ((payload.length + 1) % 2 !== 0) payload.push(0x00);
+            const packetSize = payload.length + 1;
+            const sizeCode = packetSize === 128 ? 0 : packetSize / 2;
+            if (packetSize >= 2 && packetSize <= 128) {
+                const dtvccHeader = ((this.dtvccSequence & 0x03) << 6) | (sizeCode & 0x3F);
                 this.dtvccSequence = (this.dtvccSequence + 1) & 0x03;
                 packetBytes = [dtvccHeader, ...payload];
                 // If the packet doesn't fill all DTVCC triplets, that's OK —

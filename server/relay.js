@@ -407,7 +407,7 @@ function startFrameLoop(frameRate = '29.97') {
         if (captionConfig.encodingMode === 'dtvcc' && dtvccEncoder) {
             // DTVCC mode: drain both encoders — DTVCC for modern decoders,
             // CEA-608 in Field 1 for backward compatibility with older decoders
-            const dtvccData = dtvccEncoder.drainFrame(36);
+            const dtvccData = dtvccEncoder.drainFrame(cea708Builder.dtvccCapacity(frameRate));
             const pair = cea608Encoder ? cea608Encoder.drainPair() : { cc1: 0x80, cc2: 0x80 };
             cdp = cea708Builder.buildCDP_DTVCC(dtvccData, frameRate, pair.cc1, pair.cc2);
             isActive = !!dtvccData || (pair.cc1 !== 0x80 || pair.cc2 !== 0x80);

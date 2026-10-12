@@ -116,7 +116,7 @@ assert(packet[5] === 0x00 && packet[6] === 0x00, 'Initial sequence = 0');
 assert(packet[7] === 0x72, 'cc_data_section marker = 0x72');
 
 // cc_count for 29.97 = 3 triplets → 0xE0 | 3 = 0xE3
-assert(packet[8] === 0xE3, `cc_count = 0xE3 for 29.97fps (got 0x${packet[8].toString(16)})`);
+assert(packet[8] === 0xF4, `cc_count = 0xF4 (20 triplets) for 29.97fps (got 0x${packet[8].toString(16)})`);
 
 // First triplet: Field 1
 assert(packet[9] === 0xFC, 'Triplet 1 type = 0xFC (field 1)');
@@ -139,7 +139,7 @@ cdp.reset();
 const pkt24 = cdp.buildCDP(0x80, 0x80, '24');
 assert(pkt24[3] === 0x2F, `Frame rate byte = 0x2F for 24fps (got 0x${pkt24[3].toString(16)})`);
 // cc_count for 24fps = 4 → 0xE4
-assert(pkt24[8] === 0xE4, `cc_count = 0xE4 for 24fps (got 0x${pkt24[8].toString(16)})`);
+assert(pkt24[8] === 0xF9, `cc_count = 0xF9 (25 triplets) for 24fps (got 0x${pkt24[8].toString(16)})`);
 
 // ─────────────────────────────────────────────
 // 3. End-to-End: Encoder → CDP Builder

@@ -99,9 +99,17 @@ public:
         if (b >= 0x20) text += (char)b;
     }
 
+    int dumpLeft = getenv("CC_DUMP") ? atoi(getenv("CC_DUMP")) : 0;
+    std::string lastDump;
     void ParseCdp(const uint8_t* d, uint32_t n) {
         if (n < 11 || d[0] != 0x96 || d[1] != 0x69) return;
         cdpPackets++;
+        if (dumpLeft > 0) {  // CC_DUMP=N: print the first N distinct packets as hex (sequence/footer ignored for the comparison)
+            std::string h; char b[4];
+            for (uint32_t k = 0; k < n; k++) { snprintf(b, sizeof b, "%02x", d[k]); h += b; }
+            std::string key = h.size() > 22 ? h.substr(14, h.size() - 22) : h;
+            if (key != lastDump) { printf("    CDP %u bytes: %s%c", n, h.c_str(), 10); lastDump = key; dumpLeft--; }
+        }
         uint32_t i = 7;
         while (i + 1 < n) {
             uint8_t id = d[i];
