@@ -33,8 +33,8 @@ const SECTIONS: Section[] = [
         id: 'modes', icon: Zap, title: 'Captioning modes',
         lead: 'The mode bar at the bottom chooses where speech recognition runs. Each mode sends audio somewhere different, and the app says where.',
         bullets: [
-            <><strong>Balanced</strong> (<Zap size={11} className="inline" />): the browser\'s own speech service. Chrome and Edge send microphone audio to Google\'s speech servers; Safari uses Apple\'s. Free, instant, no setup. Not private.</>,
-            <><strong>Cloud</strong> (<CloudLightning size={11} className="inline" />): audio streams to Google\'s Gemini transcription model (gemini-3.5-transcribe-live). The most accurate option for difficult audio; needs a Gemini API key.</>,
+            <><strong>Balanced</strong> (<Zap size={11} className="inline" />): the browser's own speech service. Chrome and Edge send microphone audio to Google's speech servers; Safari uses Apple's. Free, instant, no setup. Not private.</>,
+            <><strong>Cloud</strong> (<CloudLightning size={11} className="inline" />): audio streams to Google's Gemini transcription model (gemini-3.5-transcribe-live). The most accurate option for difficult audio; needs a Gemini API key.</>,
             <><strong>Local</strong> (<Lock size={11} className="inline" />): Whisper running on this computer. Audio never leaves the machine. Needs the one-time Local AI setup.</>,
             <><strong>Fully local</strong> (<Server size={11} className="inline" />): Local speech plus an Ollama model as the "brain", so the Context Engine, the Municipality Wizard, translation and session analysis also run here. Works with no internet at all.</>,
             <><strong>Resilience</strong> (<ShieldAlert size={11} className="inline" />): browser speech with aggressive automatic retry when the network drops. For venues with flaky Wi-Fi.</>,
@@ -45,8 +45,8 @@ const SECTIONS: Section[] = [
         id: 'local', icon: Server, title: 'Local AI setup (the wizard)',
         lead: 'Workspace → Local AI, or the Local pill in the Dashboard. Four steps: check this machine, speech engine, AI brain (optional), finish.',
         bullets: [
-            'Check this machine: CPU, RAM, GPU (Apple Silicon or NVIDIA), Python and Ollama. Plain installer links for anything missing; no Homebrew or Terminal required.',
-            'Speech engine: pick a Whisper model. large-v3-turbo is the default on Apple Silicon with 16 GB or more and on NVIDIA; Distil-Whisper for CPU-only machines; small.en and base.en for light hardware. Install & start creates a private Python environment, downloads the model and runs the server. Test with your microphone before you commit.',
+            'Check this machine: CPU, RAM, GPU (Apple Silicon or NVIDIA), Python and Ollama. Plain installer links for anything missing; no Homebrew or Terminal required. Python 3.10–3.13 is used (on Windows it is found through the py launcher); 3.14 is too new for the speech packages.',
+            'Speech engine: pick a Whisper model. large-v3-turbo is the default on Apple Silicon with 16 GB or more and on NVIDIA cards with 4 GB or more and the CUDA 12 runtime installed; small.en everywhere else, because on a CPU the large models need 3–4 seconds per caption and fall behind (small.en needs about 1 s). Install & start creates a private Python environment, downloads the model and runs the server. Test with your microphone before you commit.',
             'First start on a computer takes minutes, not seconds: the Python packages (about 500 MB) and the model (up to 1.6 GB) download once. The wizard, the Dashboard pill and the Prerecorded card all show that progress and the live log. After that, starts take 10–40 seconds, and the app starts the server itself whenever a local workflow needs it.',
             'If an older copy of the speech server is still running on port 9000, the wizard says so and offers to replace it with the current version.',
             'Advanced options: backend, language, interim captions, and a separate small "live caption model" that drafts the live line while the main model does the finals (useful on CPU-only machines).',
@@ -54,7 +54,8 @@ const SECTIONS: Section[] = [
         ],
         tech: [
             'The speech server cuts audio into utterances with an energy-based voice-activity detector (20 ms hops, adaptive noise floor), transcribes the growing utterance every 0.3 s on a GPU for the live line, and finalises it 550 ms after you pause. Finals never wait behind a live update, and a late live update can never overwrite a finished line.',
-            'mlx-whisper runs on the Apple GPU; faster-whisper (CTranslate2) covers CPU and NVIDIA. Models cache under ~/.community-captioner/data/local.',
+            'mlx-whisper runs on the Apple GPU; faster-whisper (CTranslate2) covers CPU and NVIDIA. On Windows the GPU needs NVIDIA\'s CUDA 12 runtime (cuBLAS); without it, or when the card does not support the model, the server says why in its log and runs on the CPU instead. On big CPUs it uses up to 12 threads.',
+            'Models and the Python environment live in ~/.community-captioner/data/local (on Windows: %USERPROFILE%\\.community-captioner\\data\\local).',
         ],
     },
     {
@@ -77,7 +78,7 @@ const SECTIONS: Section[] = [
         id: 'prerecorded', icon: FileVideo, title: 'Prerecorded files',
         lead: 'Workspace → Prerecorded. Transcribe a recording on this computer or with Gemini, review it, then export.',
         bullets: [
-            'On this computer: any file size and format (MP4, MOV, MKV, MP3, WAV, M4A…). The file uploads to the relay on this machine with a progress bar, is decoded there, cut into utterances at pauses and transcribed by your Whisper model. Lines appear with timestamps as they are done, with the stage, speed (× real time) and time left. A 4-minute recording takes about 20 seconds on an M1 Max.',
+            'On this computer: any file size and format (MP4, MOV, MKV, MP3, WAV, M4A…). The file uploads to the relay on this machine with a progress bar, is decoded there, cut into utterances at pauses and transcribed by your Whisper model. Lines appear with timestamps as they are done, with the stage, speed (× real time) and time left. A 4-minute recording takes about 20 seconds on an M1 Max; on a Windows PC without a usable GPU (24-core Xeon, small.en) a 2-minute recording took 39 seconds, including starting the speech server.',
             'YouTube link: the audio is fetched on this computer with yt-dlp (installed automatically the first time) and transcribed the same way.',
             'Gemini cloud: files under 500 MB, can label speakers, needs an API key.',
             'Every line goes through the Context Engine when it finishes; corrected lines are highlighted. Review transcript opens the editor and analytics.',
@@ -112,8 +113,8 @@ const SECTIONS: Section[] = [
         id: 'stats', icon: Activity, title: 'Machine stats',
         lead: 'Local models are only as good as the hardware under them, so the Dashboard watches it.',
         bullets: [
-            'CPU, GPU (Apple and NVIDIA report utilisation), RAM with macOS memory pressure, and network up and down, sampled every two seconds while captioning.',
-            'The detail panel lists what the Whisper server, Ollama and the relay are each using, and spells out warnings: CPU saturated, memory nearly full, GPU fully busy.',
+            'CPU, GPU (Apple and NVIDIA report utilisation), RAM (with memory pressure on macOS; RAM in use on Windows), and network up and down, sampled every two seconds while captioning.',
+            'The detail panel lists what the Whisper server, Ollama and the relay are each using (on Windows memory only, no CPU share), and spells out warnings: CPU saturated, memory nearly full, GPU fully busy.',
             'If captions lag in a local mode and the CPU graph is pinned, pick a smaller Whisper model in Local AI setup; if memory pressure is high, close other apps or choose a smaller brain model.',
         ],
     },
@@ -127,6 +128,7 @@ const SECTIONS: Section[] = [
             'Balanced mode shows the audio meter but no text: the browser speech service is not answering. The header pill says "waiting for text" and then "no text" with the reason. Chrome and Edge need internet access to Google\'s speech servers; Safari uses Apple\'s. Check the spoken language in Help & Settings → General (the audience translation picker never changes it), or switch to Local mode.',
             '"Local server offline" or a file stuck while "starting the speech server": on a first run the engine and model are downloading; the card shows the log. If Local AI was never set up, open the wizard.',
             'Port 8080 already in use: another copy of the app (or the development server) is running. Close it and launch again.',
+            'Windows with an NVIDIA card, but Local AI says the GPU is not used for speech: the CUDA 12 runtime is not installed or the card has under 4 GB. Install NVIDIA\'s CUDA 12 runtime for GPU speech, or keep the recommended CPU model (small.en), which keeps up on its own.',
             'Captions fall behind on SDI: CEA-608 is limited to about 60 characters per second. Switch the strategy to truncate with a lower line length, use summarise, or switch to DTVCC if your decoder supports it.',
             'PDF upload finds nothing: the PDF has no text layer (a scan). Export a text PDF from the agenda software or paste the text.',
             'The Municipality Wizard cannot read a town site: many municipal hosts block automated readers. With Gemini the pages are read from Google\'s side; locally, upload the agenda PDF for full coverage.',
@@ -138,7 +140,7 @@ const SECTIONS: Section[] = [
         lead: 'For the curious and for whoever maintains this next.',
         bullets: [
             'A React interface talks over a WebSocket to a Node relay on port 8080 on the operator\'s machine. The relay polishes and routes captions, hosts the audience view, runs the Context Engine endpoints, manages the local speech server and Ollama, and drives the DeckLink card through a C++ N-API addon.',
-            'The desktop app is that relay plus the interface packaged into one signed and notarised binary; data lives in ~/.community-captioner/data (dictionary, profiles, the Python environment and model caches).',
+            'The desktop app is that relay plus the interface packaged into one binary (signed and notarised on the Mac; a plain CommunityCaptioner.exe on Windows); data lives in ~/.community-captioner/data, on Windows %USERPROFILE%\\.community-captioner\\data (dictionary, profiles, the Python environment and model caches).',
             'The bundled speech server is one Python file. The relay installs it into its own environment, launches it, follows its status lines, and can replace an outdated copy.',
             'Everything the local brain does goes through Ollama\'s HTTP API with JSON-mode prompts: agenda extraction in chunks, the wizard\'s page reading and knowledge pass, translation, and the real-extraction test you see in the wizard.',
             <>Source, releases and the Windows build notes are on <a href={GITHUB_REPO_URL} target="_blank" rel="noopener" className="underline text-forest-dark">GitHub</a>; downloads on the <a href={RELEASES_URL} target="_blank" rel="noopener" className="underline text-forest-dark">releases page</a>.</>,
