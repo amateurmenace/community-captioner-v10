@@ -13,7 +13,8 @@ import { translateCaption, setApiKey as setTranslationApiKey, getSupportedLangua
 import { fetchPage, htmlToText, extractPdfText, extractUploadedText, pdfSupportAvailable, discoverLinks, locateMunicipalitySources, researchMunicipality, extractDictionaryFromUrl, itemsToEntries, getResearchGroups, GEMINI_TEXT_MODEL } from './context-sources.js';
 import { listProfiles, getProfile, saveProfile, deleteProfile } from './profiles.js';
 import { buildCorrectionIndex, applyCorrections } from '../shared/corrections.js';
-import { probeSystem, invalidateProbe, startWhisper, stopWhisper, getWhisperStatus, subscribeLogs, readScript, readHello, ollamaModels, ollamaPull, ollamaTest, ollamaStart, WHISPER_MODELS, OLLAMA_MODELS } from './local-stack.js';
+import { probeSystem, invalidateProbe, startWhisper, stopWhisper, getWhisperStatus, subscribeLogs, readScript, readHello, ollamaModels, ollamaPull, ollamaStart, WHISPER_MODELS, OLLAMA_MODELS } from './local-stack.js';
+import { getBrainConfig, setBrainConfig, brainActive, extractEntriesWithOllama, testOllamaExtraction } from './local-llm.js';
 import { createRequire as _pkgRequire } from 'module';
 // Version: injected by esbuild in packaged builds (package.json isn't in the pkg snapshot), read from disk in dev
 const APP_VERSION = process.env.CC_APP_VERSION || (() => { try { return _pkgRequire(import.meta.url)('../package.json').version; } catch { return 'dev'; } })();
@@ -1064,11 +1065,28 @@ app.post('/api/local/ollama/start', async (req, res) => {
     res.json(await ollamaStart(req.body?.url));
 });
 
+// Does this model work with the app? Runs the real extraction prompt on a
+// sample agenda and grades recall of a few known names.
 app.post('/api/local/ollama/test', async (req, res) => {
     const { model, url } = req.body || {};
     if (!model) return res.status(400).json({ ok: false, error: 'model required' });
-    try { res.json(await ollamaTest(model, url)); }
+    try { res.json(await testOllamaExtraction(model, url)); }
     catch (e) { res.status(502).json({ ok: false, error: e.message }); }
+});
+
+// Which local model (if any) powers the Context Engine's extraction
+app.get('/api/local/brain', (req, res) => {
+    res.json({ ok: true, ...getBrainConfig() });
+});
+
+app.post('/api/local/brain', (req, res) => {
+    const { enabled, url, model } = req.body || {};
+    const cfg = setBrainConfig({
+        ...(typeof enabled === 'boolean' ? { enabled } : {}),
+        ...(typeof url === 'string' && url ? { url } : {}),
+        ...(typeof model === 'string' && model ? { model } : {}),
+    });
+    res.json({ ok: true, ...cfg });
 });
 
 // Pull a model with progress (SSE): {status, completed, total, digest} as Ollama reports it
@@ -1306,6 +1324,39 @@ function resolveRequestKey(req) {
     return geminiKeyActive || null;
 }
 
+/**
+ * Extract dictionary entries from text with whichever engine is available:
+ *   1. the local Ollama brain when the operator enabled it (Fully Local mode)
+ *   2. Gemini when a key is loaded
+ *   3. basic pattern extraction
+ * Returns { entries, engine, warning? }.
+ */
+async function extractEntriesAnyEngine(text, apiKey, { domainHint = '' } = {}) {
+    if (brainActive()) {
+        const b = getBrainConfig();
+        try {
+            const r = await extractEntriesWithOllama(text, { domainHint });
+            if (r.entries.length > 0) {
+                console.log(`[Context] Ollama ${b.model}: ${r.items.length} names → ${r.entries.length} entries in ${r.latencyMs}ms`);
+                return { entries: r.entries, engine: `ollama:${b.model}` };
+            }
+            console.warn(`[Context] Ollama ${b.model} returned no entries${apiKey ? ' — falling back to Gemini' : ''}`);
+        } catch (e) {
+            console.warn(`[Context] Ollama ${b.model} failed: ${e.message}${apiKey ? ' — falling back to Gemini' : ''}`);
+            if (!apiKey) {
+                const local = extractProperNounsLocally(text);
+                return { entries: local, engine: 'local-regex', warning: `Local AI brain (${b.model}) failed: ${e.message}. Used basic pattern extraction.` };
+            }
+        }
+    }
+    if (apiKey) {
+        const entries = await extractDictionary(text, apiKey, { domainHint });
+        return { entries, engine: 'gemini' };
+    }
+    const local = extractProperNounsLocally(text);
+    return { entries: local, engine: 'local-regex', warning: 'No AI engine configured — used basic pattern extraction. Add a Gemini key, or set up the local AI brain.' };
+}
+
 /** Server-Sent Events helper. */
 function sseInit(res) {
     res.setHeader('Content-Type', 'text/event-stream');
@@ -1372,14 +1423,9 @@ async function scrapeUrlToEntries(url, apiKey, emit = () => {}) {
         return { ok: true, entries: [], textLength: text.length, source: sourceType, warning: 'Page has little readable text (dynamic page). Upload the agenda PDF instead.', totalMs: Date.now() - start };
     }
 
-    if (!apiKey) {
-        const local = extractProperNounsLocally(text);
-        return { ok: true, entries: local, textLength: text.length, source: sourceType, warning: 'No Gemini API key — used basic pattern extraction. Add a key for far better results.', totalMs: Date.now() - start };
-    }
-
-    emit('extracting', { textLength: text.length, model: GEMINI_TEXT_MODEL });
-    const entries = await extractDictionary(text, apiKey);
-    return { ok: true, entries, textLength: text.length, source: sourceType, totalMs: Date.now() - start };
+    emit('extracting', { textLength: text.length, model: brainActive() ? `ollama:${getBrainConfig().model}` : apiKey ? GEMINI_TEXT_MODEL : 'local-regex' });
+    const r = await extractEntriesAnyEngine(text, apiKey);
+    return { ok: true, entries: r.entries, engine: r.engine, warning: r.warning, textLength: text.length, source: sourceType, totalMs: Date.now() - start };
 }
 
 // What this server can do — lets the UI explain missing pieces instead of failing silently
@@ -1391,6 +1437,8 @@ app.get('/api/context/capabilities', (req, res) => {
         geminiKey: !!geminiKeyActive,
         geminiKeySource,
         model: GEMINI_TEXT_MODEL,
+        brain: getBrainConfig(),
+        extractionEngine: brainActive() ? `ollama:${getBrainConfig().model}` : geminiKeyActive ? 'gemini' : 'local-regex',
         researchGroups: getResearchGroups(),
     });
 });
@@ -1558,20 +1606,15 @@ if (upload) {
 
             const base = { textLength: text.length, filename, kind: extracted.kind, pages: extracted.pages || undefined, preview: text.slice(0, 300) };
 
-            if (!apiKey) {
-                const localEntries = extractProperNounsLocally(text);
-                return res.json({ ok: true, entries: localEntries, ...base, warning: 'No Gemini API key — used basic pattern extraction. Add a key in Settings for far better results.' });
-            }
-
-            const entries = await extractDictionary(text, apiKey, { domainHint: typeof req.body?.domainHint === 'string' ? req.body.domainHint : '' });
-            console.log(`[Context] Uploaded ${filename}: ${text.length} chars → ${entries.length} entries`);
-            if (entries.length === 0) {
+            const r = await extractEntriesAnyEngine(text, apiKey, { domainHint: typeof req.body?.domainHint === 'string' ? req.body.domainHint : '' });
+            console.log(`[Context] Uploaded ${filename}: ${text.length} chars → ${r.entries.length} entries (${r.engine})`);
+            if (r.entries.length === 0 && r.engine !== 'local-regex') {
                 const localEntries = extractProperNounsLocally(text);
                 if (localEntries.length > 0) {
-                    return res.json({ ok: true, entries: localEntries, ...base, warning: 'AI extraction returned nothing; used basic pattern extraction instead.' });
+                    return res.json({ ok: true, entries: localEntries, engine: 'local-regex', ...base, warning: 'AI extraction returned nothing; used basic pattern extraction instead.' });
                 }
             }
-            res.json({ ok: true, entries, ...base });
+            res.json({ ok: true, entries: r.entries, engine: r.engine, warning: r.warning, ...base });
         } catch (e) {
             console.warn(`[Context] Upload error (${filename}): ${e.message}`);
             res.status(422).json({ ok: false, error: e.message, filename });
@@ -1603,13 +1646,9 @@ app.post('/api/context/extract', async (req, res) => {
     const { text, domainHint } = req.body || {};
     if (!text || typeof text !== 'string' || !text.trim()) return res.status(400).json({ ok: false, error: 'text required' });
     const apiKey = resolveRequestKey(req);
-    if (!apiKey) {
-        const localEntries = extractProperNounsLocally(text);
-        return res.json({ ok: true, entries: localEntries, textLength: text.length, warning: 'No Gemini API key — used basic pattern extraction.' });
-    }
     try {
-        const entries = await extractDictionary(text, apiKey, { domainHint: typeof domainHint === 'string' ? domainHint : '' });
-        res.json({ ok: true, entries, textLength: text.length });
+        const r = await extractEntriesAnyEngine(text, apiKey, { domainHint: typeof domainHint === 'string' ? domainHint : '' });
+        res.json({ ok: true, entries: r.entries, engine: r.engine, warning: r.warning, textLength: text.length });
     } catch (e) {
         res.status(500).json({ ok: false, error: e.message });
     }

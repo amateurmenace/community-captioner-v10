@@ -17,6 +17,7 @@ import { readFileSync, writeFileSync, mkdirSync, existsSync } from 'fs';
 import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
 import { itemsToEntries, mapLimit, GEMINI_TEXT_MODEL } from './context-sources.js';
+import { brainActive, getBrainConfig, extractItemsWithOllama } from './local-llm.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -87,11 +88,41 @@ export function feedText(text) {
  * Called by the timer — never blocks the caller.
  */
 async function extractFromBuffer() {
-    if (isExtracting || !geminiApiKey || textBuffer.length < MIN_BUFFER_LENGTH) return;
+    const useBrain = brainActive();
+    if (isExtracting || (!geminiApiKey && !useBrain) || textBuffer.length < MIN_BUFFER_LENGTH) return;
     isExtracting = true;
 
     const text = textBuffer;
     textBuffer = ''; // Clear buffer for next accumulation
+
+    // Fully Local mode: the Ollama brain extracts from the live transcript instead of Gemini
+    if (useBrain) {
+        try {
+            const b = getBrainConfig();
+            const r = await extractItemsWithOllama(text.slice(0, 6000), { url: b.url, model: b.model, domainHint: 'a live public meeting transcript' });
+            const entries = itemsToEntries(r.items);
+            const existingKeys = new Set([
+                ...activeDictionary.map(e => `${e.original.toLowerCase()}→${e.replacement.toLowerCase()}`),
+                ...suggestions.map(e => `${e.original.toLowerCase()}→${e.replacement.toLowerCase()}`),
+            ]);
+            let newCount = 0;
+            for (const entry of entries) {
+                const key = `${entry.original.toLowerCase()}→${entry.replacement.toLowerCase()}`;
+                if (existingKeys.has(key) || entry.original.toLowerCase() === entry.replacement.toLowerCase()) continue;
+                suggestions.push({ id: `${Date.now()}-${Math.random().toString(36).slice(2, 7)}`, original: entry.original, replacement: entry.replacement, type: entry.type || 'proper_noun', note: entry.note, source: 'auto_learned', timestamp: Date.now() });
+                existingKeys.add(key);
+                newCount++;
+            }
+            lastExtractionTime = Date.now();
+            extractionCount++;
+            if (newCount > 0) console.log(`[Learner] (${b.model}) Extracted ${newCount} new suggestions (${suggestions.length} total pending)`);
+        } catch (e) {
+            console.warn('[Learner] Ollama extraction error:', e.message);
+            textBuffer = text + (textBuffer ? ' ' + textBuffer : '');
+        }
+        isExtracting = false;
+        return;
+    }
 
     try {
         const { GoogleGenAI } = await import('@google/genai');
@@ -437,7 +468,8 @@ export function getDictionary() {
 export function getStatus() {
     return {
         enabled,
-        geminiKeySet: !!geminiApiKey,
+        geminiKeySet: !!geminiApiKey || brainActive(),
+        engine: brainActive() ? `ollama:${getBrainConfig().model}` : geminiApiKey ? 'gemini' : 'none',
         bufferLength: textBuffer.length,
         pendingSuggestions: suggestions.length,
         dictionarySize: activeDictionary.length,

@@ -21,11 +21,13 @@ type ProbeInfo = {
     whisper: { running: boolean; managed: boolean; hello: any; url: string; port: number };
     scriptBundled: boolean; canLaunch: boolean; dataDir: string;
     installCommands: { uv: string; ollama: string; ollamaServe: string };
+    downloads: { ollama: string; python: string; terminalHint: string };
     recommendation: { backend: string; model: string; compute: string; reason: string };
     whisperModels: { name: string; label: string; downloadMB: number; englishOnly: boolean; tier: 'best' | 'light' | 'other'; desc: string }[];
-    ollamaModels: { name: string; label: string; sizeGB: number; minRamGB: number; tier: 'best' | 'light' | 'other'; desc: string }[];
+    ollamaModels: { name: string; label: string; sizeGB: number; minRamGB: number; tier: 'best' | 'light' | 'other'; tested?: boolean; desc: string }[];
     managed: WhisperStatus;
 };
+type BrainTest = { ok: boolean; model?: string; latencyMs?: number; tokensPerSec?: number | null; itemCount?: number; entryCount?: number; score?: number; sample?: string[]; verdict?: string; error?: string };
 type WhisperStatus = { state: 'stopped' | 'installing' | 'starting' | 'loading' | 'ready' | 'stopping' | 'error'; message: string; model?: string | null; backend?: string | null; device?: string | null; compute?: string | null; url?: string | null; pid?: number | null; runner?: string | null; logs?: { t: number; line: string }[] };
 
 const getRelayUrl = () => {
@@ -96,12 +98,13 @@ const LocalSetup: React.FC<LocalSetupProps> = ({ onBack, onComplete, initialWhis
 
     // ---- brain (Ollama) ----
     const [llmUrl, setLlmUrl] = useState(initialLlmUrl || 'http://127.0.0.1:11434');
-    const [llmModel, setLlmModel] = useState(initialLlmModel || 'qwen3:4b');
+    const [llmModel, setLlmModel] = useState(initialLlmModel || 'gemma3:4b');
     const [ollama, setOllama] = useState<ProbeInfo['ollama'] | null>(null);
     const [ollamaBusy, setOllamaBusy] = useState<string | null>(null);
     const [pull, setPull] = useState<{ model: string; status: string; completed?: number; total?: number; done?: boolean; error?: string } | null>(null);
-    const [llmTest, setLlmTest] = useState<{ ok: boolean; latencyMs?: number; tokensPerSec?: number | null; jsonValid?: boolean; error?: string; model?: string } | null>(null);
+    const [llmTest, setLlmTest] = useState<BrainTest | null>(null);
     const [skipBrain, setSkipBrain] = useState(false);
+    const [finishing, setFinishing] = useState(false);
 
     const copy = (t: string) => navigator.clipboard.writeText(t).catch(() => {});
 
@@ -296,16 +299,37 @@ const LocalSetup: React.FC<LocalSetupProps> = ({ onBack, onComplete, initialWhis
         setLlmTest(null);
         try {
             const d = await fetch(`${getRelayUrl()}/api/local/ollama/test`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ model: llmModel, url: llmUrl }) }).then(r => r.json());
-            if (!d.ok) throw new Error(d.error || 'failed');
-            setLlmTest({ ok: true, latencyMs: d.latencyMs, tokensPerSec: d.evalTokensPerSec, jsonValid: d.jsonValid, model: d.model });
+            if (d.error && d.ok === false && !d.verdict) throw new Error(d.error);
+            setLlmTest(d);
         } catch (e) { setLlmTest({ ok: false, error: (e as Error).message }); }
         setOllamaBusy(null);
     };
 
+    // Tell the relay which model powers the Context Engine (or that none does), then hand off
+    const finish = async () => {
+        setFinishing(true);
+        try {
+            await fetch(`${getRelayUrl()}/api/local/brain`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ enabled: !skipBrain, url: llmUrl, model: llmModel }) });
+        } catch {}
+        setFinishing(false);
+        onComplete(effectiveUrl, skipBrain ? null : { url: llmUrl, model: llmModel });
+    };
+
     const installedNames = useMemo(() => new Set((ollama?.models || []).map(m => m.name)), [ollama]);
+    const ramFits = (minRamGB: number) => !info || !minRamGB || info.memoryGB >= minRamGB;
+    // Recommend from measured results: Gemma 3 4B wins the app's own agenda test on
+    // accuracy and speed (Gemma 3 12B found more names but is ~4x slower, which
+    // hurts Auto-Learn's 30-second cycle), so it is the pick for every machine.
+    const recommendedLlm = 'gemma3:4b';
     const osName = info?.platform === 'darwin' ? 'macOS' : info?.platform === 'win32' ? 'Windows' : info?.platform === 'linux' ? 'Linux' : '';
     const speechDone = manualMode ? manualCheck.state === 'ok' : serverReady;
     const brainDone = skipBrain || (!!ollama?.running && installedNames.has(llmModel));
+
+    // Pick the recommended model once we know the machine, unless the user already chose one
+    useEffect(() => {
+        if (!info || initialLlmModel) return;
+        setLlmModel(recommendedLlm);
+    }, [info, initialLlmModel]);
 
     // ------------------------------------------------------------------
     // Render helpers
@@ -407,18 +431,30 @@ const LocalSetup: React.FC<LocalSetupProps> = ({ onBack, onComplete, initialWhis
                                         {info.uv.installed ? (
                                             <p className="text-xs text-stone-600">uv is installed — it manages Python and the speech packages automatically. Nothing else to install.</p>
                                         ) : info.python.some(p => p.ok) ? (
-                                            <p className="text-xs text-stone-600">Python {info.python.find(p => p.ok)!.version} found ({info.python.find(p => p.ok)!.cmd}). The installer will create an isolated environment for the speech packages. Installing <strong>uv</strong> is optional but makes updates easier:</p>
+                                            <p className="text-xs text-stone-600">Python {info.python.find(p => p.ok)!.version} found. The installer will create a private environment for the speech packages. Nothing else to install.</p>
                                         ) : (
-                                            <p className="text-xs text-stone-600">No usable Python found{info.python.length ? ` (found ${info.python.map(p => p.version).join(', ')}, ${info.python[0].note || 'not supported'})` : ''}. Install <strong>uv</strong> (one line, no admin rights) and press "Check again":</p>
+                                            <div className="text-xs text-stone-600 space-y-2">
+                                                <p>{info.python.length ? `Python ${info.python[0].version} is installed but ${info.python[0].note || 'not supported'}.` : 'No Python found.'} Pick either option, then press <strong>Check again</strong>:</p>
+                                                <div className="p-2.5 rounded-lg bg-white border border-stone-200">
+                                                    <p className="font-bold text-stone-700 mb-1">Option A — no Terminal needed</p>
+                                                    <p>Install <strong>Python 3.12</strong> from python.org like any other app: download the installer, open it, click through (keep the defaults).</p>
+                                                    <a href={info.downloads.python} target="_blank" rel="noopener noreferrer" className="inline-flex items-center gap-1 mt-1.5 px-2.5 py-1 rounded-lg bg-forest-dark text-white font-bold hover:bg-forest-light"><Download size={11} /> Download Python 3.12 <ExternalLink size={10} /></a>
+                                                    <p className="text-[10px] text-stone-400 mt-1">On the downloads page choose a 3.12.x release (3.14 is too new for the speech libraries).</p>
+                                                </div>
+                                                <div className="p-2.5 rounded-lg bg-white border border-stone-200">
+                                                    <p className="font-bold text-stone-700 mb-1">Option B — one line in {info.platform === 'win32' ? 'PowerShell' : 'Terminal'} (installs uv)</p>
+                                                    <Cmd cmd={info.installCommands.uv} />
+                                                    <p className="text-[10px] text-stone-400 mt-1">{info.downloads.terminalHint}</p>
+                                                </div>
+                                            </div>
                                         )}
-                                        {!info.uv.installed && <div className="mt-2"><Cmd cmd={info.installCommands.uv} /></div>}
                                     </div>
                                     <div className="p-4 rounded-xl border border-stone-200 bg-stone-50">
                                         <div className="flex items-center justify-between mb-2">
                                             <div className="flex items-center gap-2"><Brain size={16} className="text-forest-dark" /><span className="text-sm font-bold text-forest-dark">Ollama (optional brain)</span></div>
                                             {info.ollama.running ? <Pill ok>Running · {info.ollama.models.length} model{info.ollama.models.length === 1 ? '' : 's'}</Pill> : info.ollama.installed ? <Pill warn>Installed, not running</Pill> : <Pill>Not installed</Pill>}
                                         </div>
-                                        <p className="text-xs text-stone-600">Only needed for a fully offline Context Engine. Otherwise the Context Engine keeps using Gemini (if you have a key) or basic extraction.</p>
+                                        <p className="text-xs text-stone-600">Only needed for a fully offline Context Engine (reading agendas and the live transcript without Gemini). Step 3 walks you through installing it and choosing a model.</p>
                                     </div>
                                 </div>
                                 {info.whisper.running && (
@@ -585,84 +621,127 @@ const LocalSetup: React.FC<LocalSetupProps> = ({ onBack, onComplete, initialWhis
                         <div className="flex items-start justify-between gap-4">
                             <div>
                                 <h3 className="font-bold text-lg text-forest-dark">AI brain (optional)</h3>
-                                <p className="text-xs text-stone-500 max-w-xl">Ollama runs a small language model locally for the Context Engine (extracting names and acronyms from agendas) and session summaries. Skip it if you'd rather keep using Gemini for those, or don't need them.</p>
+                                <p className="text-xs text-stone-500 max-w-2xl">A small language model, run by the free <strong>Ollama</strong> app on this computer. The Context Engine uses it to pull names, boards, places and acronyms out of agendas you upload or paste, and from the live transcript (Auto-Learn), so none of that text goes to Gemini. The Municipality Wizard, translation and caption polish still need a Gemini key.</p>
                             </div>
                             <label className="flex items-center gap-2 text-xs font-bold text-stone-600 shrink-0 bg-stone-50 border border-stone-200 px-3 py-2 rounded-lg"><input type="checkbox" checked={skipBrain} onChange={e => setSkipBrain(e.target.checked)} className="accent-forest-dark" /> Skip for now</label>
                         </div>
 
-                        {!skipBrain && (
+                        {!skipBrain && info && (
                             <>
-                                <div className={`rounded-xl border p-4 ${ollama?.running ? 'border-green-200 bg-green-50' : 'border-stone-200 bg-stone-50'}`}>
-                                    <div className="flex items-center gap-3">
-                                        {ollama?.running ? <CheckCircle size={22} className="text-green-600" /> : ollama?.installed ? <AlertCircle size={22} className="text-amber-600" /> : <Download size={22} className="text-stone-400" />}
-                                        <div className="flex-1">
-                                            <p className="text-sm font-bold text-forest-dark">{ollama?.running ? `Ollama is running${ollama.version ? ` (v${ollama.version})` : ''}` : ollama?.installed ? 'Ollama is installed but not running' : 'Ollama is not installed'}</p>
-                                            <p className="text-xs text-stone-600">{ollama?.running ? `${ollama.models.length} model${ollama.models.length === 1 ? '' : 's'} installed` : ollama?.installed ? 'Start it, or open the Ollama app.' : 'Free, one install. Then come back and press "Check again".'}</p>
-                                        </div>
-                                        <div className="flex gap-2">
-                                            {ollama?.installed && !ollama.running && <button onClick={startOllama} disabled={ollamaBusy === 'start'} className="bg-forest-dark text-white px-4 py-2 rounded-lg text-sm font-bold hover:bg-forest-light disabled:opacity-50 flex items-center gap-2">{ollamaBusy === 'start' ? <Loader2 size={14} className="animate-spin" /> : <Play size={14} />} Start Ollama</button>}
-                                            <button onClick={refreshOllama} className="bg-white border border-stone-200 text-stone-600 px-3 py-2 rounded-lg text-sm font-bold hover:bg-stone-50 flex items-center gap-1.5"><RefreshCw size={14} /> Check again</button>
-                                        </div>
+                                {/* 1. Choose a model — always visible, even before Ollama exists */}
+                                <div className="space-y-2">
+                                    <div className="flex items-baseline justify-between">
+                                        <p className="text-xs font-bold text-stone-500 uppercase tracking-wider">1. Choose a model</p>
+                                        <p className="text-[11px] text-stone-400">This machine has {info.memoryGB} GB RAM</p>
                                     </div>
-                                    {!ollama?.installed && info && (
-                                        <div className="mt-3 space-y-2">
-                                            <Cmd cmd={info.installCommands.ollama} />
-                                            <a href="https://ollama.com/download" target="_blank" rel="noopener noreferrer" className="text-[11px] underline text-forest-dark inline-flex items-center gap-1">ollama.com/download <ExternalLink size={10} /></a>
-                                        </div>
-                                    )}
+                                    <p className="text-xs text-stone-600">Rule of thumb: <strong>4B</strong> models need about 8 GB of RAM and answer in seconds; <strong>12B</strong> needs 24 GB and is slower but better on unusual names. Bigger is not automatically better: on the app's own agenda test, Gemma 3 4B beat the 8B models on both accuracy and speed. "Tested with the app" means we verified it with that test; use the test below for anything else.</p>
+                                    <div className="grid grid-cols-1 md:grid-cols-2 gap-2">
+                                        {[...info.ollamaModels, ...(ollama?.models || []).filter(m => !info.ollamaModels.some(c => c.name === m.name)).map(m => ({ name: m.name, label: m.name, sizeGB: m.sizeGB || 0, minRamGB: 0, tier: 'other' as const, tested: false, desc: `Already installed${m.parameterSize ? ` · ${m.parameterSize}` : ''}. Not in our tested list; use the test below to check it.` }))].map(m => {
+                                            const installed = installedNames.has(m.name);
+                                            const sel = llmModel === m.name;
+                                            const fits = ramFits(m.minRamGB);
+                                            const rec = m.name === recommendedLlm;
+                                            const pulling = pull?.model === m.name && !pull.done && !pull.error;
+                                            return (
+                                                <button key={m.name} onClick={() => { setLlmModel(m.name); setLlmTest(null); }}
+                                                    className={`text-left p-3 rounded-xl border-2 transition-all ${sel ? 'border-sage-500 bg-sage-50' : fits ? 'border-stone-200 bg-white hover:border-sage-300' : 'border-stone-100 bg-stone-50 opacity-70'}`}>
+                                                    <div className="flex items-center gap-2 flex-wrap">
+                                                        <span className="text-sm font-bold text-forest-dark">{m.label}</span>
+                                                        {rec && fits && <Pill ok>Recommended</Pill>}
+                                                        {m.tier === 'best' && fits && !rec && <Pill ok>More thorough, slower</Pill>}
+                                                        {m.tested && <Pill ok><CheckCircle size={10} /> Tested with the app</Pill>}
+                                                        {!fits && <Pill warn>Needs {m.minRamGB} GB RAM</Pill>}
+                                                        <span className="text-[10px] text-stone-400 ml-auto">{installed ? 'installed' : m.sizeGB ? `${m.sizeGB} GB download` : ''}</span>
+                                                    </div>
+                                                    <p className="text-xs text-stone-500 mt-1">{m.desc}</p>
+                                                    {pull?.model === m.name && (
+                                                        <div className="mt-2">
+                                                            <div className="flex justify-between text-[10px] text-stone-500 mb-1"><span>{pull.error ? `Failed: ${pull.error}` : pull.done ? 'Downloaded' : pull.status}</span>{pull.total ? <span>{Math.round(((pull.completed || 0) / pull.total) * 100)}%</span> : null}</div>
+                                                            <div className="w-full bg-stone-200 rounded-full h-1.5"><div className={`h-1.5 rounded-full ${pull.error ? 'bg-red-400' : 'bg-sage-500'}`} style={{ width: `${pull.done ? 100 : pull.total ? Math.round(((pull.completed || 0) / pull.total) * 100) : 5}%` }} /></div>
+                                                        </div>
+                                                    )}
+                                                    {pulling && <span className="sr-only">downloading</span>}
+                                                </button>
+                                            );
+                                        })}
+                                    </div>
                                 </div>
 
-                                {ollama?.running && info && (
-                                    <div className="space-y-3">
-                                        <p className="text-xs font-bold text-stone-500 uppercase tracking-wider">Pick a model</p>
-                                        <div className="grid grid-cols-1 md:grid-cols-2 gap-2">
-                                            {[...info.ollamaModels, ...ollama.models.filter(m => !info.ollamaModels.some(c => c.name === m.name)).map(m => ({ name: m.name, label: m.name, sizeGB: m.sizeGB || 0, minRamGB: 0, tier: 'other' as const, desc: `Installed${m.parameterSize ? ` · ${m.parameterSize}` : ''}` }))].map(m => {
-                                                const installed = installedNames.has(m.name);
-                                                const sel = llmModel === m.name;
-                                                const fits = !m.minRamGB || info.memoryGB >= m.minRamGB;
-                                                const rec = m.tier === 'light' && m.name === 'qwen3:4b' || (m.tier === 'best' && m.name === 'qwen3:8b' && info.memoryGB >= 16);
-                                                const pulling = pull?.model === m.name && !pull.done && !pull.error;
-                                                return (
-                                                    <div key={m.name} className={`p-3 rounded-xl border-2 transition-all ${sel ? 'border-sage-500 bg-sage-50' : 'border-stone-200 bg-white'}`}>
-                                                        <div className="flex items-center gap-2 flex-wrap">
-                                                            <button onClick={() => installed && setLlmModel(m.name)} className={`text-sm font-bold ${installed ? 'text-forest-dark' : 'text-stone-500'}`}>{m.label}</button>
-                                                            {rec && fits && <Pill ok>Recommended</Pill>}
-                                                            {installed ? <Pill ok>Installed</Pill> : <Pill>{m.sizeGB ? `${m.sizeGB} GB download` : 'Download'}</Pill>}
-                                                            {!fits && <Pill warn>Needs {m.minRamGB} GB RAM</Pill>}
-                                                            <div className="ml-auto flex gap-1">
-                                                                {!installed && !pulling && <button onClick={() => pullModel(m.name)} disabled={!!ollamaBusy} className="text-[11px] font-bold bg-forest-dark text-white px-2.5 py-1 rounded-lg hover:bg-forest-light disabled:opacity-40">Download</button>}
-                                                                {installed && !sel && <button onClick={() => setLlmModel(m.name)} className="text-[11px] font-bold bg-sage-100 text-forest-dark px-2.5 py-1 rounded-lg hover:bg-sage-200">Use</button>}
-                                                            </div>
-                                                        </div>
-                                                        <p className="text-xs text-stone-500 mt-1">{m.desc}</p>
-                                                        {pull?.model === m.name && (
-                                                            <div className="mt-2">
-                                                                <div className="flex justify-between text-[10px] text-stone-500 mb-1"><span>{pull.error ? `Failed: ${pull.error}` : pull.done ? 'Downloaded' : pull.status}</span>{pull.total ? <span>{Math.round(((pull.completed || 0) / pull.total) * 100)}%</span> : null}</div>
-                                                                <div className="w-full bg-stone-200 rounded-full h-1.5"><div className={`h-1.5 rounded-full ${pull.error ? 'bg-red-400' : 'bg-sage-500'}`} style={{ width: `${pull.done ? 100 : pull.total ? Math.round(((pull.completed || 0) / pull.total) * 100) : 5}%` }} /></div>
-                                                            </div>
-                                                        )}
-                                                    </div>
-                                                );
-                                            })}
+                                {/* 2. Install / start Ollama */}
+                                <div className="space-y-2">
+                                    <p className="text-xs font-bold text-stone-500 uppercase tracking-wider">2. Install Ollama (the app that runs the model)</p>
+                                    <div className={`rounded-xl border p-4 ${ollama?.running ? 'border-green-200 bg-green-50' : 'border-stone-200 bg-stone-50'}`}>
+                                        <div className="flex items-center gap-3">
+                                            {ollama?.running ? <CheckCircle size={22} className="text-green-600" /> : ollama?.installed ? <AlertCircle size={22} className="text-amber-600" /> : <Download size={22} className="text-stone-400" />}
+                                            <div className="flex-1">
+                                                <p className="text-sm font-bold text-forest-dark">{ollama?.running ? `Ollama is running${ollama.version ? ` (v${ollama.version})` : ''}` : ollama?.installed ? 'Ollama is installed but not running' : 'Ollama is not installed yet'}</p>
+                                                <p className="text-xs text-stone-600">{ollama?.running ? `${ollama.models.length} model${ollama.models.length === 1 ? '' : 's'} installed — the app can download more for you below.` : ollama?.installed ? 'Start it here, or open the Ollama app from your Applications folder.' : 'Free. Installs like any other app; no Terminal needed.'}</p>
+                                            </div>
+                                            <div className="flex gap-2">
+                                                {ollama?.installed && !ollama.running && <button onClick={startOllama} disabled={ollamaBusy === 'start'} className="bg-forest-dark text-white px-4 py-2 rounded-lg text-sm font-bold hover:bg-forest-light disabled:opacity-50 flex items-center gap-2">{ollamaBusy === 'start' ? <Loader2 size={14} className="animate-spin" /> : <Play size={14} />} Start Ollama</button>}
+                                                <button onClick={refreshOllama} className="bg-white border border-stone-200 text-stone-600 px-3 py-2 rounded-lg text-sm font-bold hover:bg-stone-50 flex items-center gap-1.5"><RefreshCw size={14} /> Check again</button>
+                                            </div>
                                         </div>
-                                        <div className="flex items-center gap-3 p-3 rounded-xl border border-stone-200 bg-white">
-                                            <div className="flex-1 text-xs text-stone-600">Selected: <strong className="text-forest-dark font-mono">{llmModel}</strong>{installedNames.has(llmModel) ? '' : ' (not installed yet)'}</div>
-                                            <button onClick={testModel} disabled={!installedNames.has(llmModel) || !!ollamaBusy} className="bg-sage-500 text-white px-4 py-2 rounded-lg text-sm font-bold hover:bg-sage-600 disabled:opacity-40 flex items-center gap-2">{ollamaBusy === 'test' ? <Loader2 size={14} className="animate-spin" /> : <Zap size={14} />} Test extraction</button>
-                                        </div>
-                                        {llmTest && (
-                                            <p className={`text-xs flex items-center gap-1 ${llmTest.ok ? 'text-green-700' : 'text-red-600'}`}>
-                                                {llmTest.ok ? <CheckCircle size={12} /> : <XCircle size={12} />}
-                                                {llmTest.ok ? `${llmTest.model} answered in ${((llmTest.latencyMs || 0) / 1000).toFixed(1)}s${llmTest.tokensPerSec ? ` (${llmTest.tokensPerSec} tokens/s)` : ''}${llmTest.jsonValid ? ' with valid JSON' : ' but the JSON was malformed — try another model'}` : `Test failed: ${llmTest.error}`}
-                                            </p>
+                                        {!ollama?.installed && (
+                                            <div className="mt-3 grid grid-cols-1 md:grid-cols-2 gap-3">
+                                                <div className="p-3 rounded-lg bg-white border border-stone-200 text-xs text-stone-600">
+                                                    <p className="font-bold text-stone-700 mb-1">Option A — download the installer (recommended)</p>
+                                                    <ol className="list-decimal list-inside space-y-0.5">
+                                                        <li>Download Ollama for {osName || 'your computer'}.</li>
+                                                        <li>{info.platform === 'darwin' ? 'Open the .zip/.dmg, drag Ollama to Applications, then open it (it shows a llama icon in the menu bar).' : info.platform === 'win32' ? 'Run OllamaSetup.exe and follow the installer (Ollama then runs in the system tray).' : 'Run the install script from ollama.com.'}</li>
+                                                        <li>Come back here and press <strong>Check again</strong>.</li>
+                                                    </ol>
+                                                    <a href={info.downloads.ollama} target="_blank" rel="noopener noreferrer" className="inline-flex items-center gap-1 mt-2 px-3 py-1.5 rounded-lg bg-forest-dark text-white font-bold hover:bg-forest-light"><Download size={12} /> Download Ollama for {osName || 'this computer'} <ExternalLink size={10} /></a>
+                                                </div>
+                                                <div className="p-3 rounded-lg bg-white border border-stone-200 text-xs text-stone-600">
+                                                    <p className="font-bold text-stone-700 mb-1">Option B — {info.platform === 'darwin' ? 'Homebrew' : info.platform === 'win32' ? 'winget' : 'install script'} (if you already use it)</p>
+                                                    <Cmd cmd={info.installCommands.ollama} />
+                                                    <p className="text-[10px] text-stone-400 mt-1">{info.downloads.terminalHint}</p>
+                                                </div>
+                                            </div>
                                         )}
                                     </div>
-                                )}
+                                </div>
+
+                                {/* 3. Download + test the chosen model */}
+                                <div className="space-y-2">
+                                    <p className="text-xs font-bold text-stone-500 uppercase tracking-wider">3. Download and test <span className="font-mono normal-case text-forest-dark">{llmModel}</span></p>
+                                    <div className="rounded-xl border border-stone-200 bg-white p-4 space-y-3">
+                                        {!ollama?.running ? (
+                                            <p className="text-xs text-stone-500 flex items-center gap-2"><Info size={14} className="shrink-0" /> Once Ollama is running, the app downloads <strong className="font-mono">{llmModel}</strong> for you (no commands) and tests it on a sample agenda.</p>
+                                        ) : !installedNames.has(llmModel) ? (
+                                            <div className="flex items-center gap-3">
+                                                <div className="flex-1 text-xs text-stone-600">
+                                                    <p className="font-bold text-forest-dark">{llmModel} is not downloaded yet</p>
+                                                    <p>{(info.ollamaModels.find(m => m.name === llmModel)?.sizeGB || 0) ? `${info.ollamaModels.find(m => m.name === llmModel)!.sizeGB} GB, ` : ''}one-time download; the model is kept by Ollama. Or in a terminal: <code className="font-mono">ollama pull {llmModel}</code></p>
+                                                </div>
+                                                <button onClick={() => pullModel(llmModel)} disabled={!!ollamaBusy} className="bg-forest-dark text-white px-4 py-2 rounded-lg text-sm font-bold hover:bg-forest-light disabled:opacity-40 flex items-center gap-2">{ollamaBusy === 'pull' ? <Loader2 size={14} className="animate-spin" /> : <Download size={14} />} Download</button>
+                                            </div>
+                                        ) : (
+                                            <div className="flex items-center gap-3">
+                                                <div className="flex-1 text-xs text-stone-600">
+                                                    <p className="font-bold text-forest-dark flex items-center gap-1"><CheckCircle size={12} className="text-green-600" /> {llmModel} is installed</p>
+                                                    <p>Run the app's real agenda-extraction test to confirm it answers correctly and quickly on this machine.</p>
+                                                </div>
+                                                <button onClick={testModel} disabled={!!ollamaBusy} className="bg-sage-500 text-white px-4 py-2 rounded-lg text-sm font-bold hover:bg-sage-600 disabled:opacity-40 flex items-center gap-2">{ollamaBusy === 'test' ? <Loader2 size={14} className="animate-spin" /> : <Zap size={14} />} {ollamaBusy === 'test' ? 'Testing…' : 'Test with the app'}</button>
+                                            </div>
+                                        )}
+                                        {ollamaBusy === 'test' && <p className="text-[11px] text-stone-400">Loading the model and extracting names from a sample Select Board agenda (10–60 seconds the first time)…</p>}
+                                        {llmTest && (
+                                            <div className={`p-3 rounded-lg border text-xs ${llmTest.ok ? 'bg-green-50 border-green-200 text-green-800' : 'bg-amber-50 border-amber-200 text-amber-800'}`}>
+                                                <p className="font-bold flex items-center gap-1">{llmTest.ok ? <CheckCircle size={12} /> : <AlertTriangle size={12} />} {llmTest.verdict || llmTest.error || (llmTest.ok ? 'Works' : 'Failed')}</p>
+                                                {llmTest.sample && llmTest.sample.length > 0 && <p className="mt-1 text-[11px] opacity-90">Found: {llmTest.sample.join(', ')}{(llmTest.itemCount || 0) > llmTest.sample.length ? ', …' : ''}</p>}
+                                                {typeof llmTest.tokensPerSec === 'number' && <p className="mt-0.5 text-[10px] opacity-70">{llmTest.tokensPerSec} tokens/s · recall {llmTest.score}% on the known names</p>}
+                                            </div>
+                                        )}
+                                    </div>
+                                </div>
                             </>
                         )}
 
                         <div className="flex justify-between items-center pt-2">
                             <button onClick={() => setStep(1)} className="text-stone-500 font-bold hover:text-forest-dark text-sm">Back</button>
-                            <button onClick={() => setStep(3)} disabled={!brainDone} className="bg-forest-dark text-white px-8 py-3 rounded-xl font-bold hover:bg-forest-light shadow-lg flex items-center gap-2 disabled:opacity-50">Next: finish <ArrowRight size={18} /></button>
+                            <button onClick={() => setStep(3)} disabled={!brainDone} className="bg-forest-dark text-white px-8 py-3 rounded-xl font-bold hover:bg-forest-light shadow-lg flex items-center gap-2 disabled:opacity-50" title={!brainDone ? 'Download the chosen model (or tick "Skip for now") to continue' : ''}>Next: finish <ArrowRight size={18} /></button>
                         </div>
                     </div>
                 )}
@@ -686,7 +765,7 @@ const LocalSetup: React.FC<LocalSetupProps> = ({ onBack, onComplete, initialWhis
                         <div className="p-3 rounded-xl bg-stone-50 border border-stone-200 text-xs text-stone-600 flex items-start gap-2"><Info size={14} className="mt-0.5 shrink-0" /><span>The Dashboard shows a <strong>Local</strong> pill while captioning: green when the speech server is answering, red if it drops. Click it to come back here.</span></div>
                         <div className="flex justify-between items-center pt-2">
                             <button onClick={() => setStep(2)} className="text-stone-500 font-bold hover:text-forest-dark text-sm">Back</button>
-                            <button onClick={() => onComplete(effectiveUrl, skipBrain ? null : { url: llmUrl, model: llmModel })} className="bg-forest-dark text-white px-8 py-3 rounded-xl font-bold hover:bg-forest-light shadow-lg flex items-center gap-2"><CheckCircle size={18} /> Start captioning in {skipBrain ? 'Local' : 'Fully Local'} mode</button>
+                            <button onClick={finish} disabled={finishing} className="bg-forest-dark text-white px-8 py-3 rounded-xl font-bold hover:bg-forest-light shadow-lg flex items-center gap-2 disabled:opacity-60">{finishing ? <Loader2 size={18} className="animate-spin" /> : <CheckCircle size={18} />} Start captioning in {skipBrain ? 'Local' : 'Fully Local'} mode</button>
                         </div>
                     </div>
                 )}

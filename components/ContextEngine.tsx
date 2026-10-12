@@ -100,7 +100,8 @@ const ContextEngine: React.FC<ContextEngineProps> = ({
   // Server-side API key status — drives the banner and the wizard gating
   const [serverKey, setServerKey] = useState<{loaded: boolean, source: string, masked: string} | null>(null);
   const [showInlineKeyForm, setShowInlineKeyForm] = useState(false);
-  const [capabilities, setCapabilities] = useState<{pdf: boolean, docx: boolean, upload: boolean, model?: string} | null>(null);
+  const [capabilities, setCapabilities] = useState<{pdf: boolean, docx: boolean, upload: boolean, model?: string, brain?: { enabled: boolean; model: string; url: string }, extractionEngine?: string} | null>(null);
+  const brainOn = !!capabilities?.brain?.enabled && !!capabilities?.brain?.model;
 
   // --- Municipality Wizard state ---
   const [wizardState, setWizardState] = useState<'idle' | 'running' | 'done' | 'error'>('idle');
@@ -1228,16 +1229,26 @@ const ContextEngine: React.FC<ContextEngineProps> = ({
 
                         {/* === API KEY STATUS BANNER === */}
                         <div className={`rounded-2xl border-2 p-4 transition-all ${
-                            hasUsableKey()
+                            hasUsableKey() || brainOn
                                 ? 'bg-green-50 border-green-200'
                                 : 'bg-amber-50 border-amber-300 shadow-lg shadow-amber-100'
                         }`}>
                             <div className="flex items-center gap-3">
-                                <div className={`w-10 h-10 rounded-xl flex items-center justify-center shrink-0 ${hasUsableKey() ? 'bg-green-500 text-white' : 'bg-amber-500 text-white animate-pulse'}`}>
+                                <div className={`w-10 h-10 rounded-xl flex items-center justify-center shrink-0 ${hasUsableKey() || brainOn ? 'bg-green-500 text-white' : 'bg-amber-500 text-white animate-pulse'}`}>
                                     <Key size={20} />
                                 </div>
                                 <div className="flex-1 min-w-0">
-                                    {hasUsableKey() ? (
+                                    {brainOn ? (
+                                        <>
+                                            <div className="flex items-center gap-2">
+                                                <p className="text-sm font-bold text-green-800">Local AI brain is active</p>
+                                                <span className="text-[9px] bg-green-200 text-green-800 px-1.5 py-0.5 rounded font-bold uppercase font-mono">{capabilities?.brain?.model}</span>
+                                            </div>
+                                            <p className="text-[11px] text-green-700 mt-0.5">
+                                                Agenda uploads, pasted text, URL scrapes and Auto-Learn run through Ollama on this machine. {hasUsableKey() ? 'Gemini still powers the Municipality Wizard and translation.' : 'Add a Gemini key to enable the Municipality Wizard and translation.'}
+                                            </p>
+                                        </>
+                                    ) : hasUsableKey() ? (
                                         <>
                                             <div className="flex items-center gap-2">
                                                 <p className="text-sm font-bold text-green-800">Gemini AI is Connected</p>

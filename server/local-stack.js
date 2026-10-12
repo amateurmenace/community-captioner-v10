@@ -48,13 +48,17 @@ export const WHISPER_MODELS = [
       desc: 'Highest accuracy, slowest. Only real-time with a GPU.' },
 ];
 
-// Ollama models for the Context Engine's local extraction (JSON output matters)
+// Ollama models for the Context Engine's local extraction (JSON output matters).
+// `tested` = verified with the app's real extraction prompt (see local-llm.js
+// testOllamaExtraction) on 2026-10-12; `tier` drives the recommendation badge.
+// Measured on an M1 Max with the sample agenda (warm model): recall of six known
+// names / time to answer.
 export const OLLAMA_MODELS = [
-    { name: 'qwen3:4b',    label: 'Qwen3 4B',      sizeGB: 2.6, minRamGB: 8,  tier: 'light', desc: 'Best small model for structured name/acronym extraction. Runs on any 8 GB machine.' },
-    { name: 'gemma3:4b',   label: 'Gemma 3 4B',    sizeGB: 3.3, minRamGB: 8,  tier: 'light', desc: 'Google\'s small model; strong English and multilingual, slightly slower than Qwen3 4B.' },
-    { name: 'qwen3:8b',    label: 'Qwen3 8B',      sizeGB: 5.2, minRamGB: 16, tier: 'best',  desc: 'Noticeably better at names, roles and acronyms. Needs 16 GB RAM.' },
-    { name: 'gemma3:12b',  label: 'Gemma 3 12B',   sizeGB: 8.1, minRamGB: 24, tier: 'best',  desc: 'Best quality that still fits a 24–32 GB Mac.' },
-    { name: 'llama3.1:8b', label: 'Llama 3.1 8B',  sizeGB: 4.9, minRamGB: 16, tier: 'other', desc: 'Solid fallback if the others are unavailable.' },
+    { name: 'gemma3:4b',   label: 'Gemma 3 4B',    sizeGB: 3.3, minRamGB: 8,  tier: 'light', tested: true,  desc: 'Best value: the most accurate on our agenda test (83% of known names) and the fastest (about 8 s). Runs on any 8 GB machine. Start here.' },
+    { name: 'gemma3:12b',  label: 'Gemma 3 12B',   sizeGB: 8.2, minRamGB: 24, tier: 'best',  tested: true,  desc: 'More thorough: found a third more names than the 4B with the same accuracy (83%), but takes ~30 s per agenda. Worth it on a 24 GB+ machine if you prepare dictionaries ahead of meetings.' },
+    { name: 'qwen3:4b',    label: 'Qwen3 4B',      sizeGB: 2.5, minRamGB: 8,  tier: 'light', tested: true,  desc: 'Smallest download. Finds most names (67% on our test, ~14 s) but tends to include meeting times and room numbers.' },
+    { name: 'qwen3:8b',    label: 'Qwen3 8B',      sizeGB: 5.2, minRamGB: 16, tier: 'other', tested: true,  desc: 'Works, but in our test it was no more accurate than Gemma 3 4B and twice as slow (~18 s). Needs 16 GB RAM.' },
+    { name: 'llama3.1:8b', label: 'Llama 3.1 8B',  sizeGB: 4.9, minRamGB: 16, tier: 'other', tested: true,  desc: 'Older but dependable (67%, ~30 s). Fine if you already have it installed.' },
 ];
 
 // ---------------------------------------------------------------------------
@@ -242,8 +246,14 @@ export async function probeSystem({ ollamaUrl, whisperPort } = {}) {
         dataDir: LOCAL_DIR,
         installCommands: {
             uv: IS_WIN ? 'powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex"' : 'curl -LsSf https://astral.sh/uv/install.sh | sh',
-            ollama: IS_MAC ? 'brew install ollama   # or download from https://ollama.com/download' : IS_WIN ? 'winget install Ollama.Ollama   # or https://ollama.com/download/windows' : 'curl -fsSL https://ollama.com/install.sh | sh',
+            ollama: IS_MAC ? 'brew install ollama' : IS_WIN ? 'winget install Ollama.Ollama' : 'curl -fsSL https://ollama.com/install.sh | sh',
             ollamaServe: 'ollama serve',
+        },
+        downloads: {
+            // Plain installers for people who don't use Homebrew / a terminal
+            ollama: IS_MAC ? 'https://ollama.com/download/mac' : IS_WIN ? 'https://ollama.com/download/windows' : 'https://ollama.com/download/linux',
+            python: 'https://www.python.org/downloads/',
+            terminalHint: IS_MAC ? 'Open Terminal: press ⌘ Space, type Terminal, press Return, then paste the line.' : IS_WIN ? 'Open PowerShell: press the Windows key, type PowerShell, press Enter, then paste the line.' : 'Open a terminal and paste the line.',
         },
     };
     info.recommendation = recommend(info);

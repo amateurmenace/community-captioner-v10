@@ -655,6 +655,10 @@ function isJunkName(name) {
     if (JUNK_NAMES.has(n)) return true;
     if (/^https?:|^www\.|\.(gov|com|org|net|edu|us|io|html?|pdf|aspx|php)(\b|$)/i.test(n)) return true; // URLs / domains / file names
     if (/^[\d\s.,:/-]+$/.test(n)) return true;            // numbers, dates, times
+    if (/\b\d{1,2}:\d{2}\b|\b\d{1,2}\s*(am|pm)\b/.test(n)) return true; // "Tuesday 7:00 PM", "9 AM"
+    if (/^(monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b/.test(n) && n.split(' ').length <= 3) return true;
+    if (/^(january|february|march|april|may|june|july|august|september|october|november|december)\s+\d/.test(n)) return true;
+    if (/^(fy|fiscal year)\s*\d{2,4}$/.test(n)) return true;
     if (/^\$|^#\d|^page \d/i.test(n)) return true;         // money, page refs
     if (n.length > 80) return true;
     return false;

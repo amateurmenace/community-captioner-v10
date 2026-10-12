@@ -157,7 +157,7 @@ function App() {
         apiKey: localStorage.getItem('cc_api_key') || process.env.API_KEY || '',
         localServerUrl: localStorage.getItem('cc_local_url') || 'ws://localhost:9000',
         localLlmUrl: localStorage.getItem('cc_llm_url') || 'http://localhost:11434',
-        localLlmModel: localStorage.getItem('cc_llm_model') || 'qwen3:4b',
+        localLlmModel: localStorage.getItem('cc_llm_model') || 'gemma3:4b',
         cloudModel: (localStorage.getItem('cc_cloud_model') as any) || 'transcribe-live',
         
         // Video Studio

@@ -18,7 +18,7 @@ const GlobalSettings: React.FC<GlobalSettingsProps> = ({ isOpen, onClose, appSta
   const [apiKeyInput, setApiKeyInput] = useState(appState.apiKey || '');
   const [localUrlInput, setLocalUrlInput] = useState(appState.localServerUrl || 'ws://localhost:9000');
   const [llmUrlInput, setLlmUrlInput] = useState(appState.localLlmUrl || 'http://localhost:11434');
-  const [llmModelInput, setLlmModelInput] = useState(appState.localLlmModel || 'qwen3:4b');
+  const [llmModelInput, setLlmModelInput] = useState(appState.localLlmModel || 'gemma3:4b');
   const [ollamaModels, setOllamaModels] = useState<string[] | null>(null);
 
   const relayHttp = () => {
@@ -106,6 +106,9 @@ const GlobalSettings: React.FC<GlobalSettingsProps> = ({ isOpen, onClose, appSta
       localStorage.setItem('cc_local_url', localUrlInput);
       localStorage.setItem('cc_llm_url', llmUrlInput);
       localStorage.setItem('cc_llm_model', llmModelInput);
+      // Keep the relay's local brain pointed at the same model (it decides whether
+      // Context Engine extraction runs through Ollama)
+      fetch(`${relayHttp()}/api/local/brain`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ url: llmUrlInput, model: llmModelInput }) }).catch(() => {});
       onClose();
   };
 
@@ -310,10 +313,10 @@ const GlobalSettings: React.FC<GlobalSettingsProps> = ({ isOpen, onClose, appSta
                                 </div>
                                 <div>
                                     <label className="text-xs font-bold text-stone-400 uppercase tracking-wider mb-2 block">Model {ollamaModels === null ? '' : ollamaModels.length ? `(${ollamaModels.length} installed)` : '(Ollama not running)'}</label>
-                                    <input list="ollama-models" type="text" value={llmModelInput} onChange={e => setLlmModelInput(e.target.value)} className="w-full p-3 border border-stone-200 rounded-xl bg-white font-mono text-sm text-stone-800" placeholder="qwen3:4b" />
+                                    <input list="ollama-models" type="text" value={llmModelInput} onChange={e => setLlmModelInput(e.target.value)} className="w-full p-3 border border-stone-200 rounded-xl bg-white font-mono text-sm text-stone-800" placeholder="gemma3:4b" />
                                     <datalist id="ollama-models">
                                         {(ollamaModels || []).map(m => <option key={m} value={m} />)}
-                                        {['qwen3:4b', 'qwen3:8b', 'gemma3:4b', 'gemma3:12b', 'llama3.1:8b'].filter(m => !(ollamaModels || []).includes(m)).map(m => <option key={m} value={m}>{`${m} (not installed)`}</option>)}
+                                        {['gemma3:4b', 'gemma3:12b', 'qwen3:4b', 'qwen3:8b', 'llama3.1:8b'].filter(m => !(ollamaModels || []).includes(m)).map(m => <option key={m} value={m}>{`${m} (not installed)`}</option>)}
                                     </datalist>
                                 </div>
                             </div>
