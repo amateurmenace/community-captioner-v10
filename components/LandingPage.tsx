@@ -1,6 +1,6 @@
 
 import React, { useState, useEffect } from 'react';
-import { Users, ArrowRight, Database, Layers, Lock, Github, ShieldCheck, Cpu, Mic, Radio, Captions, Zap, Brain, Layout, BarChart3, ChevronDown, HelpCircle, CheckCircle, XCircle, Heart, Globe, MessageSquare, Feather, Code, Download, CloudLightning, FileVideo } from 'lucide-react';
+import { Users, ArrowRight, Database, Layers, Lock, Github, ShieldCheck, Cpu, Mic, Radio, Captions, Zap, Brain, Layout, BarChart3, ChevronDown, HelpCircle, CheckCircle, XCircle, Globe, MessageSquare, Feather, Code, Download, CloudLightning, FileVideo } from 'lucide-react';
 import { GITHUB_REPO_URL, RELEASES_URL } from '../utils/appLinks';
 import { phoneticKey } from '../shared/corrections.js';
 
@@ -633,9 +633,6 @@ const LandingPage: React.FC<LandingPageProps> = ({ onStart, onChooseMode }) => {
 
       <div id="values" className="py-24 bg-sage-50 scroll-mt-20">
            <div className="max-w-6xl mx-auto px-6 text-center">
-               <div className="inline-flex items-center gap-2 bg-white px-4 py-2 rounded-full shadow-sm mb-8 text-forest-dark font-bold text-sm">
-                   <Heart size={16} className="text-red-500 fill-current" /> Made with love in Brookline, MA
-               </div>
                <h2 className="text-4xl font-display font-bold text-forest-dark mb-8">Our Mission</h2>
                <p className="text-xl text-stone-700 leading-relaxed font-medium mb-12 max-w-3xl mx-auto">
                    Accessibility should not depend on a budget. Community Captioner replaces expensive proprietary caption hardware and per-hour services with open-source software that a small station or a town clerk can run.
