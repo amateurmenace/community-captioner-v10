@@ -2,10 +2,19 @@
 #include "device_manager.h"
 #include "output_handler.h"
 #include "passthrough.h"
+#ifdef HAVE_NDI
+#include "ndi_passthrough.h"
+#endif
 
 // Global state — only one output mode active at a time
 static OutputHandler* g_outputHandler = nullptr;
 static PassthroughHandler* g_passthroughHandler = nullptr;
+#ifdef HAVE_NDI
+static NdiPassthroughHandler* g_ndiHandler = nullptr;
+static bool AnyRunning() { return g_outputHandler || g_passthroughHandler || g_ndiHandler; }
+#else
+static bool AnyRunning() { return g_outputHandler || g_passthroughHandler; }
+#endif
 
 /**
  * enumerateDevices() -> [{name, index, hasInput, hasOutput, displayModes}]
@@ -21,7 +30,7 @@ Napi::Value EnumerateDevices(const Napi::CallbackInfo& info) {
 Napi::Value StartOutput(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
 
-    if (g_outputHandler || g_passthroughHandler) {
+    if (AnyRunning()) {
         Napi::Error::New(env, "Output already running. Stop first.").ThrowAsJavaScriptException();
         return env.Null();
     }
@@ -47,7 +56,7 @@ Napi::Value StartOutput(const Napi::CallbackInfo& info) {
 Napi::Value StartPassthrough(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
 
-    if (g_outputHandler || g_passthroughHandler) {
+    if (AnyRunning()) {
         Napi::Error::New(env, "Output already running. Stop first.").ThrowAsJavaScriptException();
         return env.Null();
     }
@@ -67,10 +76,67 @@ Napi::Value StartPassthrough(const Napi::CallbackInfo& info) {
     return Napi::Boolean::New(env, true);
 }
 
+#ifdef HAVE_NDI
+/**
+ * findNdiSources(timeoutMs?: number) -> [{name, url}]
+ */
+Napi::Value FindNdiSources(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    uint32_t timeoutMs = info.Length() > 0 && info[0].IsNumber() ? info[0].As<Napi::Number>().Uint32Value() : 2000;
+    auto sources = NdiPassthroughHandler::FindSources(timeoutMs);
+    Napi::Array arr = Napi::Array::New(env, sources.size());
+    for (size_t i = 0; i < sources.size(); i++) {
+        Napi::Object o = Napi::Object::New(env);
+        o.Set("name", sources[i].name);
+        o.Set("url", sources[i].url);
+        arr.Set((uint32_t)i, o);
+    }
+    return arr;
+}
+
+/**
+ * startNdiPassthrough(ndiSourceName: string, outputDevice: number, displayMode: number) -> boolean
+ * NDI receive -> DeckLink SDI out + captions (audio resampled to 48 kHz).
+ */
+Napi::Value StartNdiPassthrough(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+
+    if (AnyRunning()) {
+        Napi::Error::New(env, "Output already running. Stop first.").ThrowAsJavaScriptException();
+        return env.Null();
+    }
+    if (!info[0].IsString()) {
+        Napi::TypeError::New(env, "Expected the NDI source name").ThrowAsJavaScriptException();
+        return env.Null();
+    }
+
+    std::string source = info[0].As<Napi::String>().Utf8Value();
+    uint32_t outputDevice = info[1].As<Napi::Number>().Uint32Value();
+    uint32_t displayMode = info[2].As<Napi::Number>().Uint32Value();
+
+    g_ndiHandler = new NdiPassthroughHandler();
+    bool ok = g_ndiHandler->Start(source.c_str(), outputDevice, (BMDDisplayMode)displayMode);
+    if (!ok) {
+        delete g_ndiHandler;
+        g_ndiHandler = nullptr;
+        return Napi::Boolean::New(env, false);
+    }
+
+    return Napi::Boolean::New(env, true);
+}
+#endif
+
 /**
  * stopOutput() -> void
  */
 Napi::Value StopOutput(const Napi::CallbackInfo& info) {
+#ifdef HAVE_NDI
+    if (g_ndiHandler) {
+        g_ndiHandler->Stop();
+        delete g_ndiHandler;
+        g_ndiHandler = nullptr;
+    }
+#endif
     if (g_outputHandler) {
         g_outputHandler->Stop();
         g_outputHandler->Release();
@@ -114,6 +180,11 @@ Napi::Value PushCDP(const Napi::CallbackInfo& info) {
     } else if (g_passthroughHandler) {
         g_passthroughHandler->PushCDP(data, size);
     }
+#ifdef HAVE_NDI
+    else if (g_ndiHandler) {
+        g_ndiHandler->PushCDP(data, size);
+    }
+#endif
 
     return env.Undefined();
 }
@@ -135,6 +206,14 @@ Napi::Value GetStatus(const Napi::CallbackInfo& info) {
         status.Set("mode", Napi::String::New(env, "passthrough"));
         status.Set("framesOutput", Napi::Number::New(env, (double)g_passthroughHandler->GetFramesOutput()));
         status.Set("droppedFrames", Napi::Number::New(env, (double)g_passthroughHandler->GetDroppedFrames()));
+#ifdef HAVE_NDI
+    } else if (g_ndiHandler && g_ndiHandler->IsRunning()) {
+        status.Set("running", true);
+        status.Set("mode", Napi::String::New(env, "ndi"));
+        status.Set("framesOutput", Napi::Number::New(env, (double)g_ndiHandler->GetFramesOutput()));
+        status.Set("droppedFrames", Napi::Number::New(env, (double)g_ndiHandler->GetDroppedFrames()));
+        status.Set("ndiSource", Napi::String::New(env, g_ndiHandler->GetSourceName()));
+#endif
     } else {
         status.Set("running", false);
         status.Set("mode", Napi::String::New(env, "stopped"));
@@ -155,6 +234,17 @@ Napi::Object Init(Napi::Env env, Napi::Object exports) {
     exports.Set("stopOutput", Napi::Function::New(env, StopOutput));
     exports.Set("pushCDP", Napi::Function::New(env, PushCDP));
     exports.Set("getStatus", Napi::Function::New(env, GetStatus));
+#ifdef HAVE_NDI
+    // Only offer NDI when its runtime loads: the relay treats the presence of
+    // these functions as "NDI available" (Caption Injection, /api/ndi/*).
+    std::string ndiRuntime;
+    bool ndiOk = NdiPassthroughHandler::RuntimeAvailable(&ndiRuntime);
+    if (ndiOk) {
+        exports.Set("findNdiSources", Napi::Function::New(env, FindNdiSources));
+        exports.Set("startNdiPassthrough", Napi::Function::New(env, StartNdiPassthrough));
+    }
+    exports.Set("ndiRuntime", Napi::String::New(env, ndiRuntime));
+#endif
     return exports;
 }
 

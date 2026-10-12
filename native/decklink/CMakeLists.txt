@@ -88,6 +88,21 @@ elseif(WIN32)
 
     include_directories(${BMD_GEN_DIR})
 
+    # NDI → SDI passthrough (optional). Needs the NDI SDK at build time (the
+    # installer sets NDI_SDK_DIR, e.g. C:/Program Files/NDI/NDI 6 SDK). The
+    # runtime DLL is delay-loaded and found through NDI_RUNTIME_DIR_V6 (NDI Tools
+    # / NDI Runtime), so the addon still loads, SDI included, on a PC without NDI.
+    if(NOT DEFINED NDI_SDK_DIR AND DEFINED ENV{NDI_SDK_DIR})
+        file(TO_CMAKE_PATH "$ENV{NDI_SDK_DIR}" NDI_SDK_DIR)
+    endif()
+    set(NDI_SOURCES "")
+    if(NDI_SDK_DIR AND EXISTS "${NDI_SDK_DIR}/Include/Processing.NDI.Lib.h")
+        message(STATUS "NDI SDK: ${NDI_SDK_DIR} (building NDI passthrough)")
+        set(NDI_SOURCES src/ndi_passthrough.cpp)
+    else()
+        message(STATUS "NDI SDK not found: building without NDI passthrough (set NDI_SDK_DIR to enable)")
+    endif()
+
     # CMAKE_JS_SRC = win_delay_load_hook.cc — required so that delay-loaded
     # NODE.EXE symbols resolve against the host binary when the addon is loaded
     # inside a pkg-bundled executable (where the host is CommunityCaptioner.exe,
@@ -95,6 +110,7 @@ elseif(WIN32)
     # the standalone build.
     add_library(${PROJECT_NAME} SHARED
         ${COMMON_SOURCES}
+        ${NDI_SOURCES}
         ${BMD_HEADER}
         ${BMD_IID}
         ${CMAKE_JS_SRC}
@@ -108,6 +124,13 @@ elseif(WIN32)
     )
 
     target_compile_definitions(${PROJECT_NAME} PRIVATE NOMINMAX)
+
+    if(NDI_SOURCES)
+        target_include_directories(${PROJECT_NAME} PRIVATE "${NDI_SDK_DIR}/Include")
+        target_link_libraries(${PROJECT_NAME} "${NDI_SDK_DIR}/Lib/x64/Processing.NDI.Lib.x64.lib" delayimp.lib)
+        target_link_options(${PROJECT_NAME} PRIVATE "/DELAYLOAD:Processing.NDI.Lib.x64.dll")
+        target_compile_definitions(${PROJECT_NAME} PRIVATE HAVE_NDI)
+    endif()
 endif()
 
 set_target_properties(${PROJECT_NAME} PROPERTIES

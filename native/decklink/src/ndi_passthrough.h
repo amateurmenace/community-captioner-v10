@@ -23,6 +23,12 @@ public:
     NdiPassthroughHandler();
     ~NdiPassthroughHandler();
 
+    // Whether the NDI runtime library can be loaded. On Windows the DLL is
+    // delay-loaded: this loads it from NDI_RUNTIME_DIR_V6/V5 (NDI Tools or the
+    // NDI Runtime), next to the addon, or the normal search path, and must
+    // succeed before any other NDI call. `where` receives the path or the reason.
+    static bool RuntimeAvailable(std::string* where = nullptr);
+
     // NDI source discovery
     struct NdiSource {
         std::string name;
@@ -51,6 +57,11 @@ private:
     // Linear resampling: srcRate → 48kHz
     void ResampleAndOutput(const int16_t* interleavedIn, int numSamplesIn,
                            int srcRate, int numChannels);
+
+    // Sources with alpha arrive as BGRA/BGRX even when UYVY is requested;
+    // convert them (BT.709, video range) instead of sending black.
+    static void BgraToUyvy(const uint8_t* src, int32_t srcStride, int32_t srcWidth, int32_t srcHeight,
+                           uint8_t* dst, int32_t dstStride, int32_t dstWidth, int32_t dstHeight);
 
     // NDI
     NDIlib_recv_instance_t m_ndiRecv;

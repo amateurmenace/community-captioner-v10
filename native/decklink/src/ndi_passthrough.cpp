@@ -7,6 +7,97 @@
 
 static const int DECKLINK_AUDIO_RATE = 48000;
 
+// ─────────────────────────────────────────────────────
+// NDI runtime (Windows: delay-loaded DLL)
+// ─────────────────────────────────────────────────────
+#ifdef _WIN32
+static std::string DirOfThisModule() {
+    HMODULE self = nullptr;
+    if (!GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                            reinterpret_cast<LPCSTR>(&DirOfThisModule), &self)) return "";
+    char path[MAX_PATH * 2];
+    DWORD n = GetModuleFileNameA(self, path, (DWORD)sizeof(path));
+    if (n == 0 || n >= sizeof(path)) return "";
+    std::string p(path, n);
+    size_t slash = p.find_last_of("\\/");
+    return slash == std::string::npos ? "" : p.substr(0, slash);
+}
+
+static std::string EnvVar(const char* name) {
+    char buf[1024];
+    DWORD n = GetEnvironmentVariableA(name, buf, (DWORD)sizeof(buf));
+    return (n > 0 && n < sizeof(buf)) ? std::string(buf, n) : std::string();
+}
+#endif
+
+bool NdiPassthroughHandler::RuntimeAvailable(std::string* where) {
+#ifdef _WIN32
+    // The import is delay-loaded (/DELAYLOAD), so nothing touches the DLL until
+    // the first NDI call. Load it here from where NDI Tools / the NDI Runtime put
+    // it (not on PATH); the delay-load helper then finds the module already loaded.
+    static int state = -1;  // -1 not tried, 0 missing, 1 loaded
+    static std::string detail;
+    if (state < 0) {
+        const char* dll = "Processing.NDI.Lib.x64.dll";
+        std::vector<std::string> candidates;
+        for (const char* var : { "NDI_RUNTIME_DIR_V6", "NDI_RUNTIME_DIR_V5" }) {
+            std::string dir = EnvVar(var);
+            if (!dir.empty()) candidates.push_back(dir + "\\" + dll);
+        }
+        std::string self = DirOfThisModule();
+        if (!self.empty()) candidates.push_back(self + "\\" + dll);
+        candidates.push_back(dll);
+        state = 0;
+        detail = "Processing.NDI.Lib.x64.dll not found: install NDI Tools or the NDI 6 Runtime (ndi.video)";
+        if (GetModuleHandleA(dll)) { state = 1; detail = "already loaded"; }
+        for (size_t i = 0; state == 0 && i < candidates.size(); i++) {
+            const std::string& c = candidates[i];
+            bool full = c.find('\\') != std::string::npos;
+            if (LoadLibraryExA(c.c_str(), nullptr, full ? LOAD_WITH_ALTERED_SEARCH_PATH : 0)) { state = 1; detail = c; }
+        }
+        fprintf(stderr, "[NDI] Runtime %s: %s\n", state == 1 ? "loaded" : "unavailable", detail.c_str());
+    }
+    if (where) *where = detail;
+    return state == 1;
+#else
+    if (where) *where = "linked";
+    return true;
+#endif
+}
+
+// ─────────────────────────────────────────────────────
+// BGRA/BGRX → UYVY (BT.709, video range), cropped/padded to the output size.
+// dst must already be filled with black.
+// ─────────────────────────────────────────────────────
+void NdiPassthroughHandler::BgraToUyvy(const uint8_t* src, int32_t srcStride, int32_t srcWidth, int32_t srcHeight,
+                                       uint8_t* dst, int32_t dstStride, int32_t dstWidth, int32_t dstHeight) {
+    int32_t w = std::min(srcWidth, dstWidth) & ~1;
+    int32_t h = std::min(srcHeight, dstHeight);
+    for (int32_t y = 0; y < h; y++) {
+        const uint8_t* s = src + (size_t)y * srcStride;
+        uint8_t* d = dst + (size_t)y * dstStride;
+        for (int32_t x = 0; x < w; x += 2, s += 8, d += 4) {
+            int b0 = s[0], g0 = s[1], r0 = s[2];
+            int b1 = s[4], g1 = s[5], r1 = s[6];
+            int y0 = (47 * r0 + 157 * g0 + 16 * b0 + 4096 + 128) >> 8;
+            int y1 = (47 * r1 + 157 * g1 + 16 * b1 + 4096 + 128) >> 8;
+            int r = (r0 + r1) >> 1, g = (g0 + g1) >> 1, b = (b0 + b1) >> 1;
+            int u = (-26 * r - 87 * g + 112 * b + 32768 + 128) >> 8;
+            int v = (112 * r - 102 * g - 10 * b + 32768 + 128) >> 8;
+            d[0] = (uint8_t)std::clamp(u, 16, 240);
+            d[1] = (uint8_t)std::clamp(y0, 16, 235);
+            d[2] = (uint8_t)std::clamp(v, 16, 240);
+            d[3] = (uint8_t)std::clamp(y1, 16, 235);
+        }
+    }
+}
+
+static void FillBlackUyvy(uint8_t* dst, int32_t bytes) {
+    for (int32_t i = 0; i + 3 < bytes; i += 4) {
+        dst[i] = 0x80; dst[i + 1] = 0x10; dst[i + 2] = 0x80; dst[i + 3] = 0x10;
+    }
+}
+
 NdiPassthroughHandler::NdiPassthroughHandler()
     : m_ndiRecv(nullptr)
     , m_deckLink(nullptr)
@@ -33,6 +124,7 @@ NdiPassthroughHandler::~NdiPassthroughHandler() {
 std::vector<NdiPassthroughHandler::NdiSource> NdiPassthroughHandler::FindSources(uint32_t timeoutMs) {
     std::vector<NdiSource> result;
 
+    if (!RuntimeAvailable()) return result;
     if (!NDIlib_initialize()) {
         fprintf(stderr, "[NDI] Failed to initialize NDI library\n");
         return result;
@@ -75,6 +167,11 @@ bool NdiPassthroughHandler::Start(const char* ndiSourceName,
     if (m_running) return false;
 
     // --- Initialize NDI ---
+    std::string runtime;
+    if (!RuntimeAvailable(&runtime)) {
+        fprintf(stderr, "[NDI→SDI] %s\n", runtime.c_str());
+        return false;
+    }
     if (!NDIlib_initialize()) {
         fprintf(stderr, "[NDI→SDI] Failed to initialize NDI\n");
         return false;
@@ -125,7 +222,9 @@ bool NdiPassthroughHandler::Start(const char* ndiSourceName,
     recvCreate.source_to_connect_to = *targetSource;
     recvCreate.color_format = NDIlib_recv_color_format_UYVY_BGRA;
     recvCreate.bandwidth = NDIlib_recv_bandwidth_highest;
-    recvCreate.allow_video_fields = true;
+    // Whole (interleaved) frames only: separate fields arrive at half height and
+    // would be cropped into the output; DeckLink's interlaced modes take woven frames.
+    recvCreate.allow_video_fields = false;
     recvCreate.p_ndi_recv_name = "Community Captioner SDI";
 
     m_ndiRecv = NDIlib_recv_create_v3(&recvCreate);
@@ -139,7 +238,7 @@ bool NdiPassthroughHandler::Start(const char* ndiSourceName,
     fprintf(stderr, "[NDI→SDI] NDI receiver connected to '%s'\n", ndiSourceName);
 
     // --- Open DeckLink Output ---
-    IDeckLinkIterator* iterator = CreateDeckLinkIteratorInstance();
+    IDeckLinkIterator* iterator = CreateDeckLinkIterator();  // platform.h: COM init + CoCreateInstance on Windows
     if (!iterator) {
         fprintf(stderr, "[NDI→SDI] DeckLink driver not installed\n");
         NDIlib_recv_destroy(m_ndiRecv);
@@ -364,7 +463,9 @@ void NdiPassthroughHandler::ResampleAndOutput(const int16_t* interleavedIn,
 // Receive Loop: NDI frames → DeckLink output + VANC
 // ─────────────────────────────────────────────────────
 void NdiPassthroughHandler::RecvLoop() {
+    ComInit com;  // Windows: this thread makes DeckLink COM calls (no-op on macOS)
     bool audioLogged = false;
+    bool videoLogged = false;
 
     while (m_running) {
         NDIlib_video_frame_v2_t videoFrame;
@@ -382,46 +483,50 @@ void NdiPassthroughHandler::RecvLoop() {
                 bmdFormat8BitYUV, bmdFrameFlagDefault, &outFrame);
 
             if (hr == S_OK && outFrame) {
-                void* outBuf = nullptr;
-                outFrame->GetBytes(&outBuf);
+                if (!videoLogged) {
+                    char cc[5] = { (char)(videoFrame.FourCC & 0xFF), (char)((videoFrame.FourCC >> 8) & 0xFF),
+                                   (char)((videoFrame.FourCC >> 16) & 0xFF), (char)((videoFrame.FourCC >> 24) & 0xFF), 0 };
+                    fprintf(stderr, "[NDI→SDI] First video frame: %dx%d %s, %d/%d fps, format %d → output %dx%d\n",
+                            videoFrame.xres, videoFrame.yres, cc, videoFrame.frame_rate_N, videoFrame.frame_rate_D,
+                            (int)videoFrame.frame_format_type, m_width, m_height);
+                    videoLogged = true;
+                }
+                // The pixel pointer is only valid inside this scope (Windows: StartAccess/
+                // EndAccess on IDeckLinkVideoBuffer), and the buffer has to be released
+                // before the frame is displayed.
+                {
+                    VideoFrameAccess access(outFrame, bmdBufferAccessWrite);
+                    uint8_t* dst = (uint8_t*)access.data;
+                    if (dst && videoFrame.p_data) {
+                        int32_t srcRowBytes = videoFrame.line_stride_in_bytes;
+                        int32_t srcWidth = videoFrame.xres;
+                        int32_t srcHeight = videoFrame.yres;
+                        bool uyvy = videoFrame.FourCC == NDIlib_FourCC_video_type_UYVY;
+                        bool bgra = videoFrame.FourCC == NDIlib_FourCC_video_type_BGRA || videoFrame.FourCC == NDIlib_FourCC_video_type_BGRX;
 
-                if (outBuf && videoFrame.p_data) {
-                    int32_t srcRowBytes = videoFrame.line_stride_in_bytes;
-                    int32_t srcWidth = videoFrame.xres;
-                    int32_t srcHeight = videoFrame.yres;
-
-                    if (srcWidth == m_width && srcHeight == m_height && srcRowBytes == m_rowBytes) {
-                        // Perfect match — direct copy
-                        memcpy(outBuf, videoFrame.p_data, m_height * m_rowBytes);
-                    } else if (videoFrame.FourCC == NDIlib_FourCC_video_type_UYVY) {
-                        // Same format, different resolution — crop/pad
-                        int32_t copyWidth = std::min(srcWidth, m_width) * 2;
-                        int32_t copyHeight = std::min(srcHeight, m_height);
-
-                        // Black fill first
-                        uint8_t* dst = (uint8_t*)outBuf;
-                        for (int32_t i = 0; i < m_height * m_rowBytes; i += 4) {
-                            dst[i]     = 0x80; // Cb
-                            dst[i + 1] = 0x10; // Y
-                            dst[i + 2] = 0x80; // Cr
-                            dst[i + 3] = 0x10; // Y
+                        if (uyvy && srcWidth == m_width && srcHeight == m_height && srcRowBytes == m_rowBytes) {
+                            // Perfect match — direct copy
+                            memcpy(dst, videoFrame.p_data, (size_t)m_height * m_rowBytes);
+                        } else if (uyvy) {
+                            // Same format, different resolution — crop/pad
+                            int32_t copyWidth = std::min(srcWidth, m_width) * 2;
+                            int32_t copyHeight = std::min(srcHeight, m_height);
+                            FillBlackUyvy(dst, m_height * m_rowBytes);
+                            for (int32_t y = 0; y < copyHeight; y++) {
+                                memcpy(dst + (size_t)y * m_rowBytes,
+                                       videoFrame.p_data + (size_t)y * srcRowBytes,
+                                       copyWidth);
+                            }
+                        } else if (bgra) {
+                            // Sources with alpha (graphics, keys) arrive as BGRA
+                            FillBlackUyvy(dst, m_height * m_rowBytes);
+                            BgraToUyvy(videoFrame.p_data, srcRowBytes, srcWidth, srcHeight,
+                                       dst, m_rowBytes, m_width, m_height);
+                        } else {
+                            // Anything else — fill black
+                            FillBlackUyvy(dst, m_height * m_rowBytes);
+                            m_droppedFrames++;
                         }
-
-                        for (int32_t y = 0; y < copyHeight; y++) {
-                            memcpy(dst + y * m_rowBytes,
-                                   videoFrame.p_data + y * srcRowBytes,
-                                   copyWidth);
-                        }
-                    } else {
-                        // Non-UYVY — fill black
-                        uint8_t* dst = (uint8_t*)outBuf;
-                        for (int32_t i = 0; i < m_height * m_rowBytes; i += 4) {
-                            dst[i]     = 0x80;
-                            dst[i + 1] = 0x10;
-                            dst[i + 2] = 0x80;
-                            dst[i + 3] = 0x10;
-                        }
-                        m_droppedFrames++;
                     }
                 }
 
