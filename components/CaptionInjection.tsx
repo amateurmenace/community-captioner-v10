@@ -792,7 +792,7 @@ const CaptionInjection: React.FC<CaptionInjectionProps> = ({ onBack, apiKey }) =
                                         <option value={60}>every 2 seconds</option>
                                     </select>
                                 </label>
-                                <p className="text-[11px] text-stone-500">Redrawing lets a decoder that misses caption frames (a Blackmagic Web Presenter drops 15–50 % of them) show the right text again within that time. Leave CEA-608 on unless the destination shows CC1 instead of the 708 captions.</p>
+                                <p className="text-[11px] text-stone-500">Redrawing lets a decoder that misses caption frames (a Blackmagic Web Presenter drops 15–50 % of them) show the right text again within that time. For YouTube switch CEA-608 off: YouTube prefers 608 when both are present and renders it as single characters, while its 708 rendering is correct. Keep it on for SDI decoders that only read 608.</p>
                             </div>
                         )}
                     </section>
