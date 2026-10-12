@@ -1,0 +1,19 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <!-- Community Captioner app icon: three caption bars on a forest-green rounded square -->
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#466A5A"/>
+      <stop offset="1" stop-color="#2F4A3D"/>
+    </linearGradient>
+    <linearGradient id="sheen" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#FFFFFF" stop-opacity="0.10"/>
+      <stop offset="0.55" stop-color="#FFFFFF" stop-opacity="0"/>
+    </linearGradient>
+  </defs>
+  <rect x="0" y="0" width="1024" height="1024" rx="228" fill="url(#bg)"/>
+  <rect x="0" y="0" width="1024" height="1024" rx="228" fill="url(#sheen)"/>
+  <!-- bars (same proportions as the in-app logo: 32 / 24 / 16 units wide, 6 tall, 10 apart) -->
+  <rect x="236" y="302" width="552" height="110" rx="55" fill="#F7F7F5"/>
+  <rect x="236" y="457" width="414" height="110" rx="55" fill="#A3C0B0"/>
+  <rect x="236" y="612" width="276" height="110" rx="55" fill="#64947F"/>
+</svg>

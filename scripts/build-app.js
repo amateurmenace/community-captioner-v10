@@ -229,6 +229,8 @@ function createInfoPlist(version) {
   <string>${version}</string>
   <key>CFBundleExecutable</key>
   <string>CommunityCaptioner</string>
+  <key>CFBundleIconFile</key>
+  <string>AppIcon</string>
   <key>CFBundlePackageType</key>
   <string>APPL</string>
   <key>CFBundleSignature</key>
@@ -282,6 +284,14 @@ END_SCRIPT
 `;
   fs.writeFileSync(path.join(macosDir, 'CommunityCaptioner'), launchScript);
   fs.chmodSync(path.join(macosDir, 'CommunityCaptioner'), 0o755);
+
+  // App icon (assets/icon.icns, generated from assets/icon.svg with iconutil)
+  const icns = path.join(ROOT, 'assets', 'icon.icns');
+  if (fs.existsSync(icns)) {
+    fs.copyFileSync(icns, path.join(resourcesDir, 'AppIcon.icns'));
+  } else {
+    console.warn('  WARNING: assets/icon.icns missing — the app will show the generic icon');
+  }
 
   // Copy dist/ (frontend) and local/ (speech server script) into Resources/
   const distSrc = path.join(ROOT, 'dist');
