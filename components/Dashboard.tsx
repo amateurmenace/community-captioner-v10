@@ -697,7 +697,7 @@ const Dashboard: React.FC<DashboardProps> = ({
           } catch { if (!stopped) setSysError(true); }
       };
       tick();
-      const id = setInterval(tick, isRecording || showSys ? 2000 : 6000);
+      const id = setInterval(tick, isRecording || showSys ? 2000 : 4000);
       return () => { stopped = true; clearInterval(id); };
   }, [isRecording, showSys]);
   const sysTone = (pct: number | null | undefined) => pct == null ? 'text-stone-400' : pct >= 90 ? 'text-red-500' : pct >= 70 ? 'text-amber-500' : 'text-stone-800';
@@ -728,24 +728,51 @@ const Dashboard: React.FC<DashboardProps> = ({
       else if (sys.memory.pressure === 'warning') sysWarnings.push('Memory pressure is elevated. Fine for now; avoid opening more large apps.');
       if (sys.gpu.available && (sys.gpu.percent ?? 0) >= 97 && isRecording) sysWarnings.push('GPU is fully busy, which is normal while transcribing. If captions lag, Auto-Learn and translation are competing for it.');
   }
-  const systemCard = (
-      <div className="relative">
-          <Tooltip text="How this computer is coping: CPU, memory, GPU and network. Click for details.">
-              <button onClick={() => setShowSys(v => !v)} className={`flex flex-col items-start px-4 min-w-[150px] text-left rounded-lg transition-colors ${showSys ? 'bg-stone-200/70' : 'hover:bg-stone-100'}`}>
-                  <span className="text-[10px] font-bold text-stone-400 uppercase tracking-wider mb-1 flex items-center gap-1"><Cpu size={10} /> This machine</span>
-                  {sys ? (
-                      <span className="flex items-baseline gap-x-2 leading-none whitespace-nowrap">
-                          <span className={`text-xl font-display font-bold ${sysTone(sys.cpu.percent)}`}>{sys.cpu.percent ?? '—'}%</span><span className="text-[9px] font-bold text-stone-400 -ml-1">CPU</span>
-                          {sys.gpu.available && <><span className={`text-xl font-display font-bold ${sysTone(sys.gpu.percent)}`}>{sys.gpu.percent}%</span><span className="text-[9px] font-bold text-stone-400 -ml-1">GPU</span></>}
-                          <span className={`text-xl font-display font-bold ${memTone}`}>{sys.memory.percent}%</span><span className="text-[9px] font-bold text-stone-400 -ml-1">RAM</span>
-                      </span>
-                  ) : <span className="text-xl font-display font-bold text-stone-400">{sysError ? 'offline' : '…'}</span>}
-              </button>
-          </Tooltip>
+  const StatCell = ({ icon: Icon, label, value, sub, tone, spark, sparkMax }: any) => (
+      <div className="flex items-center gap-2.5 min-w-0 shrink-0">
+          <Icon size={13} className="text-stone-400 shrink-0" />
+          <div className="leading-none">
+              <div className="text-[9px] font-bold text-stone-400 uppercase tracking-wider mb-0.5">{label}</div>
+              <div className={`font-display font-bold text-base whitespace-nowrap ${tone}`}>{value}{sub && <span className="text-[10px] font-sans font-medium text-stone-400 ml-1">{sub}</span>}</div>
+          </div>
+          <div className={`flex items-end gap-px h-6 w-24 ${tone}`} aria-hidden>
+              {(spark as number[]).map((v: number, i: number) => <div key={i} className="flex-1 bg-current rounded-[1px] opacity-60" style={{ height: `${Math.max(6, Math.min(100, (v / ((sparkMax as number) || 100)) * 100))}%` }} />)}
+          </div>
+      </div>
+  );
+  const netMax = Math.max(64, ...sysHistory.map(h => h.down + h.up));
+  const systemStrip = (
+      <div className="relative hidden md:flex items-center gap-5 px-5 py-1.5 border-t border-stone-100 bg-stone-50/70">
+          <button onClick={() => setShowSys(v => !v)} className="flex items-center gap-1.5 text-[10px] font-bold text-stone-500 uppercase tracking-wider shrink-0 hover:text-forest-dark">
+              <Cpu size={12} /> This machine
+          </button>
+          {sys ? (
+              <div className="flex items-center gap-6 flex-1 min-w-0 overflow-hidden">
+                  <StatCell icon={Cpu} label="CPU" value={`${sys.cpu.percent ?? '—'}%`} sub={`${sys.cpu.cores} cores`} tone={sysTone(sys.cpu.percent)} spark={sysHistory.map(h => h.cpu)} />
+                  {sys.gpu.available && <StatCell icon={Zap} label="GPU" value={`${sys.gpu.percent}%`} sub={sys.gpu.memoryUsedGB != null ? `${sys.gpu.memoryUsedGB} GB` : undefined} tone={sysTone(sys.gpu.percent)} spark={sysHistory.map(h => h.gpu)} />}
+                  <StatCell icon={Activity} label="RAM" value={`${sys.memory.usedGB} GB`} sub={`of ${sys.memory.totalGB}${sys.memory.pressure && sys.memory.pressure !== 'normal' ? ` · pressure ${sys.memory.pressure}` : ''}`} tone={memTone} spark={sysHistory.map(h => h.mem)} />
+                  <StatCell icon={Wifi} label="Network" value={`↓ ${fmtRate(sys.network.downKBps)}`} sub={`↑ ${fmtRate(sys.network.upKBps)}`} tone="text-stone-800" spark={sysHistory.map(h => h.down + h.up)} sparkMax={netMax} />
+                  <div className="hidden xl:flex items-center gap-1.5 min-w-0">
+                      {sys.processes.filter(p => !p.name.startsWith('Captioner')).map(p => (
+                          <span key={p.pid} className="text-[10px] font-medium text-stone-500 bg-white border border-stone-200 rounded-full px-2 py-0.5 whitespace-nowrap">
+                              {p.name.replace(' speech server', '').replace(' (local AI brain)', '')} <span className="font-mono text-stone-700">{p.cpu != null ? `${p.cpu}% · ` : ''}{p.memGB} GB</span>
+                          </span>
+                      ))}
+                  </div>
+              </div>
+          ) : (
+              <span className="text-xs text-stone-400 flex-1">{sysError ? 'Relay offline — no machine stats' : 'Measuring…'}</span>
+          )}
+          {sysWarnings.length > 0 && (
+              <Tooltip text={sysWarnings.join(' ')}>
+                  <span className="flex items-center gap-1 text-[10px] font-bold text-amber-700 bg-amber-50 border border-amber-200 px-2 py-0.5 rounded-full shrink-0 cursor-help"><AlertTriangle size={11} /> {sysWarnings.length === 1 ? 'Watch this' : `${sysWarnings.length} warnings`}</span>
+              </Tooltip>
+          )}
+          <button onClick={() => setShowSys(v => !v)} className="text-[10px] font-bold text-stone-500 hover:text-forest-dark shrink-0 flex items-center gap-1">{showSys ? <ChevronDown size={12} /> : <ChevronRight size={12} />} {showSys ? 'Hide details' : 'Details'}</button>
           {showSys && (
               <>
                   <div className="fixed inset-0 z-40" onClick={() => setShowSys(false)} />
-                  <div className="absolute top-full left-0 mt-3 w-[440px] bg-white rounded-2xl shadow-2xl border border-stone-200 p-4 z-50 text-left">
+                  <div className="absolute top-full right-4 mt-1 w-[460px] bg-white rounded-2xl shadow-2xl border border-stone-200 p-4 z-50 text-left">
                       <div className="flex items-center justify-between mb-1">
                           <div>
                               <p className="text-sm font-bold text-forest-dark">This machine</p>
@@ -764,7 +791,7 @@ const Dashboard: React.FC<DashboardProps> = ({
                               ) : (
                                   <SysRow icon={Zap} label="GPU" value="not reported" pct={null} tone="text-stone-400" bar="" spark={[]} note="Only Apple and NVIDIA GPUs report utilization here. Local models still use whatever GPU they can." />
                               )}
-                              <SysRow icon={Wifi} label="Network" value={`↓ ${fmtRate(sys.network.downKBps)}   ↑ ${fmtRate(sys.network.upKBps)}`} pct={null} tone="text-stone-800" bar="" spark={sysHistory.map(h => h.down + h.up)} sparkMax={Math.max(64, ...sysHistory.map(h => h.down + h.up))} note={sys.network.iface ? `${sys.network.iface}${mode === 'local' || mode === 'fully_local' ? ' · local modes send no audio over the network; cloud modes stream it continuously' : ''}` : undefined} />
+                              <SysRow icon={Wifi} label="Network" value={`↓ ${fmtRate(sys.network.downKBps)}   ↑ ${fmtRate(sys.network.upKBps)}`} pct={null} tone="text-stone-800" bar="" spark={sysHistory.map(h => h.down + h.up)} sparkMax={netMax} note={sys.network.iface ? `${sys.network.iface}${mode === 'local' || mode === 'fully_local' ? ' · local modes send no audio over the network; cloud modes stream it continuously' : ''}` : undefined} />
                               {sys.processes.length > 0 && (
                                   <div className="mt-2 pt-2 border-t border-stone-100">
                                       <p className="text-[10px] font-bold text-stone-400 uppercase tracking-wider mb-1">What the captioning stack is using</p>
@@ -784,7 +811,7 @@ const Dashboard: React.FC<DashboardProps> = ({
                                       {sysWarnings.map((w, i) => <p key={i} className="text-[11px] text-amber-800 flex items-start gap-1"><AlertTriangle size={12} className="shrink-0 mt-0.5" /> {w}</p>)}
                                   </div>
                               )}
-                              <p className="text-[10px] text-stone-400 mt-2">Sampled every {isRecording ? 2 : 6} seconds · {Math.max(0, Math.round((Date.now() - sys.ts) / 1000))} s ago</p>
+                              <p className="text-[10px] text-stone-400 mt-2">Sampled every {isRecording ? 2 : 4} seconds · {Math.max(0, Math.round((Date.now() - sys.ts) / 1000))} s ago</p>
                           </>
                       )}
                   </div>
@@ -795,11 +822,11 @@ const Dashboard: React.FC<DashboardProps> = ({
 
   const MetricCard = ({ label, value, colorClass, icon: Icon }: any) => (
       <Tooltip text={`Real-time statistic for ${label}`}>
-          <div className="flex flex-col items-start px-4 border-r border-stone-100 last:border-0 cursor-help min-w-[100px]">
+          <div className="flex flex-col items-start px-3 border-r border-stone-100 last:border-0 cursor-help min-w-[84px]">
               <span className="text-[10px] font-bold text-stone-400 uppercase tracking-wider mb-1 flex items-center gap-1">
                   {Icon && <Icon size={10} />} {label}
               </span>
-              <span className={`text-xl font-display font-bold leading-none transition-colors duration-300 ${colorClass}`}>{value}</span>
+              <span className={`text-lg font-display font-bold leading-none transition-colors duration-300 ${colorClass}`}>{value}</span>
           </div>
       </Tooltip>
   );
@@ -820,8 +847,8 @@ const Dashboard: React.FC<DashboardProps> = ({
       <canvas ref={pipCanvasRef} width={300} height={150} className="hidden" />
       <video ref={pipVideoRef} muted className="hidden" />
 
-      {/* Top Bar */}
-      <div className="h-24 border-b border-stone-200 bg-white/90 backdrop-blur flex items-center justify-between px-8 shrink-0 z-30 shadow-sm relative">
+      {/* Top Bar — row 1: brand, session metrics, controls (wrap instead of overflowing), Start/Stop always visible; row 2: live machine stats */}
+      <div className="border-b border-stone-200 bg-white/90 backdrop-blur shrink-0 z-30 shadow-sm relative">
         {/* Relay Disconnected Alert */}
         {!relayConnected && (
             <div className="absolute top-0 left-0 right-0 h-1 bg-red-500 overflow-hidden">
@@ -829,22 +856,22 @@ const Dashboard: React.FC<DashboardProps> = ({
             </div>
         )}
 
-        <div className="flex items-center gap-6">
+        <div className="flex items-center gap-4 px-5 py-2.5 min-h-[4.5rem]">
           <Tooltip text="Return to the main landing page">
-              <button onClick={goHome} className="p-2 hover:bg-stone-100 rounded-xl transition-all hover:scale-105 active:scale-95 flex items-center justify-center">
+              <button onClick={goHome} className="p-2 hover:bg-stone-100 rounded-xl transition-all hover:scale-105 active:scale-95 flex items-center justify-center shrink-0">
                 <BrandLogo />
               </button>
           </Tooltip>
-          <div id="metrics" className="hidden lg:flex items-center bg-stone-50 rounded-xl p-2 border border-stone-100 shadow-inner">
+          <div id="metrics" className="hidden lg:flex items-center bg-stone-50 rounded-xl p-1.5 border border-stone-100 shadow-inner shrink-0">
                <MetricCard label="Duration" value={formatDuration(stats.durationSeconds)} colorClass="text-stone-800" icon={Clock} />
                <MetricCard label={t.latency} value={stats.latencySamples ? `${(stats.latencyMs / 1000).toFixed(1)}s` : '—'} colorClass={stats.latencySamples && stats.latencyMs > 3000 ? "text-red-500 animate-pulse" : stats.latencySamples && stats.latencyMs > 1500 ? "text-yellow-600" : "text-stone-800"} icon={Signal} />
                <MetricCard label={t.wpm} value={`${stats.wpmHistory.length > 0 ? Math.round(stats.wpmHistory[stats.wpmHistory.length - 1].wpm) : 0}`} colorClass="text-stone-800" />
                <MetricCard label={t.confidence} value={stats.confidenceSamples ? `${(stats.averageConfidence * 100).toFixed(0)}%` : '—'} colorClass={!stats.confidenceSamples ? "text-stone-400" : stats.averageConfidence > 0.9 ? "text-green-600" : "text-yellow-600"} />
-               {systemCard}
           </div>
-        </div>
 
-        <div className="flex items-center gap-8">
+          <div className="flex-1 min-w-[8px]" />
+
+          <div className="flex items-center justify-end gap-2.5 flex-wrap min-w-0">
            {/* Local speech server status (Local / Fully Local modes) */}
            {(mode === 'local' || mode === 'fully_local') && (
                 <Tooltip text={isRecording
@@ -885,7 +912,7 @@ const Dashboard: React.FC<DashboardProps> = ({
                         </button>
                     </Tooltip>
                     <Tooltip text="Manage dictionary definitions, scrape websites for context, and configure engine settings.">
-                        <button id="context-btn" onClick={onOpenContext} className="flex items-center gap-2 px-6 py-2.5 bg-sage-200 hover:bg-sage-300 text-forest-dark text-sm font-bold rounded-xl border border-sage-400 transition-all shadow-sm active:scale-95">
+                        <button id="context-btn" onClick={onOpenContext} className="flex items-center gap-2 px-4 py-2.5 bg-sage-200 hover:bg-sage-300 text-forest-dark text-sm font-bold rounded-xl border border-sage-400 transition-all shadow-sm active:scale-95">
                             <ShieldCheck size={16} /> Context Engine
                         </button>
                     </Tooltip>
@@ -945,15 +972,19 @@ const Dashboard: React.FC<DashboardProps> = ({
               )}
            </div>
            
+          </div>
+
            <Tooltip text="Pauses the recording (Stop) or Finishes the session completely.">
              <button 
                 onClick={() => isRecording ? setIsRecording(false) : setIsRecording(true)} 
-                className={`flex items-center gap-2 px-6 py-3 rounded-xl font-bold text-sm transition-all shadow-lg transform hover:-translate-y-0.5 ${isRecording ? 'bg-orange-50 text-orange-600 border border-orange-200 hover:bg-orange-100' : 'bg-forest-dark text-white hover:bg-forest-light'}`}
+                className={`shrink-0 flex items-center gap-2 px-6 py-3 rounded-xl font-bold text-sm transition-all shadow-lg transform hover:-translate-y-0.5 ${isRecording ? 'bg-orange-50 text-orange-600 border border-orange-200 hover:bg-orange-100' : 'bg-forest-dark text-white hover:bg-forest-light'}`}
              >
                 {isRecording ? <><Pause size={20} /> Stop</> : <><Play size={20} /> Start</>}
              </button>
           </Tooltip>
         </div>
+
+        {systemStrip}
       </div>
 
       <div className="flex flex-1 overflow-hidden relative">

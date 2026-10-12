@@ -184,7 +184,8 @@ function App() {
   // NOTE: must stay up here with the other hooks — declaring it after the
   // conditional view returns below changes the hook count between renders
   // and crashes React when navigating between views.
-  const [addonStatus, setAddonStatus] = useState<{ loaded: boolean; platform: string } | null>(null);
+  const [addonStatus, setAddonStatus] = useState<{ loaded: boolean; platform: string; version?: string } | null>(null);
+  const appInfoVersion = addonStatus?.version;
   useEffect(() => {
     if (appState.view !== 'choice') return;
     const port = window.location.port;
@@ -192,7 +193,7 @@ function App() {
     const relayPort = (p >= 5170 && p <= 5199) ? '8080' : (port || '80');
     fetch(`${window.location.protocol}//${window.location.hostname}:${relayPort}/api/inject/status`)
       .then(r => r.json())
-      .then(d => setAddonStatus({ loaded: !!d.addonLoaded, platform: /Windows/i.test(navigator.userAgent) ? 'windows' : /Mac/i.test(navigator.userAgent) ? 'mac' : 'other' }))
+      .then(d => setAddonStatus({ loaded: !!d.addonLoaded, platform: /Windows/i.test(navigator.userAgent) ? 'windows' : /Mac/i.test(navigator.userAgent) ? 'mac' : 'other', version: typeof d.version === 'string' && d.version !== 'dev' ? d.version : undefined }))
       .catch(() => {});
   }, [appState.view]);
   
@@ -1176,46 +1177,66 @@ function App() {
 
   // --- EXISTING: Web App Workflow Selection (Renamed intent slightly) ---
   if (appState.view === 'choice') {
+      // Workflow picker. Accent classes are literal strings so Tailwind keeps them.
+      const ACCENT = {
+          sage:   { icon: 'bg-sage-100 text-forest-dark', hover: 'hover:border-sage-500 hover:shadow-sage-100', chip: 'bg-sage-50 text-forest-dark border-sage-200', cta: 'text-forest-dark' },
+          amber:  { icon: 'bg-amber-100 text-amber-700', hover: 'hover:border-amber-400 hover:shadow-amber-100', chip: 'bg-amber-50 text-amber-800 border-amber-200', cta: 'text-amber-700' },
+          blue:   { icon: 'bg-blue-100 text-blue-700', hover: 'hover:border-blue-400 hover:shadow-blue-100', chip: 'bg-blue-50 text-blue-800 border-blue-200', cta: 'text-blue-700' },
+          purple: { icon: 'bg-purple-100 text-purple-700', hover: 'hover:border-purple-400 hover:shadow-purple-100', chip: 'bg-purple-50 text-purple-800 border-purple-200', cta: 'text-purple-700' },
+      } as const;
+      const cards: { key: string; view: string; title: string; tagline: string; desc: string; icon: any; accent: keyof typeof ACCENT; needs: string[]; badge?: string; warn?: string }[] = [
+          { key: 'live', view: 'dashboard', title: 'Live Session', tagline: 'Caption a meeting as it happens', icon: Mic, accent: 'sage',
+            desc: 'Real-time captions from a microphone or line-in, with the Context Engine fixing names as they are spoken. Browser speech, Gemini cloud, or your local Whisper server.',
+            needs: ['Microphone or mixer feed', 'Any captioning mode'] },
+          { key: 'inject', view: 'caption_injection', title: 'Caption Injection', tagline: 'Closed captions on your SDI feed', icon: Zap, accent: 'amber',
+            desc: 'Embed CEA-608/708 captions into a DeckLink SDI output for broadcast, or pass them through a web presenter to YouTube.',
+            needs: ['DeckLink card', 'Desktop app'], warn: addonStatus && !addonStatus.loaded ? `DeckLink driver not loaded${addonStatus.platform === 'windows' ? ' on Windows' : ''} — setup required` : undefined },
+          { key: 'prerecorded', view: 'prerecorded', title: 'Prerecorded', tagline: 'Transcribe a recording', icon: FileVideo, accent: 'blue',
+            desc: 'Upload a video or audio file and get a full transcript and caption file, processed in the cloud or on this machine.',
+            needs: ['Video or audio file'] },
+          { key: 'local', view: 'local_setup', title: 'Local AI', tagline: 'Everything on this computer', icon: ShieldCheck, accent: 'purple', badge: 'Private',
+            desc: 'Set up Whisper for speech and an Ollama brain for names and translation, so nothing leaves the room. A guided wizard checks the machine and installs what it needs.',
+            needs: ['Nothing leaves this computer', '8 GB RAM or more'] },
+      ];
       return (
-          <div className="h-screen bg-cream flex flex-col items-center justify-center p-8 animate-fade-in relative">
-              <button onClick={() => setAppState(p => ({...p, view: 'deployment_choice'}))} className="absolute top-8 left-8 text-stone-500 font-bold">Back</button>
-              
-              <h1 className="text-4xl font-display font-bold text-forest-dark mb-12">Web App Workspace</h1>
-              <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-4 gap-6 max-w-7xl w-full">
-                  <div onClick={() => setAppState(p => ({...p, view: 'dashboard'}))} className="bg-white p-7 rounded-2xl border-2 border-stone-200 hover:border-sage-500 hover:shadow-xl cursor-pointer transition-all group">
-                      <div className="bg-sage-100 w-14 h-14 rounded-full flex items-center justify-center text-forest-dark mb-5 group-hover:scale-110 transition-transform"><Mic size={28} /></div>
-                      <h2 className="text-xl font-bold text-stone-800 mb-2">Live Session</h2>
-                      <p className="text-stone-500 leading-relaxed text-sm">Real-time captioning. Browser or Cloud mode.</p>
-                  </div>
+          <div className="min-h-screen bg-cream flex flex-col items-center justify-center p-8 animate-fade-in relative overflow-y-auto">
+              <div className="absolute inset-0 pointer-events-none" aria-hidden style={{ background: 'radial-gradient(60% 50% at 50% 0%, rgba(167, 189, 171, 0.25), transparent 70%)' }} />
+              <button onClick={() => setAppState(p => ({...p, view: 'landing'}))} className="absolute top-8 left-8 text-stone-500 font-bold hover:text-forest-dark flex items-center gap-1.5 text-sm"><ArrowRight size={16} className="rotate-180" /> Back</button>
 
-                  {/* Caption Injection workflow (same card style as the others) */}
-                  <div
-                      onClick={() => setAppState(p => ({...p, view: 'caption_injection'}))}
-                      className="bg-white p-7 rounded-2xl border-2 border-stone-200 hover:border-sage-500 hover:shadow-xl cursor-pointer transition-all group"
-                  >
-                      <div className="bg-sage-100 w-14 h-14 rounded-full flex items-center justify-center text-forest-dark mb-5 group-hover:scale-110 transition-transform"><Zap size={28} /></div>
-                      <h2 className="text-xl font-bold text-stone-800 mb-2">Caption Injection</h2>
-                      <p className="text-stone-500 leading-relaxed text-sm">Embed CEA-608/708 into your SDI feed for web-presenter passthrough to YouTube.</p>
-                      {addonStatus && !addonStatus.loaded && (
-                          <div className="mt-3 px-2.5 py-1.5 bg-amber-50 border border-amber-200 text-amber-800 rounded-lg text-[11px] font-medium flex items-center gap-1.5">
-                              <span className="w-1.5 h-1.5 rounded-full bg-amber-500" />
-                              Setup required — DeckLink driver not loaded{addonStatus.platform === 'windows' ? ' on Windows' : ''}
-                          </div>
-                      )}
-                  </div>
-
-                  <div onClick={() => setAppState(p => ({...p, view: 'prerecorded'}))} className="bg-white p-7 rounded-2xl border-2 border-stone-200 hover:border-sage-500 hover:shadow-xl cursor-pointer transition-all group">
-                      <div className="bg-sage-100 w-14 h-14 rounded-full flex items-center justify-center text-forest-dark mb-5 group-hover:scale-110 transition-transform"><FileVideo size={28} /></div>
-                      <h2 className="text-xl font-bold text-stone-800 mb-2">Prerecorded</h2>
-                      <p className="text-stone-500 leading-relaxed text-sm">Upload files. Process with Cloud or Local AI.</p>
-                  </div>
-
-                  <div onClick={() => setAppState(p => ({...p, view: 'local_setup'}))} className="bg-white p-7 rounded-2xl border-2 border-stone-200 hover:border-sage-500 hover:shadow-xl cursor-pointer transition-all group opacity-75">
-                      <div className="bg-stone-100 w-14 h-14 rounded-full flex items-center justify-center text-stone-600 mb-5 group-hover:scale-110 transition-transform"><Server size={28} /></div>
-                      <h2 className="text-xl font-bold text-stone-800 mb-2">Connect Local AI</h2>
-                      <p className="text-stone-500 leading-relaxed text-sm">Connect this web app to a local Whisper server via WebSocket.</p>
-                  </div>
+              <div className="text-center mb-10 relative">
+                  <p className="text-[11px] font-bold uppercase tracking-[0.25em] text-sage-600 mb-3">Workspace</p>
+                  <h1 className="text-4xl md:text-5xl font-display font-bold text-forest-dark mb-3">What are you captioning today?</h1>
+                  <p className="text-stone-500 text-base max-w-2xl mx-auto">Pick a workflow. You can switch any time, and the Context Engine and your dictionary follow you across all of them.</p>
               </div>
+
+              <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-4 gap-5 max-w-7xl w-full relative">
+                  {cards.map(c => {
+                      const a = ACCENT[c.accent];
+                      const Icon = c.icon;
+                      return (
+                          <button key={c.key} onClick={() => setAppState(p => ({...p, view: c.view as any}))}
+                              className={`group text-left bg-white p-7 rounded-3xl border-2 border-stone-200 shadow-sm ${a.hover} hover:shadow-2xl hover:-translate-y-1 cursor-pointer transition-all duration-200 flex flex-col min-h-[340px] focus:outline-none focus:ring-4 focus:ring-sage-200`}>
+                              <div className="flex items-start justify-between mb-5">
+                                  <div className={`w-14 h-14 rounded-2xl flex items-center justify-center ${a.icon} group-hover:scale-110 transition-transform shadow-inner`}><Icon size={26} /></div>
+                                  {c.badge && <span className={`text-[10px] font-bold uppercase tracking-wider px-2 py-1 rounded-full border ${a.chip}`}>{c.badge}</span>}
+                              </div>
+                              <p className={`text-[11px] font-bold uppercase tracking-wider mb-1 ${a.cta}`}>{c.tagline}</p>
+                              <h2 className="text-2xl font-display font-bold text-forest-dark mb-2">{c.title}</h2>
+                              <p className="text-stone-500 leading-relaxed text-sm flex-1">{c.desc}</p>
+                              <div className="flex flex-wrap gap-1.5 mt-5">
+                                  {c.needs.map(n => <span key={n} className={`text-[10px] font-medium px-2 py-1 rounded-full border ${a.chip}`}>{n}</span>)}
+                              </div>
+                              {c.warn && (
+                                  <div className="mt-3 px-2.5 py-1.5 bg-amber-50 border border-amber-200 text-amber-800 rounded-lg text-[11px] font-medium flex items-center gap-1.5">
+                                      <span className="w-1.5 h-1.5 rounded-full bg-amber-500 shrink-0" /> {c.warn}
+                                  </div>
+                              )}
+                              <div className={`mt-5 flex items-center gap-1.5 text-sm font-bold ${a.cta} opacity-70 group-hover:opacity-100 transition-opacity`}>Open <ArrowRight size={16} className="group-hover:translate-x-1 transition-transform" /></div>
+                          </button>
+                      );
+                  })}
+              </div>
+              <p className="text-[11px] text-stone-400 mt-8 relative">Running {appInfoVersion ? `v${appInfoVersion}` : 'locally'} · Settings (gear, bottom right) hold API keys, audio devices and output styling.</p>
           </div>
       );
   }

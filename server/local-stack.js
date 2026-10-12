@@ -197,12 +197,45 @@ async function detectOllama(baseUrl = 'http://127.0.0.1:11434') {
     return { installed, running, models, version, url: baseUrl };
 }
 
+/** Version of the speech server script we ship (SCRIPT_VERSION in whisper_server.py). */
+export function bundledScriptVersion() {
+    try { const m = readScript().match(/^SCRIPT_VERSION\s*=\s*(\d+)/m); return m ? +m[1] : 0; } catch { return 0; }
+}
+
 async function detectWhisper(port = 9000) {
     const running = await portOpen(port);
     const managed = !!whisperProc && whisperState.state !== 'stopped';
     let hello = null;
     if (running) hello = await readHello(`ws://127.0.0.1:${port}`).catch(() => null);
-    return { running, managed, hello, url: `ws://127.0.0.1:${port}`, port };
+    const bundledVersion = bundledScriptVersion();
+    const serverVersion = hello && typeof hello.scriptVersion === 'number' ? hello.scriptVersion : (hello ? 1 : null);
+    // An older copy of our own script (or a legacy server) is still listening: the app
+    // can replace it so the operator gets the current captioning behaviour.
+    const outdated = running && !managed && !!hello && serverVersion != null && serverVersion < bundledVersion;
+    return { running, managed, hello, url: `ws://127.0.0.1:${port}`, port, bundledVersion, serverVersion, outdated };
+}
+
+/** Kill whatever is listening on the speech-server port (used to replace a stale server). */
+export async function killPortListener(port = 9000) {
+    let pids = [];
+    if (process.platform === 'win32') {
+        const r = await run('netstat', ['-ano', '-p', 'tcp'], { timeout: 5000 });
+        for (const line of r.stdout.split('\n')) {
+            const m = line.trim().match(/^TCP\s+\S+:(\d+)\s+\S+\s+LISTENING\s+(\d+)/i);
+            if (m && +m[1] === port) pids.push(+m[2]);
+        }
+        for (const pid of pids) await run('taskkill', ['/PID', String(pid), '/T', '/F'], { timeout: 5000 });
+    } else {
+        const r = await run('lsof', ['-ti', `tcp:${port}`, '-sTCP:LISTEN'], { timeout: 5000 });
+        pids = r.stdout.split('\n').map(x => +x.trim()).filter(n => n > 0 && n !== process.pid);
+        for (const pid of pids) { try { process.kill(pid, 'SIGTERM'); } catch {} }
+    }
+    for (let i = 0; i < 30 && await portOpen(port); i++) {
+        if (i === 15 && process.platform !== 'win32') for (const pid of pids) { try { process.kill(pid, 'SIGKILL'); } catch {} }
+        await new Promise(r => setTimeout(r, 200));
+    }
+    invalidateProbe();
+    return { killed: pids, freed: !(await portOpen(port)) };
 }
 
 /** Connect to a speech server and return its hello message (null for legacy servers). */
@@ -344,12 +377,16 @@ function waitExit(child) {
  * pick a runner (uv → ephemeral env; else venv + pip), install deps if needed,
  * spawn the server and track its status lines.
  */
-export async function startWhisper({ model = 'large-v3-turbo', backend = 'auto', device = 'auto', compute = 'auto', language = 'en', port = 9000, interim = true } = {}) {
+export async function startWhisper({ model = 'large-v3-turbo', backend = 'auto', device = 'auto', compute = 'auto', language = 'en', port = 9000, interim = true, interimModel = 'auto', replaceExisting = false } = {}) {
     if (whisperProc && whisperState.state !== 'stopped' && whisperState.state !== 'error') {
-        throw new Error(`Speech server is already ${whisperState.state}. Stop it first.`);
+        if (!replaceExisting) throw new Error(`Speech server is already ${whisperState.state}. Stop it first.`);
+        await stopWhisper();
     }
     if (await portOpen(port)) {
-        throw new Error(`Port ${port} is already in use (another speech server?). Stop it or pick another port.`);
+        if (!replaceExisting) throw new Error(`Port ${port} is already in use (another speech server?). Stop it or pick another port.`);
+        const k = await killPortListener(port);
+        if (!k.freed) throw new Error(`Could not stop the server on port ${port} (pid ${k.killed.join(', ') || '?'}). Close it yourself and try again.`);
+        pushLog(`Replaced the speech server that was listening on port ${port} (pid ${k.killed.join(', ') || '?'}).`);
     }
     mkdirSync(LOCAL_DIR, { recursive: true });
     const scriptPath = join(LOCAL_DIR, SCRIPT_NAME);
@@ -360,7 +397,7 @@ export async function startWhisper({ model = 'large-v3-turbo', backend = 'auto',
     const info = await probeSystem();
     const wantMlx = IS_APPLE_SILICON && (backend === 'auto' || backend === 'mlx');
     const pkgs = ['numpy', 'websockets', 'faster-whisper', ...(wantMlx ? ['mlx-whisper'] : [])];
-    const serverArgs = [scriptPath, '--model', model, '--backend', backend, '--device', device, '--compute', compute, '--language', language, '--port', String(port), ...(interim ? [] : ['--no-interim'])];
+    const serverArgs = [scriptPath, '--model', model, '--backend', backend, '--device', device, '--compute', compute, '--language', language, '--port', String(port), ...(interim ? [] : ['--no-interim']), ...(interimModel && interimModel !== 'auto' ? ['--interim-model', interimModel] : [])];
     const env = { HF_HOME: join(LOCAL_DIR, 'hf-cache') };
 
     let cmd, args, runner;

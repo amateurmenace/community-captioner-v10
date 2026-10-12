@@ -15,7 +15,7 @@ import { fetchPage, htmlToText, extractPdfText, extractUploadedText, pdfSupportA
 import { listProfiles, getProfile, saveProfile, deleteProfile } from './profiles.js';
 import { buildCorrectionIndex, applyCorrections } from '../shared/corrections.js';
 import { probeSystem, invalidateProbe, startWhisper, stopWhisper, getWhisperStatus, subscribeLogs, readScript, readHello, ollamaModels, ollamaPull, ollamaStart, WHISPER_MODELS, OLLAMA_MODELS } from './local-stack.js';
-import { getBrainConfig, setBrainConfig, brainActive, extractEntriesWithOllama, testOllamaExtraction } from './local-llm.js';
+import { getBrainConfig, setBrainConfig, brainActive, extractEntriesWithOllama, extractItemsWithOllama, testOllamaExtraction } from './local-llm.js';
 import { locateMunicipalityLocally, researchMunicipalityLocally } from './local-wizard.js';
 import { createRequire as _pkgRequire } from 'module';
 // Version: injected by esbuild in packaged builds (package.json isn't in the pkg snapshot), read from disk in dev
@@ -1631,6 +1631,77 @@ app.post('/api/context/discover-links', async (req, res) => {
 const upload = multer ? multer({ storage: multer.memoryStorage(), limits: { fileSize: 40 * 1024 * 1024 } }) : null;
 
 if (upload) {
+    // Streaming upload: the same parsing + extraction as /upload-pdf, but with live
+    // phases so the Context Engine can show what is happening (reading → extracting
+    // chunk 2/4 with <engine> → done) instead of a spinner for up to a minute.
+    app.post('/api/context/upload-stream', upload.single('file'), async (req, res) => {
+        if (!req.file) return res.status(400).json({ ok: false, error: 'No file uploaded' });
+        const apiKey = resolveRequestKey(req);
+        const filename = req.file.originalname || 'document';
+        const domainHint = typeof req.body?.domainHint === 'string' ? req.body.domainHint : '';
+        const sse = sseInit(res);
+        const t0 = Date.now();
+        sse.emit('received', { filename, bytes: req.file.size });
+        try {
+            sse.emit('parsing', { filename, message: `Reading ${filename}…` });
+            const extracted = await extractUploadedText(req.file.buffer, filename, req.file.mimetype || '');
+            const text = (extracted.text || '').trim();
+            const words = text ? text.split(/\s+/).length : 0;
+            const pages = extracted.pages || null;
+            console.log(`[Context] Upload-stream ${filename}: kind=${extracted.kind}${pages ? ` pages=${pages}` : ''} chars=${text.length} key=${apiKey ? 'yes' : 'no'} brain=${brainActive()}`);
+            sse.emit('parsed', { kind: extracted.kind, pages, chars: text.length, words, preview: text.slice(0, 1500), ms: Date.now() - t0 });
+            if (text.length < 20) {
+                const hint = extracted.kind === 'pdf'
+                    ? 'This PDF has no selectable text (probably a scan). Export a text PDF from the agenda software, or paste the agenda text instead.'
+                    : 'Could not read any text from this file.';
+                sse.emit('done', { entries: [], items: [], engine: 'none', warning: hint, ms: Date.now() - t0, kind: extracted.kind, pages, chars: text.length, filename });
+                return sse.end();
+            }
+            let entries = [], items = [], warning = null, engine = 'local-regex';
+            if (brainActive()) {
+                const b = getBrainConfig();
+                engine = `ollama:${b.model}`;
+                const chunks = Math.max(1, Math.min(4, Math.ceil(text.length / 6000)));
+                sse.emit('extracting', { engine, chunk: 0, chunks, message: `Extracting names with ${b.model} (${chunks} ${chunks === 1 ? 'pass' : 'passes'})…` });
+                try {
+                    const r = await extractItemsWithOllama(text, { url: b.url, model: b.model, domainHint, onProgress: (p) => sse.emit('extracting', { engine, ...p, message: `Extracting names with ${b.model} (${p.chunk}/${p.chunks})…` }) });
+                    items = r.items || [];
+                    entries = itemsToEntries(items);
+                    sse.emit('engine_done', { engine, items: items.length, entries: entries.length, ms: r.latencyMs, tokensPerSec: r.tokensPerSec });
+                } catch (e) {
+                    warning = `Local AI brain (${b.model}) failed: ${e.message}.`;
+                    sse.emit('engine_done', { engine, items: 0, entries: 0, error: e.message });
+                }
+            }
+            if (entries.length === 0 && apiKey) {
+                engine = 'gemini';
+                const chunks = Math.max(1, Math.min(6, Math.ceil(text.length / 24000)));
+                sse.emit('extracting', { engine, chunk: 0, chunks, message: `Extracting names with Gemini (${chunks} ${chunks === 1 ? 'pass' : 'passes'} in parallel)…` });
+                try {
+                    entries = await extractDictionary(text, apiKey, { domainHint });
+                    sse.emit('engine_done', { engine, entries: entries.length });
+                } catch (e) {
+                    warning = `${warning ? warning + ' ' : ''}Gemini failed: ${e.message}.`;
+                    sse.emit('engine_done', { engine, entries: 0, error: e.message });
+                }
+            }
+            if (entries.length === 0) {
+                const local = extractProperNounsLocally(text);
+                if (local.length > 0) {
+                    warning = `${warning ? warning + ' ' : ''}${engine === 'local-regex' ? 'No AI engine is configured — used basic pattern extraction.' : 'AI extraction returned nothing; used basic pattern extraction instead.'}`;
+                    engine = 'local-regex';
+                    entries = local;
+                }
+            }
+            console.log(`[Context] Upload-stream ${filename}: ${text.length} chars → ${entries.length} entries (${engine}) in ${Date.now() - t0}ms`);
+            sse.emit('done', { entries, items, engine, warning: warning || undefined, ms: Date.now() - t0, kind: extracted.kind, pages, chars: text.length, words, filename });
+        } catch (e) {
+            console.warn(`[Context] Upload-stream error (${filename}): ${e.message}`);
+            sse.emit('error', { error: e.message, filename });
+        }
+        sse.end();
+    });
+
     app.post('/api/context/upload-pdf', upload.single('file'), async (req, res) => {
         if (!req.file) return res.status(400).json({ ok: false, error: 'No file uploaded' });
         const apiKey = resolveRequestKey(req);

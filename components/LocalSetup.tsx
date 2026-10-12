@@ -18,7 +18,7 @@ type ProbeInfo = {
     python: { cmd: string; version: string; ok: boolean; note?: string }[];
     uv: { installed: boolean; path?: string; version?: string };
     ollama: { installed: boolean; running: boolean; models: { name: string; sizeGB?: number | null; parameterSize?: string }[]; version?: string | null; url: string };
-    whisper: { running: boolean; managed: boolean; hello: any; url: string; port: number };
+    whisper: { running: boolean; managed: boolean; hello: any; url: string; port: number; bundledVersion?: number; serverVersion?: number | null; outdated?: boolean };
     scriptBundled: boolean; canLaunch: boolean; dataDir: string;
     installCommands: { uv: string; ollama: string; ollamaServe: string };
     downloads: { ollama: string; python: string; terminalHint: string };
@@ -81,6 +81,7 @@ const LocalSetup: React.FC<LocalSetupProps> = ({ onBack, onComplete, initialWhis
     const [launching, setLaunching] = useState(false);
     const [launchError, setLaunchError] = useState<string | null>(null);
     const [manualMode, setManualMode] = useState(false);
+    const [interimModel, setInterimModel] = useState<'auto' | 'none' | 'base.en' | 'small.en' | 'base' | 'small'>('auto');
     const [whisperUrl, setWhisperUrl] = useState(() => {
         const def = `ws://${browserHost}:9000`;
         if (initialWhisperUrl && !/^ws:\/\/(localhost|127\.0\.0\.1):9000$/.test(initialWhisperUrl)) return initialWhisperUrl;
@@ -160,14 +161,14 @@ const LocalSetup: React.FC<LocalSetupProps> = ({ onBack, onComplete, initialWhis
     // ------------------------------------------------------------------
     // Speech server actions
     // ------------------------------------------------------------------
-    const startServer = async () => {
+    const startServer = async (replaceExisting = false) => {
         setLaunching(true);
         setLaunchError(null);
         setLogs([]);
         try {
             const res = await fetch(`${getRelayUrl()}/api/local/whisper/start`, {
                 method: 'POST', headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ model, backend, language, interim }),
+                body: JSON.stringify({ model, backend, language, interim, interimModel, replaceExisting }),
             });
             const data = await res.json();
             if (!data.ok) throw new Error(data.error || `HTTP ${res.status}`);
@@ -529,7 +530,7 @@ const LocalSetup: React.FC<LocalSetupProps> = ({ onBack, onComplete, initialWhis
                                 </div>
                                 <details className="text-xs text-stone-500">
                                     <summary className="cursor-pointer font-bold text-stone-600">Advanced options</summary>
-                                    <div className="mt-2 grid grid-cols-1 md:grid-cols-3 gap-3 p-3 bg-stone-50 rounded-xl border border-stone-200">
+                                    <div className="mt-2 grid grid-cols-1 md:grid-cols-2 xl:grid-cols-4 gap-3 p-3 bg-stone-50 rounded-xl border border-stone-200">
                                         <label className="block"><span className="font-bold text-stone-600 block mb-1">Backend</span>
                                             <select value={backend} onChange={e => setBackend(e.target.value as any)} className="w-full border border-stone-200 rounded-lg p-2 bg-white">
                                                 <option value="auto">Auto ({info.gpu.type === 'apple' ? 'mlx-whisper on the Apple GPU' : 'faster-whisper'})</option>
@@ -541,6 +542,13 @@ const LocalSetup: React.FC<LocalSetupProps> = ({ onBack, onComplete, initialWhis
                                                 <option value="en">English (fastest)</option>
                                                 <option value="auto">Auto-detect (multilingual models only)</option>
                                             </select></label>
+                                        <label className="block"><span className="font-bold text-stone-600 block mb-1">Live caption model</span>
+                                            <select value={interimModel} onChange={e => setInterimModel(e.target.value as any)} className="w-full border border-stone-200 rounded-lg p-2 bg-white">
+                                                <option value="auto">Auto ({info.gpu.type === 'none' ? 'small model for the live line, main model for finals' : 'main model for everything'})</option>
+                                                <option value="none">Main model only</option>
+                                                {language === 'en' ? <><option value="base.en">Whisper base (English) — fastest live line</option><option value="small.en">Whisper small (English)</option></> : <><option value="base">Whisper base — fastest live line</option><option value="small">Whisper small</option></>}
+                                            </select>
+                                            <span className="block mt-1 text-[10px] text-stone-400">A small model can draft the live line while the main model produces the final captions. Useful on CPU-only machines; on a GPU the main model is already fast.</span></label>
                                         <label className="flex items-center gap-2 mt-5"><input type="checkbox" checked={interim} onChange={e => setInterim(e.target.checked)} className="accent-forest-dark" /> <span className="font-bold text-stone-600">Show words while speaking</span> <span className="text-stone-400">(uses more CPU)</span></label>
                                     </div>
                                     <p className="mt-2 text-[11px]">Prefer a terminal? <a href={`${getRelayUrl()}/api/local/whisper-server.py`} className="underline text-forest-dark">Download whisper_server.py</a> and run <code className="font-mono">python whisper_server.py --model {model}</code> (needs <code className="font-mono">pip install faster-whisper websockets numpy{info.gpu.type === 'apple' ? ' mlx-whisper' : ''}</code>).</p>
@@ -554,19 +562,32 @@ const LocalSetup: React.FC<LocalSetupProps> = ({ onBack, onComplete, initialWhis
                                         </div>
                                         <div className="flex-1 min-w-0">
                                             <p className="text-sm font-bold text-forest-dark">
-                                                {wstatus.state === 'stopped' ? (info.whisper.running ? 'A speech server is already running' : 'Speech server not running') :
+                                                {wstatus.state === 'stopped' ? (info.whisper.running ? (info.whisper.outdated ? `An older speech server is running on port ${info.whisper.port}` : `A speech server is already running on port ${info.whisper.port}`) : 'Speech server not running yet') :
                                                  wstatus.state === 'installing' ? 'Installing packages' :
                                                  wstatus.state === 'starting' ? 'Starting' :
                                                  wstatus.state === 'loading' ? 'Loading model' :
                                                  wstatus.state === 'ready' ? 'Speech server ready' :
                                                  wstatus.state === 'stopping' ? 'Stopping' : 'Something went wrong'}
                                             </p>
-                                            <p className="text-xs text-stone-600 truncate">{wstatus.message}{wstatus.state === 'ready' && wstatus.url ? ` · ${wstatus.url}` : ''}</p>
+                                            <p className="text-xs text-stone-600">
+                                                {wstatus.state === 'stopped'
+                                                    ? (info.whisper.running
+                                                        ? <>{info.whisper.hello ? <span className="font-mono">{info.whisper.hello.backend} / {info.whisper.hello.model}</span> : 'A server that does not announce itself (older or third-party)'}{info.whisper.outdated
+                                                            ? <> · version {info.whisper.serverVersion} of the speech server, while this app ships version {info.whisper.bundledVersion} with much faster live captions. Replace it to get the update.</>
+                                                            : <> · started outside this app or by an earlier session. The app will use it as it is, or you can replace it with a fresh one.</>}</>
+                                                        : 'Nothing is listening yet. Click Install & start: the app sets up Python, downloads the model and runs the server for you.')
+                                                    : <>{wstatus.message}{wstatus.state === 'ready' && wstatus.url ? ` · ${wstatus.url}` : ''}</>}
+                                            </p>
                                             {(wstatus.state === 'installing' || wstatus.state === 'loading') && <p className="text-[11px] text-stone-500 mt-0.5">First run downloads {wstatus.state === 'installing' ? 'the speech packages (~200 MB)' : `the model (${fmtMB(info.whisperModels.find(m => m.name === model)?.downloadMB || 0)})`}; later starts take a few seconds.</p>}
                                         </div>
                                         <div className="flex gap-2 shrink-0">
+                                            {wstatus.state === 'stopped' && info.whisper.running && !info.whisper.managed && (
+                                                <button onClick={() => startServer(true)} disabled={launching || !info.canLaunch} className={`${info.whisper.outdated ? 'bg-forest-dark text-white hover:bg-forest-light' : 'bg-white border border-stone-200 text-stone-600 hover:bg-stone-50'} px-4 py-2 rounded-lg text-sm font-bold disabled:opacity-40 flex items-center gap-2`}>
+                                                    {launching ? <Loader2 size={14} className="animate-spin" /> : <RefreshCw size={14} />} {info.whisper.outdated ? 'Replace with the new version' : "Replace with the app's server"}
+                                                </button>
+                                            )}
                                             {(wstatus.state === 'stopped' || wstatus.state === 'error') && !info.whisper.running && (
-                                                <button onClick={startServer} disabled={launching || !info.canLaunch} className="bg-forest-dark text-white px-4 py-2 rounded-lg text-sm font-bold hover:bg-forest-light disabled:opacity-40 flex items-center gap-2" title={!info.canLaunch ? 'Install uv or Python first (step 1)' : ''}>
+                                                <button onClick={() => startServer()} disabled={launching || !info.canLaunch} className="bg-forest-dark text-white px-4 py-2 rounded-lg text-sm font-bold hover:bg-forest-light disabled:opacity-40 flex items-center gap-2" title={!info.canLaunch ? 'Install uv or Python first (step 1)' : ''}>
                                                     {launching ? <Loader2 size={14} className="animate-spin" /> : <Play size={14} />} {wstatus.state === 'error' ? 'Try again' : 'Install & start'}
                                                 </button>
                                             )}

@@ -100,7 +100,7 @@ const ContextEngine: React.FC<ContextEngineProps> = ({
   // Server-side API key status — drives the banner and the wizard gating
   const [serverKey, setServerKey] = useState<{loaded: boolean, source: string, masked: string} | null>(null);
   const [showInlineKeyForm, setShowInlineKeyForm] = useState(false);
-  const [capabilities, setCapabilities] = useState<{pdf: boolean, docx: boolean, upload: boolean, model?: string, brain?: { enabled: boolean; model: string; url: string }, extractionEngine?: string} | null>(null);
+  const [capabilities, setCapabilities] = useState<{pdf: boolean, docx: boolean, upload: boolean, geminiKey?: boolean, model?: string, brain?: { enabled: boolean; model: string; url: string }, extractionEngine?: string} | null>(null);
   const brainOn = !!capabilities?.brain?.enabled && !!capabilities?.brain?.model;
 
   // --- Municipality Wizard state ---
@@ -160,9 +160,18 @@ const ContextEngine: React.FC<ContextEngineProps> = ({
   const [scrapePreview, setScrapePreview] = useState<PreviewEntry[] | null>(null);
 
   // Upload tool
-  const [uploading, setUploading] = useState(false);
-  const [uploadResult, setUploadResult] = useState<{ text: string; kind: 'ok' | 'warn' | 'error' } | null>(null);
-  const [uploadPreview, setUploadPreview] = useState<{ entries: PreviewEntry[]; filename: string } | null>(null);
+  // Document ingestion: one job per uploaded file, streamed from /api/context/upload-stream
+  type IngestJob = {
+      id: string; filename: string; bytes: number; startedAt: number;
+      status: 'queued' | 'reading' | 'extracting' | 'done' | 'error' | 'added';
+      message?: string; chunk?: number; chunks?: number; engine?: string;
+      kind?: string; pages?: number | null; chars?: number; words?: number; preview?: string;
+      entries: PreviewEntry[]; existing: number; warning?: string; error?: string; ms?: number;
+      selected: Set<string>; added?: number; showText?: boolean;
+  };
+  const [ingestJobs, setIngestJobs] = useState<IngestJob[]>([]);
+  const ingestBusyRef = useRef(false);
+  const ingestQueueRef = useRef<{ id: string; file: File }[]>([]);
 
   // Paste tool
   const [pasteText, setPasteText] = useState('');
@@ -373,41 +382,76 @@ const ContextEngine: React.FC<ContextEngineProps> = ({
       setBodyProcessing(false);
   };
 
-  const handleFileUpload = async (file: File) => {
-      setUploading(true);
-      setUploadResult(null);
-      setUploadPreview(null);
+  const patchJob = (id: string, patch: Partial<IngestJob> | ((j: IngestJob) => Partial<IngestJob>)) =>
+      setIngestJobs(prev => prev.map(j => j.id === id ? { ...j, ...(typeof patch === 'function' ? patch(j) : patch) } : j));
+
+  const ingestOne = async (id: string, file: File) => {
+      patchJob(id, { status: 'reading', message: `Uploading ${file.name}…` });
       try {
           const formData = new FormData();
           formData.append('file', file);
-          const res = await fetch(`${getRelayUrl()}/api/context/upload-pdf`, {
-              method: 'POST',
-              headers: apiHeaders(false),
-              body: formData,
-          });
-          const data = await res.json();
-          const entries = normalizeEntries(data.entries);
-          if (data.ok && entries.length > 0) {
-              setUploadPreview({ entries, filename: file.name });
-              const meta = [data.pages ? `${data.pages} page${data.pages === 1 ? '' : 's'}` : null, data.textLength ? `${data.textLength.toLocaleString()} characters` : null].filter(Boolean).join(', ');
-              setUploadResult({ text: `Found ${entries.length} entries in ${file.name}${meta ? ` (${meta})` : ''} — review below`, kind: data.warning ? 'warn' : 'ok' });
-              if (data.warning) setUploadResult({ text: `${data.warning} Found ${entries.length} entries — review below`, kind: 'warn' });
-          } else {
-              setUploadResult({ text: data.warning || data.error || `No names or terms found in ${file.name}`, kind: data.ok ? 'warn' : 'error' });
+          const res = await fetch(`${getRelayUrl()}/api/context/upload-stream`, { method: 'POST', headers: apiHeaders(false), body: formData });
+          if (!res.ok || !res.body) {
+              let msg = `HTTP ${res.status}`;
+              try { const j = await res.json(); msg = j.error || msg; } catch {}
+              throw new Error(msg);
           }
+          let finished = false;
+          await readSse(res, (ev) => {
+              switch (ev.phase) {
+                  case 'parsing': patchJob(id, { status: 'reading', message: ev.message || 'Reading the document…' }); break;
+                  case 'parsed': patchJob(id, { kind: ev.kind, pages: ev.pages, chars: ev.chars, words: ev.words, preview: ev.preview, message: `Read ${ev.pages ? `${ev.pages} page${ev.pages === 1 ? '' : 's'}, ` : ''}${(ev.words || 0).toLocaleString()} words` }); break;
+                  case 'extracting': patchJob(id, { status: 'extracting', engine: ev.engine, chunk: ev.chunk, chunks: ev.chunks, message: ev.message || 'Extracting names…' }); break;
+                  case 'engine_done': patchJob(id, { message: ev.error ? `${ev.engine} failed: ${ev.error}` : `${ev.engine}: ${ev.entries} rules${ev.ms ? ` in ${(ev.ms / 1000).toFixed(1)} s` : ''}` }); break;
+                  case 'done': {
+                      finished = true;
+                      const entries = normalizeEntries(ev.entries);
+                      const existingKeys = new Set(dictionary.map(entryKey));
+                      const novel = entries.filter(e => !existingKeys.has(entryKey(e)));
+                      patchJob(id, {
+                          status: 'done', entries: novel, existing: entries.length - novel.length, engine: ev.engine, warning: ev.warning, ms: ev.ms,
+                          kind: ev.kind, pages: ev.pages, chars: ev.chars, words: ev.words,
+                          selected: new Set(novel.map(entryKey)),
+                          message: novel.length ? `${novel.length} new rule${novel.length === 1 ? '' : 's'} found` : entries.length ? 'Everything found is already in the dictionary' : 'No names or terms found',
+                      });
+                      break;
+                  }
+                  case 'error': finished = true; patchJob(id, { status: 'error', error: ev.error, message: ev.error }); break;
+              }
+          });
+          if (!finished) patchJob(id, j => j.status === 'done' || j.status === 'error' ? {} : { status: 'error', error: 'The connection closed before the document was processed.', message: 'Connection closed early' });
       } catch (err) {
-          setUploadResult({ text: 'Upload failed: ' + (err as Error).message, kind: 'error' });
+          patchJob(id, { status: 'error', error: (err as Error).message, message: (err as Error).message });
       }
-      setUploading(false);
   };
 
-  const handleAcceptUpload = () => {
-      if (uploadPreview) {
-          const n = addEntries(uploadPreview.entries, 'document');
-          setUploadResult({ text: `Added ${n} entries from ${uploadPreview.filename}`, kind: 'ok' });
-          setUploadPreview(null);
-      }
+  const pumpIngestQueue = async () => {
+      if (ingestBusyRef.current) return;
+      ingestBusyRef.current = true;
+      try {
+          while (ingestQueueRef.current.length) {
+              const next = ingestQueueRef.current.shift()!;
+              await ingestOne(next.id, next.file);   // one at a time: the local brain has one GPU
+          }
+      } finally { ingestBusyRef.current = false; }
   };
+
+  const ingestFiles = (files: File[]) => {
+      const accepted = files.filter(f => /\.(pdf|txt|docx|html?|md)$/i.test(f.name));
+      if (!accepted.length) return;
+      const jobs: IngestJob[] = accepted.map(f => ({ id: `${Date.now()}-${Math.random().toString(36).slice(2, 7)}`, filename: f.name, bytes: f.size, startedAt: Date.now(), status: 'queued', entries: [], existing: 0, selected: new Set(), message: 'Waiting…' }));
+      setIngestJobs(prev => [...jobs, ...prev]);
+      ingestQueueRef.current.push(...jobs.map((j, i) => ({ id: j.id, file: accepted[i] })));
+      pumpIngestQueue();
+  };
+
+  const addSelectedFromJob = (job: IngestJob) => {
+      const chosen = job.entries.filter(e => job.selected.has(entryKey(e)));
+      const n = addEntries(chosen, 'document');
+      patchJob(job.id, { status: 'added', added: n, message: `Added ${n} rule${n === 1 ? '' : 's'} to the dictionary` });
+  };
+
+  const removeJob = (id: string) => setIngestJobs(prev => prev.filter(j => j.id !== id));
 
   const refreshServerKey = useCallback(async () => {
       try {
@@ -777,13 +821,13 @@ const ContextEngine: React.FC<ContextEngineProps> = ({
     else if (e.type === "dragleave") setDragActive(false);
   }, []);
 
-  const handleDrop = useCallback(async (e: React.DragEvent) => {
+  const handleDrop = useCallback((e: React.DragEvent) => {
     e.preventDefault();
     e.stopPropagation();
     setDragActive(false);
-    const file = e.dataTransfer.files?.[0];
-    if (file) await handleFileUpload(file);
-  }, [handleFileUpload]);
+    const files = Array.from(e.dataTransfer.files || []);
+    if (files.length) ingestFiles(files);
+  }, [ingestFiles]);
 
   const addManualEntry = () => {
     if (manualOriginal && manualReplacement) {
@@ -1639,51 +1683,123 @@ const ContextEngine: React.FC<ContextEngineProps> = ({
                             <p className="text-[10px] text-stone-400">Extract names from agendas and documents</p>
                         </div>
 
-                        {/* 3. Drag & Drop Upload — with preview */}
+                        {/* 3. Drag & Drop Upload — streamed, multi-file, with per-document progress and review */}
                         <div className="space-y-2">
                             <div
                                 onDragEnter={handleDrag}
                                 onDragLeave={handleDrag}
                                 onDragOver={handleDrag}
                                 onDrop={handleDrop}
-                                onClick={() => !uploading && fileUploadRef.current?.click()}
-                                className={`border-2 border-dashed rounded-2xl h-28 flex flex-col items-center justify-center text-center p-4 transition-all cursor-pointer ${dragActive ? 'border-sage-500 bg-sage-50' : 'border-stone-200 hover:border-sage-400 hover:bg-stone-50'}`}
+                                onClick={() => fileUploadRef.current?.click()}
+                                className={`relative border-2 border-dashed rounded-2xl min-h-[7.5rem] flex flex-col items-center justify-center text-center p-4 transition-all cursor-pointer overflow-hidden ${dragActive ? 'border-sage-500 bg-sage-50 scale-[1.01]' : 'border-stone-200 bg-white hover:border-sage-400 hover:bg-sage-50/40'}`}
                             >
-                                {uploading ? (
-                                    <>
-                                        <Loader2 size={24} className="animate-spin text-sage-500 mb-2" />
-                                        <p className="text-xs font-bold text-sage-600">Reading document & extracting names…</p>
-                                        <p className="text-[10px] text-stone-400">Long agendas take 10–30 seconds</p>
-                                    </>
-                                ) : (
-                                    <>
-                                        <Upload size={24} className={`mb-2 ${dragActive ? 'text-sage-600' : 'text-stone-300'}`} />
-                                        <p className="text-xs font-bold text-stone-600">Drop Agenda PDF Here</p>
-                                        <p className="text-[10px] text-stone-400">PDF, Word (.docx) or text · or click to choose</p>
-                                        {capabilities && !capabilities.pdf && <p className="text-[9px] text-red-500 mt-1">PDF parsing unavailable on this server</p>}
-                                    </>
-                                )}
+                                <div className={`w-10 h-10 rounded-xl flex items-center justify-center mb-2 ${dragActive ? 'bg-sage-200 text-forest-dark' : 'bg-sage-100 text-sage-600'}`}><Upload size={20} /></div>
+                                <p className="text-sm font-bold text-forest-dark">{dragActive ? 'Drop to read it' : 'Drop agendas, minutes or packets here'}</p>
+                                <p className="text-[10px] text-stone-400 mt-0.5">PDF, Word (.docx), text, HTML or Markdown · several files at once · or click to choose</p>
+                                <p className="text-[10px] text-stone-400 mt-1.5 flex items-center gap-1"><Sparkles size={10} className="text-sage-500" /> Names, boards, places and acronyms are extracted with {capabilities?.extractionEngine?.startsWith('ollama') ? `your local brain (${capabilities.extractionEngine.replace('ollama:', '')})` : capabilities?.geminiKey ? 'Gemini' : 'basic pattern matching (add an AI engine for better results)'}; you review before anything is added.</p>
+                                {capabilities && !capabilities.pdf && <p className="text-[9px] text-red-500 mt-1">PDF parsing unavailable on this server</p>}
                                 <input
                                     ref={fileUploadRef}
                                     type="file"
+                                    multiple
                                     className="hidden"
                                     accept=".pdf,.txt,.docx,.html,.htm,.md"
-                                    onChange={async (e) => {
-                                        const file = e.target.files?.[0];
-                                        if (file) await handleFileUpload(file);
+                                    onChange={(e) => {
+                                        const files = Array.from(e.target.files || []);
+                                        if (files.length) ingestFiles(files);
                                         e.target.value = '';
                                     }}
                                 />
                             </div>
-                            {uploadResult && (
-                                <p className={`text-[10px] font-medium flex items-start gap-1.5 ${uploadResult.kind === 'ok' ? 'text-green-700' : uploadResult.kind === 'warn' ? 'text-amber-700' : 'text-red-600'}`}>
-                                    {uploadResult.kind !== 'ok' && <AlertTriangle size={11} className="shrink-0 mt-0.5" />}
-                                    <span>{uploadResult.text}</span>
-                                </p>
-                            )}
-                            {uploadPreview && (
-                                <PreviewList entries={uploadPreview.entries} accent="sage" title={`${uploadPreview.filename} — ${uploadPreview.entries.length} entries, review before adding`} onAccept={handleAcceptUpload} onDiscard={() => { setUploadPreview(null); setUploadResult(null); }} />
-                            )}
+
+                            {ingestJobs.map(job => {
+                                const pct = job.status === 'queued' ? 0 : job.status === 'reading' ? 12 : job.status === 'extracting' ? (job.chunks ? 15 + Math.round(((job.chunk || 0) / job.chunks) * 80) : 30) : 100;
+                                const elapsed = Math.max(0, Math.round(((job.ms ?? (Date.now() - job.startedAt)) / 1000)));
+                                const groups = ['proper_noun', 'place', 'acronym', 'correction'] as const;
+                                const GROUP: Record<string, { label: string; cls: string; icon: any }> = {
+                                    proper_noun: { label: 'People & organizations', cls: 'bg-blue-100 text-blue-700', icon: Users },
+                                    place: { label: 'Places', cls: 'bg-green-100 text-green-700', icon: MapPin },
+                                    acronym: { label: 'Acronyms', cls: 'bg-purple-100 text-purple-700', icon: Hash },
+                                    correction: { label: 'Corrections', cls: 'bg-amber-100 text-amber-700', icon: Wand2 },
+                                };
+                                const byType = (t: string) => job.entries.filter(e => (e.type || 'proper_noun') === t);
+                                const selectedCount = job.selected.size;
+                                const toggle = (k: string) => patchJob(job.id, j => { const n = new Set(j.selected); n.has(k) ? n.delete(k) : n.add(k); return { selected: n }; });
+                                const toggleGroup = (t: string, on: boolean) => patchJob(job.id, j => { const n = new Set(j.selected); for (const e of byType(t)) { on ? n.add(entryKey(e)) : n.delete(entryKey(e)); } return { selected: n }; });
+                                const kindIcon = job.kind === 'pdf' ? 'PDF' : job.kind === 'docx' ? 'DOC' : job.kind === 'html' ? 'HTML' : 'TXT';
+                                return (
+                                    <div key={job.id} className={`rounded-xl border p-3 space-y-2 transition-colors ${job.status === 'error' ? 'border-red-200 bg-red-50/60' : job.status === 'added' ? 'border-green-200 bg-green-50/60' : job.status === 'done' ? 'border-sage-300 bg-sage-50/60' : 'border-stone-200 bg-white'}`}>
+                                        {/* header */}
+                                        <div className="flex items-center gap-2 min-w-0">
+                                            <span className={`text-[9px] font-mono font-bold px-1.5 py-0.5 rounded shrink-0 ${job.kind === 'pdf' ? 'bg-red-100 text-red-700' : job.kind === 'docx' ? 'bg-blue-100 text-blue-700' : 'bg-stone-100 text-stone-600'}`}>{kindIcon}</span>
+                                            <p className="text-xs font-bold text-forest-dark truncate flex-1" title={job.filename}>{job.filename}</p>
+                                            <span className="text-[10px] text-stone-400 shrink-0">{job.bytes >= 1e6 ? `${(job.bytes / 1e6).toFixed(1)} MB` : `${Math.max(1, Math.round(job.bytes / 1024))} KB`}{job.pages ? ` · ${job.pages} p` : ''}{job.words ? ` · ${job.words.toLocaleString()} words` : ''}</span>
+                                            {(job.status === 'reading' || job.status === 'extracting' || job.status === 'queued') && <Loader2 size={13} className="animate-spin text-sage-600 shrink-0" />}
+                                            {job.status === 'done' && <CheckCircle size={13} className="text-sage-600 shrink-0" />}
+                                            {job.status === 'added' && <CheckCircle size={13} className="text-green-600 shrink-0" />}
+                                            {job.status === 'error' && <AlertTriangle size={13} className="text-red-500 shrink-0" />}
+                                            <button onClick={() => removeJob(job.id)} className="text-stone-300 hover:text-stone-600 shrink-0" title="Remove"><X size={13} /></button>
+                                        </div>
+                                        {/* progress + status line */}
+                                        {(job.status === 'queued' || job.status === 'reading' || job.status === 'extracting') && (
+                                            <div>
+                                                <div className="h-1.5 bg-stone-100 rounded-full overflow-hidden"><div className="h-full bg-sage-500 rounded-full transition-all duration-500" style={{ width: `${Math.max(3, pct)}%` }} /></div>
+                                                <div className="flex items-center justify-between mt-1 text-[10px]">
+                                                    <span className="text-stone-600 truncate">{job.message}</span>
+                                                    <span className="text-stone-400 font-mono shrink-0 ml-2">{elapsed}s{job.engine ? ` · ${job.engine.replace('ollama:', '')}` : ''}</span>
+                                                </div>
+                                                {job.status === 'extracting' && <p className="text-[10px] text-stone-400 mt-0.5">{job.engine?.startsWith('ollama') ? 'Running on this machine; a long packet takes a pass per 6,000 characters, about 5–15 s each.' : 'Long documents are split into chunks and extracted in parallel.'}</p>}
+                                            </div>
+                                        )}
+                                        {job.status === 'error' && <p className="text-[11px] text-red-700">{job.error}</p>}
+                                        {job.status === 'added' && <p className="text-[11px] text-green-800 font-medium">{job.message}{job.engine ? ` · ${job.engine.replace('ollama:', '')}` : ''}{job.ms ? ` · ${(job.ms / 1000).toFixed(1)} s` : ''}</p>}
+                                        {job.status === 'done' && (
+                                            <>
+                                                <div className="flex items-center justify-between gap-2 text-[10px]">
+                                                    <span className="font-bold text-forest-dark">{job.message}{job.existing ? <span className="font-normal text-stone-400"> · {job.existing} already in the dictionary</span> : null}</span>
+                                                    <span className="text-stone-400 font-mono shrink-0">{job.engine?.replace('ollama:', '')}{job.ms ? ` · ${(job.ms / 1000).toFixed(1)} s` : ''}</span>
+                                                </div>
+                                                {job.warning && <p className="text-[10px] text-amber-700 flex items-start gap-1"><AlertTriangle size={11} className="shrink-0 mt-0.5" /> {job.warning}</p>}
+                                                {job.entries.length > 0 && (
+                                                    <div className="space-y-2">
+                                                        {groups.filter(t => byType(t).length).map(t => {
+                                                            const list = byType(t);
+                                                            const allOn = list.every(e => job.selected.has(entryKey(e)));
+                                                            const G = GROUP[t];
+                                                            return (
+                                                                <div key={t} className="rounded-lg bg-white border border-stone-100 p-2">
+                                                                    <div className="flex items-center gap-2 mb-1">
+                                                                        <span className={`w-5 h-5 rounded-md flex items-center justify-center ${G.cls}`}><G.icon size={11} /></span>
+                                                                        <span className="text-[10px] font-bold text-forest-dark">{G.label} <span className="text-stone-400 font-normal">({list.length})</span></span>
+                                                                        <button onClick={() => toggleGroup(t, !allOn)} className="ml-auto text-[10px] font-bold text-sage-700 hover:underline">{allOn ? 'Clear' : 'Select all'}</button>
+                                                                    </div>
+                                                                    <div className="max-h-36 overflow-y-auto custom-scrollbar space-y-0.5">
+                                                                        {list.map(e => { const k = entryKey(e); const on = job.selected.has(k); return (
+                                                                            <label key={k} className={`flex items-center gap-2 text-[10px] px-1.5 py-1 rounded cursor-pointer min-w-0 ${on ? 'bg-sage-50' : 'hover:bg-stone-50 opacity-70'}`}>
+                                                                                <input type="checkbox" checked={on} onChange={() => toggle(k)} className="accent-forest-dark shrink-0" />
+                                                                                <span className="text-stone-400 truncate max-w-[38%]">{e.original}</span>
+                                                                                <ArrowRight size={8} className="text-stone-300 shrink-0" />
+                                                                                <span className="font-bold text-forest-dark truncate">{e.replacement}</span>
+                                                                                {e.note && <span className="text-stone-400 truncate hidden sm:inline">· {e.note}</span>}
+                                                                            </label>
+                                                                        ); })}
+                                                                    </div>
+                                                                </div>
+                                                            );
+                                                        })}
+                                                    </div>
+                                                )}
+                                                <div className="flex items-center gap-2 pt-1">
+                                                    {job.entries.length > 0 && <button onClick={() => addSelectedFromJob(job)} disabled={!selectedCount} className="flex-1 px-3 py-1.5 bg-forest-dark text-white text-[10px] font-bold rounded-lg hover:bg-forest-light disabled:opacity-40">Add {selectedCount} of {job.entries.length} to the dictionary</button>}
+                                                    {job.preview && <button onClick={() => patchJob(job.id, { showText: !job.showText })} className="px-3 py-1.5 bg-white border border-stone-200 text-[10px] font-bold rounded-lg text-stone-500 hover:bg-stone-50">{job.showText ? 'Hide text' : 'Show text'}</button>}
+                                                    <button onClick={() => removeJob(job.id)} className="px-3 py-1.5 bg-white border border-stone-200 text-[10px] font-bold rounded-lg text-stone-500 hover:bg-stone-50">Discard</button>
+                                                </div>
+                                                {job.showText && job.preview && <pre className="text-[10px] text-stone-600 bg-white border border-stone-100 rounded-lg p-2 max-h-40 overflow-auto whitespace-pre-wrap font-sans">{job.preview}{job.chars && job.chars > job.preview.length ? `\n… (${(job.chars - job.preview.length).toLocaleString()} more characters)` : ''}</pre>}
+                                            </>
+                                        )}
+                                    </div>
+                                );
+                            })}
                         </div>
 
                         {/* 4. Paste Agenda Text — with preview */}

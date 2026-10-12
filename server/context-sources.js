@@ -657,6 +657,10 @@ function isJunkName(name) {
     if (/^[\d\s.,:/-]+$/.test(n)) return true;            // numbers, dates, times
     if (/\b\d{1,2}:\d{2}\b|\b\d{1,2}\s*(am|pm)\b/.test(n)) return true; // "Tuesday 7:00 PM", "9 AM"
     if (/^(monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b/.test(n) && n.split(' ').length <= 3) return true;
+    if (/^(monday|tuesday|wednesday|thursday|friday|saturday|sunday),?\s+(january|february|march|april|may|june|july|august|september|october|november|december)\b/.test(n)) return true; // "Tuesday, October 14, 2026"
+    if (/^(january|february|march|april|may|june|july|august|september|october|november|december)\s+\d{1,2},?\s+\d{4}$/.test(n)) return true;
+    if (/^\d+(st|nd|rd|th)\s+floor$/.test(n) || /^(room|suite)\s+[\w-]+$/.test(n)) return true; // "6th Floor", "Room 204"
+    if (/^(regular|special) meeting( agenda)?$/.test(n) || /^(meeting )?(agenda|minutes)$/.test(n)) return true;
     if (/^(january|february|march|april|may|june|july|august|september|october|november|december)\s+\d/.test(n)) return true;
     if (/^(fy|fiscal year)\s*\d{2,4}$/.test(n)) return true;
     if (/^\$|^#\d|^page \d/i.test(n)) return true;         // money, page refs
