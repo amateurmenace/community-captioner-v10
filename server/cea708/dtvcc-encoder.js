@@ -69,7 +69,15 @@ export class DtvccEncoder {
      */
     _buildRepaint() {
         const block = [];
-        block.push(...this._buildDefineWindow());
+        // DefineWindow only on the first redraw after start/clear and then every
+        // fifth one (a late-joining or frame-dropping decoder still gets it within
+        // ~5 s): YouTube's converter treats every DefineWindow as "clear window",
+        // which made captions flash once a second when it was sent every time.
+        this._repaintCount = (this._repaintCount || 0) + 1;
+        if (!this._windowDefined || this._repaintCount % 5 === 1) {
+            block.push(...this._buildDefineWindow());
+            this._windowDefined = true;
+        }
         block.push(CMD.CW0);
         for (let r = 0; r < this._rows; r++) {
             const text = (this._lines[r] || '').padEnd(CEA608_COLUMNS, ' ');
@@ -275,5 +283,6 @@ export class DtvccEncoder {
         this._lastEnqueuedTime = 0;
         this._lines = [];
         this._framesSinceRepaint = 0;
+        this._repaintCount = 0;
     }
 }
