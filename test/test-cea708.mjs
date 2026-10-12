@@ -106,6 +106,19 @@ const nonAsciiPairs = [];
 while (enc.queueLength > 0) nonAsciiPairs.push(enc.drainPair());
 assert(nonAsciiPairs.length === 6 && (nonAsciiPairs[5].cc2 & 0x7F) === 0x3F, `Non-ASCII "café" → "ca" "f?" with ? substitution (got ${nonAsciiPairs.length} pairs)`);
 
+// DefineWindow layout (CEA-708 §8.4.5): anchor point 7 (bottom-centre), relative 50 %/90 %, rows − 1, 32 columns
+{
+    const { DtvccEncoder } = await import('../server/cea708/dtvcc-encoder.js');
+    const d = new DtvccEncoder();
+    d.setRows(2);
+    d.enqueueText('Hi');
+    const bytes = d.drainFrame(60);
+    const i = bytes.indexOf(0x98);
+    const dfw = bytes.slice(i, i + 7);
+    assert(dfw[1] === 0x20 && dfw[2] === (0x80 | 90) && dfw[3] === 50 && dfw[4] === ((7 << 4) | 1) && dfw[5] === 31,
+        `DefineWindow layout: visible, rp 90 %/50 %, anchor 7, 2 rows, 32 cols (got ${dfw.map(b => b.toString(16)).join(' ')})`);
+}
+
 // ─────────────────────────────────────────────
 // 2. CEA-708 CDP Builder Tests
 // ─────────────────────────────────────────────

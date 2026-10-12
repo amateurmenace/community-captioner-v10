@@ -104,30 +104,24 @@ export class DtvccEncoder {
         //   byte 4: row_count(4) | col_count_hi(4)  — row_count is actual-1
         //   byte 5: col_count_lo(8) — total col_count is 10 bits
         //   byte 6: pen_style(3) | window_style(3)
+        // DefineWindow (CEA-708 §8.4.5), six parameter bytes:
+        //   1: reserved(2) visible(1) row_lock(1) column_lock(1) priority(3)
+        //   2: relative_positioning(1) anchor_vertical(7)
+        //   3: anchor_horizontal(8)
+        //   4: anchor_point(4) row_count(4)        — row_count is rows − 1
+        //   5: reserved(2) column_count(6)         — column_count is columns − 1
+        //   6: reserved(2) window_style(3) pen_style(3)
+        // An earlier version put the row count in the anchor-point nibble, so decoders
+        // saw "anchor 1 (top-centre), 1 row" at the left edge: the window was centred on
+        // the screen's left edge (half of it offscreen) and showed one row.
         const block = [];
-        block.push(CMD.DFW | 0); // DefineWindow 0
-
-        // Byte 1: visible=1, priority=0, col_lock=0, row_lock=0
-        // Bits: 0(priority) 0(col_lock) 0(row_lock) 1(visible) 0 0(anchor_id) 0 0
-        block.push(0x00 | (1 << 5) | (0 << 0)); // visible=1, anchor_point=0 (bottom-left)
-
-        // Anchor vertical: bottom of screen (~85% for safe area)
-        block.push(70); // anchor_v
-
-        // Anchor horizontal: left margin
-        block.push(0);  // anchor_h
-
-        // Row count (actual - 1) and column count high bits
-        const rowCount = this._rows - 1;
-        const colCount = 31; // 32 columns (0-indexed)
-        block.push((rowCount << 4) | ((colCount >> 8) & 0x0F));
-
-        // Column count low 8 bits
-        block.push(colCount & 0xFF);
-
-        // Pen style 1 (default), Window style 1 (roll-up)
-        block.push((1 << 3) | 1);
-
+        block.push(CMD.DFW | 0);                         // DefineWindow 0
+        block.push(1 << 5);                              // visible, no locks, priority 0
+        block.push(0x80 | 90);                           // relative positioning, 90 % down
+        block.push(50);                                  // 50 % across
+        block.push((7 << 4) | ((this._rows - 1) & 0x0F)); // anchor 7 = bottom-centre; rows − 1
+        block.push(31 & 0x3F);                           // 32 columns
+        block.push((1 << 3) | 1);                        // window style 1 (608 pop-up), pen style 1
         return block;
     }
 
@@ -170,18 +164,18 @@ export class DtvccEncoder {
         // Set current window 0
         block.push(CMD.CW0);
 
-        // Encode text as G0 characters (basic ASCII 0x20-0x7E)
-        for (let i = 0; i < trimmed.length; i++) {
-            const code = trimmed.charCodeAt(i);
-            if (code >= 0x20 && code <= 0x7E) {
-                block.push(code);
-            } else {
-                block.push(0x20); // Space for non-ASCII
+        // Encode text as G0 characters (basic ASCII 0x20-0x7E), one 32-column row at a
+        // time with a carriage return after each row (the window is 32 columns wide;
+        // anything longer on one row is cut off by the decoder).
+        const rows = wrapRows(trimmed, CEA608_COLUMNS);
+        rows.forEach((row, r) => {
+            for (let i = 0; i < row.length; i++) {
+                const code = row.charCodeAt(i);
+                block.push(code >= 0x20 && code <= 0x7E ? code : 0x20);
             }
-        }
-
-        // Carriage return to roll up
-        block.push(CMD.CR);
+            // Carriage return to roll up (after every row)
+            block.push(CMD.CR);
+        });
 
         // End of text - flush to display
         block.push(CMD.ETX);
