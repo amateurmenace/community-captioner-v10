@@ -18,8 +18,9 @@ const GlobalSettings: React.FC<GlobalSettingsProps> = ({ isOpen, onClose, appSta
   const [apiKeyInput, setApiKeyInput] = useState(appState.apiKey || '');
   const [localUrlInput, setLocalUrlInput] = useState(appState.localServerUrl || 'ws://localhost:9000');
   const [llmUrlInput, setLlmUrlInput] = useState(appState.localLlmUrl || 'http://localhost:11434');
-  const [llmModelInput, setLlmModelInput] = useState(appState.localLlmModel || 'gemma3:4b');
+  const [llmModelInput, setLlmModelInput] = useState(appState.localLlmModel || 'gemma4:e2b');
   const [ollamaModels, setOllamaModels] = useState<string[] | null>(null);
+  const [ollamaCatalog, setOllamaCatalog] = useState<string[]>([]);
 
   const relayHttp = () => {
       const port = window.location.port;
@@ -32,7 +33,7 @@ const GlobalSettings: React.FC<GlobalSettingsProps> = ({ isOpen, onClose, appSta
       if (!isOpen || activeTab !== 'local') return;
       fetch(`${relayHttp()}/api/local/ollama/models?url=${encodeURIComponent(llmUrlInput)}`)
           .then(r => r.json())
-          .then(d => setOllamaModels(d.running ? (d.models || []).map((m: any) => m.name) : []))
+          .then(d => { setOllamaModels(d.running ? (d.models || []).map((m: any) => m.name) : []); if (Array.isArray(d.catalog)) setOllamaCatalog(d.catalog.map((m: any) => m.name)); })
           .catch(() => setOllamaModels([]));
   }, [isOpen, activeTab, llmUrlInput]);
   
@@ -313,10 +314,10 @@ const GlobalSettings: React.FC<GlobalSettingsProps> = ({ isOpen, onClose, appSta
                                 </div>
                                 <div>
                                     <label className="text-xs font-bold text-stone-400 uppercase tracking-wider mb-2 block">Model {ollamaModels === null ? '' : ollamaModels.length ? `(${ollamaModels.length} installed)` : '(Ollama not running)'}</label>
-                                    <input list="ollama-models" type="text" value={llmModelInput} onChange={e => setLlmModelInput(e.target.value)} className="w-full p-3 border border-stone-200 rounded-xl bg-white font-mono text-sm text-stone-800" placeholder="gemma3:4b" />
+                                    <input list="ollama-models" type="text" value={llmModelInput} onChange={e => setLlmModelInput(e.target.value)} className="w-full p-3 border border-stone-200 rounded-xl bg-white font-mono text-sm text-stone-800" placeholder="gemma4:e2b" />
                                     <datalist id="ollama-models">
                                         {(ollamaModels || []).map(m => <option key={m} value={m} />)}
-                                        {['gemma3:4b', 'gemma3:12b', 'qwen3:4b', 'qwen3:8b', 'llama3.1:8b'].filter(m => !(ollamaModels || []).includes(m)).map(m => <option key={m} value={m}>{`${m} (not installed)`}</option>)}
+                                        {ollamaCatalog.filter(m => !(ollamaModels || []).includes(m)).map(m => <option key={m} value={m}>{`${m} (not installed)`}</option>)}
                                     </datalist>
                                 </div>
                             </div>

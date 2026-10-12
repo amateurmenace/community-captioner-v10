@@ -157,7 +157,7 @@ function App() {
         apiKey: localStorage.getItem('cc_api_key') || process.env.API_KEY || '',
         localServerUrl: localStorage.getItem('cc_local_url') || 'ws://localhost:9000',
         localLlmUrl: localStorage.getItem('cc_llm_url') || 'http://localhost:11434',
-        localLlmModel: localStorage.getItem('cc_llm_model') || 'gemma3:4b',
+        localLlmModel: localStorage.getItem('cc_llm_model') || 'gemma4:e2b',
         cloudModel: (localStorage.getItem('cc_cloud_model') as any) || 'transcribe-live',
         
         // Video Studio
@@ -245,14 +245,23 @@ function App() {
   useEffect(() => { interimRef.current = appState.interimText; }, [appState.interimText]);
   useEffect(() => { apiKeyRef.current = appState.apiKey; }, [appState.apiKey]);
 
-  // Handle Translation Key Warning
+  // Translation needs an engine on the relay: the local AI brain or a Gemini key.
+  // Ask the relay rather than assuming Gemini, and explain in-app instead of alerting.
   useEffect(() => {
-      if (appState.targetLanguage !== 'en' && !appState.apiKey) {
-           alert("Translation Feature Warning:\n\nYou have selected a language for translation, but no API Key is configured.\n\nTranslation uses the Google Gemini API. Please enter your key in Settings > Cloud Access.");
-           setGlobalSettingsTab('cloud');
-           setShowGlobalSettings(true);
-           setAppState(p => ({...p, targetLanguage: 'en'})); // Reset to avoid stuck state
-      }
+      if (appState.targetLanguage === 'en') return;
+      let cancelled = false;
+      fetch(`${getRelayHttpUrl()}/api/polisher/status`).then(r => r.json()).then(s => {
+          if (cancelled) return;
+          const available = s.translationAvailable ?? (s.geminiKeySet || !!appState.apiKey);
+          if (!available) {
+              setAppState(p => ({
+                  ...p,
+                  targetLanguage: 'en',
+                  notifications: [...p.notifications, { id: Date.now().toString(), message: 'Translation needs the local AI brain (Connect Local AI) or a Gemini key (Settings → Cloud Access).', type: 'error', timestamp: Date.now() }],
+              }));
+          }
+      }).catch(() => {});
+      return () => { cancelled = true; };
   }, [appState.targetLanguage]);
 
   // Persist the Context Engine dictionary locally and mirror it to the relay (debounced)
@@ -564,16 +573,23 @@ function App() {
             corrected: !!detail
         };
 
-        // Handle Translation - Checks for API Key if not English
+        // Side-by-side translation goes through the relay, which uses the local AI
+        // brain when it is enabled and Gemini otherwise (shared cache with the audience view).
         if (targetLanguageRef.current !== 'en') {
-            const key = apiKeyRef.current;
-            if (key) {
-                translateText(final, targetLanguageRef.current, key).then(t => {
-                     setCaptions(prev => prev.map(c => c.id === newCaption.id ? { ...c, translatedText: t } : c));
-                });
-            } else {
-                console.warn("Translation skipped: No API Key.");
-            }
+            const lang = targetLanguageRef.current;
+            fetch(`${getRelayHttpUrl()}/api/translate`, {
+                method: 'POST', headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ text: final, lang }),
+            }).then(r => r.json()).then(d => {
+                if (d?.ok && d.translated) setCaptions(prev => prev.map(c => c.id === newCaption.id ? { ...c, translatedText: d.translated } : c));
+            }).catch(async () => {
+                // Relay unreachable: fall back to the browser's own Gemini call if a key exists
+                const key = apiKeyRef.current;
+                if (key) {
+                    const t = await translateText(final, lang, key);
+                    setCaptions(prev => prev.map(c => c.id === newCaption.id ? { ...c, translatedText: t } : c));
+                }
+            });
         }
 
         setCaptions(prev => [...prev, newCaption]);

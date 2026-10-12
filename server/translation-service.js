@@ -38,6 +38,29 @@ export function setApiKey(key) {
     geminiApiKey = key || null;
 }
 
+// Local AI brain (Ollama) translates captions when it is enabled — nothing
+// leaves the machine. Loaded lazily to keep module start-up cheap.
+let _localLlm = null;
+async function localLlm() {
+    if (!_localLlm) _localLlm = await import('./local-llm.js');
+    return _localLlm;
+}
+export async function translationAvailable() {
+    if (geminiApiKey) return true;
+    try { return (await localLlm()).brainActive(); } catch { return false; }
+}
+
+async function translateWithLocalBrain(text, targetLang) {
+    const { getBrainConfig, ollamaText } = await localLlm();
+    const b = getBrainConfig();
+    const langName = SUPPORTED_LANGUAGES[targetLang] || targetLang;
+    const r = await ollamaText({
+        url: b.url, model: b.model, maxTokens: 300, timeoutMs: 12000,
+        prompt: `Translate the following live caption from English into ${langName}. Output only the translation, no quotes, no notes.\n\n${text}`,
+    });
+    return r.text.replace(/^["“]|["”]$/g, '').trim();
+}
+
 export function getSupportedLanguages() {
     return Object.entries(SUPPORTED_LANGUAGES).map(([code, name]) => ({ code, name }));
 }
@@ -61,8 +84,8 @@ export function getCacheStats() {
  */
 export async function translateCaption(text, targetLang) {
     if (!text || targetLang === 'en') return text;
-    if (!geminiApiKey) {
-        console.warn('[Translation] No API key set — returning original text');
+    if (!geminiApiKey && !(await translationAvailable())) {
+        console.warn('[Translation] No translation engine (no Gemini key, local brain off) — returning original text');
         return text;
     }
 
@@ -101,6 +124,24 @@ export async function translateCaption(text, targetLang) {
 }
 
 async function doTranslate(text, targetLang, langName, cacheKey) {
+    // Local AI brain first (Fully Local mode): the caption never leaves the machine
+    let useLocal = false;
+    try { useLocal = (await localLlm()).brainActive(); } catch {}
+    if (useLocal) {
+        try {
+            const translated = await translateWithLocalBrain(text, targetLang);
+            if (translated) {
+                cache.set(cacheKey, { translated, ts: Date.now() });
+                if (cache.size > CACHE_MAX) cache.delete(cache.keys().next().value);
+                console.log(`[Translation] local ${targetLang}: "${text.slice(0, 40)}" → "${translated.slice(0, 40)}"`);
+                stats.local = (stats.local || 0) + 1;
+                return translated;
+            }
+        } catch (e) {
+            console.warn(`[Translation] Local brain failed (${e.message})${geminiApiKey ? ' — falling back to Gemini' : ''}`);
+            if (!geminiApiKey) { stats.errors++; return text; }
+        }
+    }
     try {
         const { GoogleGenAI } = await import('@google/genai');
         const ai = new GoogleGenAI({ apiKey: geminiApiKey });

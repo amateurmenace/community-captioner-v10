@@ -1,7 +1,7 @@
 
 // Service for interacting with Local LLMs (Ollama / LM Studio-compatible)
 
-export const DEFAULT_OLLAMA_MODEL = 'gemma3:4b';
+export const DEFAULT_OLLAMA_MODEL = 'gemma4:e2b';
 
 export const checkOllamaConnection = async (url: string = 'http://localhost:11434'): Promise<boolean> => {
     try {

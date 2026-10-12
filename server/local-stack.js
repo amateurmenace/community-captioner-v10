@@ -53,11 +53,18 @@ export const WHISPER_MODELS = [
 // testOllamaExtraction) on 2026-10-12; `tier` drives the recommendation badge.
 // Measured on an M1 Max with the sample agenda (warm model): recall of six known
 // names / time to answer.
+// Measured 2026-10-12 on an M1 Max (32 GB) with the app's own test: the real extraction
+// prompt on a sample Select Board agenda, graded on recall of six known names, warm model.
+// Newer is not automatically better, and Ollama's "-mlx" tags (Apple Silicon builds) were
+// both LARGER downloads and WORSE on this test (gemma4:e4b-mlx 67% vs gemma4:e4b 100%,
+// qwen3.5:4b-mlx 33%), so the catalog sticks to the standard tags on every platform.
 export const OLLAMA_MODELS = [
-    { name: 'gemma3:4b',   label: 'Gemma 3 4B',    sizeGB: 3.3, minRamGB: 8,  tier: 'light', tested: true,  desc: 'Best value: the most accurate on our agenda test (83% of known names) and the fastest (about 8 s). Runs on any 8 GB machine. Start here.' },
-    { name: 'gemma3:12b',  label: 'Gemma 3 12B',   sizeGB: 8.2, minRamGB: 24, tier: 'best',  tested: true,  desc: 'More thorough: found a third more names than the 4B with the same accuracy (83%), but takes ~30 s per agenda. Worth it on a 24 GB+ machine if you prepare dictionaries ahead of meetings.' },
-    { name: 'qwen3:4b',    label: 'Qwen3 4B',      sizeGB: 2.5, minRamGB: 8,  tier: 'light', tested: true,  desc: 'Smallest download. Finds most names (67% on our test, ~14 s) but tends to include meeting times and room numbers.' },
-    { name: 'qwen3:8b',    label: 'Qwen3 8B',      sizeGB: 5.2, minRamGB: 16, tier: 'other', tested: true,  desc: 'Works, but in our test it was no more accurate than Gemma 3 4B and twice as slow (~18 s). Needs 16 GB RAM.' },
+    { name: 'gemma4:e2b',  label: 'Gemma 4 E2B',   sizeGB: 4.6, minRamGB: 8,  tier: 'light', tested: true,  desc: 'Best on every axis in our agenda test: found all six known names (100%), fastest (about 5 s), and runs on an 8 GB machine. Google\'s newest small model. Start here.' },
+    { name: 'gemma4:e4b',  label: 'Gemma 4 E4B',   sizeGB: 6.6, minRamGB: 16, tier: 'best',  tested: true,  desc: 'Same 100% recall and a few more names than E2B, but about 3x slower (~14 s per agenda) and the best of the small models at translating into less common languages (Haitian Creole). Needs 16 GB RAM.' },
+    { name: 'gemma3:4b',   label: 'Gemma 3 4B',    sizeGB: 3.3, minRamGB: 8,  tier: 'light', tested: true,  desc: 'Previous recommendation, still solid: 83% of known names in about 8 s. Smaller download than Gemma 4 E2B; pick it if disk space is tight.' },
+    { name: 'gemma3:12b',  label: 'Gemma 3 12B',   sizeGB: 8.2, minRamGB: 24, tier: 'other', tested: true,  desc: 'Thorough but slow: 83% with a third more names than Gemma 3 4B, ~30 s per agenda. Gemma 4 E4B now does better in half the time.' },
+    { name: 'qwen3.5:4b',  label: 'Qwen 3.5 4B',   sizeGB: 3.3, minRamGB: 8,  tier: 'other', tested: true,  desc: 'Not recommended for the Context Engine: on our test it returned acronyms and last names but missed most people (17%). Fine for translation.' },
+    { name: 'qwen3:4b',    label: 'Qwen3 4B',      sizeGB: 2.5, minRamGB: 8,  tier: 'other', tested: true,  desc: 'Smallest download. Finds most names (67%, ~14 s) but tends to include meeting times and room numbers.' },
     { name: 'llama3.1:8b', label: 'Llama 3.1 8B',  sizeGB: 4.9, minRamGB: 16, tier: 'other', tested: true,  desc: 'Older but dependable (67%, ~30 s). Fine if you already have it installed.' },
 ];
 
@@ -442,7 +449,11 @@ export async function ollamaPull(model, onEvent, baseUrl = 'http://127.0.0.1:114
             const line = buf.slice(0, idx).trim();
             buf = buf.slice(idx + 1);
             if (!line) continue;
-            try { onEvent(JSON.parse(line)); } catch {}
+            let obj;
+            try { obj = JSON.parse(line); } catch { continue; }
+            // Ollama reports failures as {"error": "..."} lines (e.g. unknown model, no disk space)
+            if (obj.error) { onEvent({ status: 'error', error: obj.error }); invalidateProbe(); return; }
+            onEvent(obj);
         }
     }
     invalidateProbe();

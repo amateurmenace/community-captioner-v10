@@ -9,12 +9,13 @@ import { install as installCloudflared } from 'cloudflared';
 import { spawn } from 'child_process';
 import { polish, localPolish, summarize, truncateAtWord, setApiKey as setPolisherApiKey, toggleGemini as togglePolisherGemini, getStatus as getPolisherStatus } from './caption-polisher.js';
 import { feedText as learnerFeedText, setApiKey as setLearnerApiKey, setEnabled as setLearnerEnabled, getSuggestions, acceptSuggestion, dismissSuggestion, setDictionary as setLearnerDictionary, getDictionary as getLearnerDictionary, extractDictionary, generateMishearings, getStatus as getLearnerStatus } from './context-learner.js';
-import { translateCaption, setApiKey as setTranslationApiKey, getSupportedLanguages, getCacheStats as getTranslationStats } from './translation-service.js';
+import { translateCaption, setApiKey as setTranslationApiKey, getSupportedLanguages, getCacheStats as getTranslationStats, translationAvailable } from './translation-service.js';
 import { fetchPage, htmlToText, extractPdfText, extractUploadedText, pdfSupportAvailable, discoverLinks, locateMunicipalitySources, researchMunicipality, extractDictionaryFromUrl, itemsToEntries, getResearchGroups, GEMINI_TEXT_MODEL } from './context-sources.js';
 import { listProfiles, getProfile, saveProfile, deleteProfile } from './profiles.js';
 import { buildCorrectionIndex, applyCorrections } from '../shared/corrections.js';
 import { probeSystem, invalidateProbe, startWhisper, stopWhisper, getWhisperStatus, subscribeLogs, readScript, readHello, ollamaModels, ollamaPull, ollamaStart, WHISPER_MODELS, OLLAMA_MODELS } from './local-stack.js';
 import { getBrainConfig, setBrainConfig, brainActive, extractEntriesWithOllama, testOllamaExtraction } from './local-llm.js';
+import { locateMunicipalityLocally, researchMunicipalityLocally } from './local-wizard.js';
 import { createRequire as _pkgRequire } from 'module';
 // Version: injected by esbuild in packaged builds (package.json isn't in the pkg snapshot), read from disk in dev
 const APP_VERSION = process.env.CC_APP_VERSION || (() => { try { return _pkgRequire(import.meta.url)('../package.json').version; } catch { return 'dev'; } })();
@@ -917,8 +918,22 @@ app.get('/api/checklist', async (req, res) => {
 });
 
 // --- Caption Polisher API ---
-app.get('/api/polisher/status', (req, res) => {
-    res.json(getPolisherStatus());
+app.get('/api/polisher/status', async (req, res) => {
+    res.json({ ...getPolisherStatus(), localBrain: brainActive(), translationAvailable: await translationAvailable() });
+});
+
+// Translate one caption with whatever engine is active (local brain first, then Gemini).
+// Used by the Dashboard's side-by-side translation so the browser never needs its own key.
+app.post('/api/translate', async (req, res) => {
+    const { text, lang } = req.body || {};
+    if (!text || typeof text !== 'string') return res.status(400).json({ ok: false, error: 'text required' });
+    if (!lang || typeof lang !== 'string' || lang === 'en') return res.json({ ok: true, translated: text, engine: 'none' });
+    try {
+        const translated = await translateCaption(text, lang);
+        res.json({ ok: true, translated, engine: brainActive() ? `ollama:${getBrainConfig().model}` : geminiKeyActive ? 'gemini' : 'none', changed: translated !== text });
+    } catch (e) {
+        res.status(500).json({ ok: false, error: e.message });
+    }
 });
 
 app.post('/api/polisher/toggle', (req, res) => {
@@ -1042,7 +1057,7 @@ app.get('/api/local/whisper/logs', (req, res) => {
     send({ type: 'status', ...snapshot, logs: undefined });
     const unsub = subscribeLogs(send);
     const keepAlive = setInterval(() => { try { res.write(': ping\n\n'); } catch {} }, 15000);
-    req.on('close', () => { unsub(); clearInterval(keepAlive); });
+    res.on('close', () => { unsub(); clearInterval(keepAlive); }); // res, not req: req 'close' fires once the request is read (Node 16+)
 });
 
 // Ask any speech server (ours or a third-party one) for its hello message
@@ -1099,7 +1114,10 @@ app.post('/api/local/ollama/pull', async (req, res) => {
     res.flushHeaders?.();
     const send = (ev) => { try { res.write(`data: ${JSON.stringify(ev)}\n\n`); } catch {} };
     const controller = new AbortController();
-    req.on('close', () => controller.abort());
+    // Abort the Ollama download only if the browser actually goes away. (Listening on
+    // req 'close' is wrong: since Node 16 it fires as soon as the request body has
+    // been consumed, which cancelled every download a few seconds in.)
+    res.on('close', () => { if (!res.writableEnded) controller.abort(); });
     try {
         await ollamaPull(model, send, url, controller.signal);
         send({ status: 'done', model });
@@ -1489,9 +1507,9 @@ app.post('/api/context/search-municipality', async (req, res) => {
     const { query } = req.body || {};
     if (!query || typeof query !== 'string') return res.status(400).json({ ok: false, error: 'query required' });
     const apiKey = resolveRequestKey(req);
-    if (!apiKey) return res.status(400).json({ ok: false, error: 'No Gemini API key loaded on the server' });
+    if (!apiKey && !brainActive()) return res.status(400).json({ ok: false, error: 'No AI engine: add a Gemini key or set up the local AI brain' });
     try {
-        const r = await locateMunicipalitySources(query.trim(), apiKey);
+        const r = brainActive() ? await locateMunicipalityLocally(query.trim()) : await locateMunicipalitySources(query.trim(), apiKey);
         if (!r.ok) return res.status(502).json({ ok: false, error: r.error, results: [] });
         res.json({ ok: true, results: r.sources, officialHost: r.officialHost, crawlNote: r.crawlNote });
     } catch (e) {
@@ -1516,11 +1534,25 @@ app.post('/api/context/wizard/research', async (req, res) => {
     const { query, groups, skipSources, domainHint } = req.body || {};
     if (!query || typeof query !== 'string' || !query.trim()) return res.status(400).json({ ok: false, error: 'query required' });
     const apiKey = resolveRequestKey(req);
-    if (!apiKey) return res.status(400).json({ ok: false, error: 'No Gemini API key. Add one in the Context Engine settings.' });
+    if (!apiKey && !brainActive()) return res.status(400).json({ ok: false, error: 'No AI engine. Add a Gemini key in the Context Engine settings, or set up the local AI brain (Connect Local AI).' });
 
     const sse = sseInit(res);
     const start = Date.now();
     const q = query.trim();
+
+    // Fully Local mode: web search + the Ollama brain, no Gemini involved
+    if (brainActive()) {
+        console.log(`[Wizard] Local research started for "${q}" (${getBrainConfig().model})`);
+        try {
+            const r = await researchMunicipalityLocally(q, { emit: sse.emit });
+            console.log(`[Wizard] Local research for "${q}" ${r.ok ? `done: ${r.totalItems} items / ${r.totalEntries} entries` : 'failed'} in ${Date.now() - start}ms`);
+        } catch (e) {
+            console.warn('[Wizard] Local research failed:', e.message);
+            sse.emit('error', { error: e.message });
+        }
+        return sse.end();
+    }
+
     console.log(`[Wizard] Research started for "${q}"`);
 
     try {

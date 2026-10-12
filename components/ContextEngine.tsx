@@ -575,7 +575,7 @@ const ContextEngine: React.FC<ContextEngineProps> = ({
   const handleWizardResearch = async () => {
       const q = searchQuery.trim();
       if (!q) return;
-      if (!hasUsableKey()) { setShowInlineKeyForm(true); return; }
+      if (!hasUsableKey() && !brainOn) { setShowInlineKeyForm(true); return; }
       if (tempKey && tempKey !== getApiKey() && tempKey.length > 10) await saveKey(tempKey);
 
       resetWizard();
@@ -1245,7 +1245,7 @@ const ContextEngine: React.FC<ContextEngineProps> = ({
                                                 <span className="text-[9px] bg-green-200 text-green-800 px-1.5 py-0.5 rounded font-bold uppercase font-mono">{capabilities?.brain?.model}</span>
                                             </div>
                                             <p className="text-[11px] text-green-700 mt-0.5">
-                                                Agenda uploads, pasted text, URL scrapes and Auto-Learn run through Ollama on this machine. {hasUsableKey() ? 'Gemini still powers the Municipality Wizard and translation.' : 'Add a Gemini key to enable the Municipality Wizard and translation.'}
+                                                The Municipality Wizard, agenda uploads, pasted text, URL scrapes, Auto-Learn and audience translation all run through Ollama on this machine. Nothing leaves this computer.
                                             </p>
                                         </>
                                     ) : hasUsableKey() ? (
@@ -1267,10 +1267,10 @@ const ContextEngine: React.FC<ContextEngineProps> = ({
                                         </>
                                     ) : (
                                         <>
-                                            <p className="text-sm font-bold text-amber-900">Add a Gemini API Key to Continue</p>
+                                            <p className="text-sm font-bold text-amber-900">Pick an AI engine to continue</p>
                                             <p className="text-[11px] text-amber-800 mt-0.5">
-                                                The Municipality Wizard, PDF extraction, and Auto-Learn all require a free Gemini key.{' '}
-                                                <a href="https://aistudio.google.com/apikey" target="_blank" rel="noopener" className="underline font-bold">Get one here →</a>
+                                                The Municipality Wizard, PDF extraction, Auto-Learn and translation need either the <strong>local AI brain</strong> (workflow picker → Connect Local AI, runs on this computer) or a free Gemini key.{' '}
+                                                <a href="https://aistudio.google.com/apikey" target="_blank" rel="noopener" className="underline font-bold">Get a key →</a>
                                             </p>
                                         </>
                                     )}
@@ -1312,7 +1312,7 @@ const ContextEngine: React.FC<ContextEngineProps> = ({
                         </div>
 
                         {/* === MUNICIPALITY WIZARD === */}
-                        <div className={`bg-gradient-to-br from-forest-dark to-forest-light rounded-2xl shadow-xl relative overflow-hidden ${!hasUsableKey() ? 'opacity-60' : ''}`}>
+                        <div className={`bg-gradient-to-br from-forest-dark to-forest-light rounded-2xl shadow-xl relative overflow-hidden ${!(hasUsableKey() || brainOn) ? 'opacity-60' : ''}`}>
                             <div className="absolute top-0 right-0 w-32 h-32 bg-white/10 rounded-full -translate-y-1/2 translate-x-1/2 blur-2xl"></div>
                             <div className="p-5 relative z-10">
                                 <div className="flex items-center gap-3 mb-3">
@@ -1322,11 +1322,14 @@ const ContextEngine: React.FC<ContextEngineProps> = ({
                                     <div className="flex-1 min-w-0">
                                         <div className="flex items-center gap-2">
                                             <h4 className="font-bold text-base text-white">Municipality Wizard</h4>
-                                            {!hasUsableKey() && (
-                                                <span className="text-[9px] bg-amber-400 text-amber-900 px-1.5 py-0.5 rounded font-bold uppercase">Needs API Key</span>
+                                            {!(hasUsableKey() || brainOn) && (
+                                                <span className="text-[9px] bg-amber-400 text-amber-900 px-1.5 py-0.5 rounded font-bold uppercase">Needs an AI engine</span>
+                                            )}
+                                            {brainOn && (
+                                                <span className="text-[9px] bg-white/20 text-white px-1.5 py-0.5 rounded font-bold uppercase font-mono">{capabilities?.brain?.model}</span>
                                             )}
                                         </div>
-                                        <p className="text-sage-100 text-[10px] opacity-80">Researches your town with Google Search: officials, boards, departments, places and acronyms → correction rules</p>
+                                        <p className="text-sage-100 text-[10px] opacity-80">{brainOn ? 'Searches the web and reads the official pages with your local AI: officials, boards, departments, places and acronyms → correction rules' : 'Researches your town with Google Search: officials, boards, departments, places and acronyms → correction rules'}</p>
                                     </div>
                                     {wizardState !== 'idle' && (
                                         <button onClick={resetWizard} title="Start over" className="text-white/70 hover:text-white p-1.5 rounded-lg hover:bg-white/10"><RotateCcw size={14} /></button>
@@ -1337,14 +1340,14 @@ const ContextEngine: React.FC<ContextEngineProps> = ({
                                     <input
                                         value={searchQuery}
                                         onChange={e => setSearchQuery(e.target.value)}
-                                        onKeyDown={e => e.key === 'Enter' && wizardState !== 'running' && searchQuery.trim() && hasUsableKey() && handleWizardResearch()}
-                                        placeholder={hasUsableKey() ? "e.g. Brookline, MA" : "Add an API key above to enable the wizard"}
+                                        onKeyDown={e => e.key === 'Enter' && wizardState !== 'running' && searchQuery.trim() && (hasUsableKey() || brainOn) && handleWizardResearch()}
+                                        placeholder={(hasUsableKey() || brainOn) ? "e.g. Brookline, MA" : "Add an API key above (or set up the local AI brain) to enable the wizard"}
                                         className="flex-1 px-4 py-2.5 rounded-xl text-sm bg-white/95 text-forest-dark placeholder:text-stone-400 outline-none focus:ring-2 focus:ring-white/50 disabled:bg-white/60"
-                                        disabled={wizardState === 'running' || !hasUsableKey()}
+                                        disabled={wizardState === 'running' || !(hasUsableKey() || brainOn)}
                                     />
                                     <button
                                         onClick={handleWizardResearch}
-                                        disabled={wizardState === 'running' || !searchQuery.trim() || !hasUsableKey()}
+                                        disabled={wizardState === 'running' || !searchQuery.trim() || !(hasUsableKey() || brainOn)}
                                         className="px-4 py-2.5 bg-white text-forest-dark rounded-xl font-bold text-sm hover:bg-sage-50 transition-colors disabled:opacity-50 flex items-center gap-1.5"
                                     >
                                         {wizardState === 'running' ? <Loader2 size={14} className="animate-spin" /> : <Search size={14} />}

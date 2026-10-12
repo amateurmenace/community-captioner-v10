@@ -98,10 +98,10 @@ const LocalSetup: React.FC<LocalSetupProps> = ({ onBack, onComplete, initialWhis
 
     // ---- brain (Ollama) ----
     const [llmUrl, setLlmUrl] = useState(initialLlmUrl || 'http://127.0.0.1:11434');
-    const [llmModel, setLlmModel] = useState(initialLlmModel || 'gemma3:4b');
+    const [llmModel, setLlmModel] = useState(initialLlmModel || 'gemma4:e2b');
     const [ollama, setOllama] = useState<ProbeInfo['ollama'] | null>(null);
     const [ollamaBusy, setOllamaBusy] = useState<string | null>(null);
-    const [pull, setPull] = useState<{ model: string; status: string; completed?: number; total?: number; done?: boolean; error?: string } | null>(null);
+    const [pull, setPull] = useState<{ model: string; status: string; completed?: number; total?: number; done?: boolean; error?: string; startedAt?: number } | null>(null);
     const [llmTest, setLlmTest] = useState<BrainTest | null>(null);
     const [skipBrain, setSkipBrain] = useState(false);
     const [finishing, setFinishing] = useState(false);
@@ -280,18 +280,37 @@ const LocalSetup: React.FC<LocalSetupProps> = ({ onBack, onComplete, initialWhis
         setOllamaBusy(null);
     };
     const pullModel = async (name: string) => {
-        setPull({ model: name, status: 'starting…' });
+        const startedAt = Date.now();
+        setLlmModel(name);
+        setLlmTest(null);
+        setPull({ model: name, status: 'Contacting Ollama…', startedAt });
         setOllamaBusy('pull');
+        let failed: string | null = null;
         try {
             const res = await fetch(`${getRelayUrl()}/api/local/ollama/pull`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ model: name, url: llmUrl }) });
+            if (!res.ok) {
+                let msg = `HTTP ${res.status}`;
+                try { const j = await res.json(); msg = j.error || msg; } catch {}
+                throw new Error(msg);
+            }
+            let sawDone = false;
             await readSse(res, (ev) => {
-                if (ev.status === 'error') setPull({ model: name, status: 'failed', error: ev.error });
-                else if (ev.status === 'done') setPull({ model: name, status: 'done', done: true });
-                else setPull({ model: name, status: ev.status || '', completed: ev.completed, total: ev.total });
+                if (ev.status === 'error') { failed = ev.error || 'Download failed'; setPull({ model: name, status: 'failed', error: failed, startedAt }); }
+                else if (ev.status === 'done') { sawDone = true; setPull({ model: name, status: 'done', done: true, startedAt }); }
+                else {
+                    const total = typeof ev.total === 'number' ? ev.total : undefined;
+                    const completed = typeof ev.completed === 'number' ? ev.completed : undefined;
+                    const label = /pulling manifest/i.test(ev.status || '') ? 'Looking up the model…'
+                        : /pulling [a-f0-9]/i.test(ev.status || '') ? 'Downloading'
+                        : /verifying/i.test(ev.status || '') ? 'Verifying download…'
+                        : /writing manifest/i.test(ev.status || '') ? 'Finishing up…'
+                        : /success/i.test(ev.status || '') ? 'Downloaded' : (ev.status || 'Working…');
+                    setPull(prev => ({ model: name, status: label, completed, total: total ?? prev?.total, startedAt, error: undefined, done: /success/i.test(ev.status || '') }));
+                }
             });
-            setLlmModel(name);
+            if (!sawDone && !failed) setPull({ model: name, status: 'done', done: true, startedAt });
             await refreshOllama();
-        } catch (e) { setPull({ model: name, status: 'failed', error: (e as Error).message }); }
+        } catch (e) { failed = (e as Error).message; setPull({ model: name, status: 'failed', error: failed, startedAt }); }
         setOllamaBusy(null);
     };
     const testModel = async () => {
@@ -317,10 +336,11 @@ const LocalSetup: React.FC<LocalSetupProps> = ({ onBack, onComplete, initialWhis
 
     const installedNames = useMemo(() => new Set((ollama?.models || []).map(m => m.name)), [ollama]);
     const ramFits = (minRamGB: number) => !info || !minRamGB || info.memoryGB >= minRamGB;
-    // Recommend from measured results: Gemma 3 4B wins the app's own agenda test on
-    // accuracy and speed (Gemma 3 12B found more names but is ~4x slower, which
-    // hurts Auto-Learn's 30-second cycle), so it is the pick for every machine.
-    const recommendedLlm = 'gemma3:4b';
+    // Recommend from measured results (see OLLAMA_MODELS in server/local-stack.js):
+    // Gemma 4 E2B found every known name on the app's own agenda test in ~5 s and
+    // runs on 8 GB, so it is the pick for every machine. Gemma 4 E4B is the
+    // "more thorough" option for 16 GB+ machines.
+    const recommendedLlm = 'gemma4:e2b';
     const osName = info?.platform === 'darwin' ? 'macOS' : info?.platform === 'win32' ? 'Windows' : info?.platform === 'linux' ? 'Linux' : '';
     const speechDone = manualMode ? manualCheck.state === 'ok' : serverReady;
     const brainDone = skipBrain || (!!ollama?.running && installedNames.has(llmModel));
@@ -621,7 +641,7 @@ const LocalSetup: React.FC<LocalSetupProps> = ({ onBack, onComplete, initialWhis
                         <div className="flex items-start justify-between gap-4">
                             <div>
                                 <h3 className="font-bold text-lg text-forest-dark">AI brain (optional)</h3>
-                                <p className="text-xs text-stone-500 max-w-2xl">A small language model, run by the free <strong>Ollama</strong> app on this computer. The Context Engine uses it to pull names, boards, places and acronyms out of agendas you upload or paste, and from the live transcript (Auto-Learn), so none of that text goes to Gemini. The Municipality Wizard, translation and caption polish still need a Gemini key.</p>
+                                <p className="text-xs text-stone-500 max-w-2xl">A small language model, run by the free <strong>Ollama</strong> app on this computer. With it, everything the Context Engine does runs here: the Municipality Wizard (web search + your local model instead of Google's AI), agendas you upload or paste, the live transcript (Auto-Learn), and audience translation into 15 languages. Caption text never leaves this computer, and Gemini is not needed for anything.</p>
                             </div>
                             <label className="flex items-center gap-2 text-xs font-bold text-stone-600 shrink-0 bg-stone-50 border border-stone-200 px-3 py-2 rounded-lg"><input type="checkbox" checked={skipBrain} onChange={e => setSkipBrain(e.target.checked)} className="accent-forest-dark" /> Skip for now</label>
                         </div>
@@ -634,7 +654,7 @@ const LocalSetup: React.FC<LocalSetupProps> = ({ onBack, onComplete, initialWhis
                                         <p className="text-xs font-bold text-stone-500 uppercase tracking-wider">1. Choose a model</p>
                                         <p className="text-[11px] text-stone-400">This machine has {info.memoryGB} GB RAM</p>
                                     </div>
-                                    <p className="text-xs text-stone-600">Rule of thumb: <strong>4B</strong> models need about 8 GB of RAM and answer in seconds; <strong>12B</strong> needs 24 GB and is slower but better on unusual names. Bigger is not automatically better: on the app's own agenda test, Gemma 3 4B beat the 8B models on both accuracy and speed. "Tested with the app" means we verified it with that test; use the test below for anything else.</p>
+                                    <p className="text-xs text-stone-600">Rule of thumb: the small <strong>2B–4B</strong> models need about 8 GB of RAM and answer in seconds; <strong>E4B</strong> and <strong>8B+</strong> need 16 GB or more and are slower. Bigger and newer are not automatically better: on the app's own agenda test the new Gemma 4 E2B beat every larger model, while Qwen 3.5 missed most people's names and the Apple "MLX" builds were both larger and less accurate. "Tested with the app" means we verified it with that test; use the test below for anything else.</p>
                                     <div className="grid grid-cols-1 md:grid-cols-2 gap-2">
                                         {[...info.ollamaModels, ...(ollama?.models || []).filter(m => !info.ollamaModels.some(c => c.name === m.name)).map(m => ({ name: m.name, label: m.name, sizeGB: m.sizeGB || 0, minRamGB: 0, tier: 'other' as const, tested: false, desc: `Already installed${m.parameterSize ? ` · ${m.parameterSize}` : ''}. Not in our tested list; use the test below to check it.` }))].map(m => {
                                             const installed = installedNames.has(m.name);
@@ -643,8 +663,8 @@ const LocalSetup: React.FC<LocalSetupProps> = ({ onBack, onComplete, initialWhis
                                             const rec = m.name === recommendedLlm;
                                             const pulling = pull?.model === m.name && !pull.done && !pull.error;
                                             return (
-                                                <button key={m.name} onClick={() => { setLlmModel(m.name); setLlmTest(null); }}
-                                                    className={`text-left p-3 rounded-xl border-2 transition-all ${sel ? 'border-sage-500 bg-sage-50' : fits ? 'border-stone-200 bg-white hover:border-sage-300' : 'border-stone-100 bg-stone-50 opacity-70'}`}>
+                                                <button key={m.name} onClick={() => { setLlmModel(m.name); setLlmTest(null); }} disabled={ollamaBusy === 'pull'}
+                                                    className={`text-left p-3 rounded-xl border-2 transition-all disabled:cursor-wait ${sel ? 'border-sage-500 bg-sage-50' : fits ? 'border-stone-200 bg-white hover:border-sage-300' : 'border-stone-100 bg-stone-50 opacity-70'}`}>
                                                     <div className="flex items-center gap-2 flex-wrap">
                                                         <span className="text-sm font-bold text-forest-dark">{m.label}</span>
                                                         {rec && fits && <Pill ok>Recommended</Pill>}
@@ -709,18 +729,41 @@ const LocalSetup: React.FC<LocalSetupProps> = ({ onBack, onComplete, initialWhis
                                     <div className="rounded-xl border border-stone-200 bg-white p-4 space-y-3">
                                         {!ollama?.running ? (
                                             <p className="text-xs text-stone-500 flex items-center gap-2"><Info size={14} className="shrink-0" /> Once Ollama is running, the app downloads <strong className="font-mono">{llmModel}</strong> for you (no commands) and tests it on a sample agenda.</p>
+                                        ) : pull && pull.model === llmModel && !pull.done && !pull.error ? (
+                                            <div className="space-y-2">
+                                                <div className="flex items-center gap-3">
+                                                    <Loader2 size={22} className="animate-spin text-forest-dark shrink-0" />
+                                                    <div className="flex-1 min-w-0">
+                                                        <p className="text-sm font-bold text-forest-dark">Downloading {llmModel}</p>
+                                                        <p className="text-xs text-stone-600">{pull.status}{pull.total ? ` — ${((pull.completed || 0) / 1e9).toFixed(2)} of ${(pull.total / 1e9).toFixed(2)} GB` : ''}{pull.startedAt && pull.completed && pull.total && (Date.now() - pull.startedAt) > 3000 ? ` · ${(pull.completed / 1e6 / ((Date.now() - pull.startedAt) / 1000)).toFixed(0)} MB/s · about ${Math.max(1, Math.round(((pull.total - pull.completed) / (pull.completed / ((Date.now() - pull.startedAt) / 1000))) / 60))} min left` : ''}</p>
+                                                    </div>
+                                                    <span className="text-lg font-mono font-bold text-forest-dark shrink-0">{pull.total ? `${Math.round(((pull.completed || 0) / pull.total) * 100)}%` : ''}</span>
+                                                </div>
+                                                <div className="w-full bg-stone-200 rounded-full h-2.5 overflow-hidden"><div className={`h-2.5 rounded-full bg-sage-500 ${pull.total ? '' : 'animate-pulse w-1/4'}`} style={pull.total ? { width: `${Math.round(((pull.completed || 0) / pull.total) * 100)}%`, transition: 'width 500ms linear' } : undefined} /></div>
+                                                <p className="text-[11px] text-stone-400">One-time download; Ollama keeps the model. You can stay on this page or come back later — the download continues in Ollama.</p>
+                                            </div>
+                                        ) : pull && pull.model === llmModel && pull.error ? (
+                                            <div className="flex items-start gap-3">
+                                                <XCircle size={22} className="text-red-500 shrink-0" />
+                                                <div className="flex-1 text-xs">
+                                                    <p className="text-sm font-bold text-red-700">Download of {llmModel} failed</p>
+                                                    <p className="text-red-600">{pull.error}</p>
+                                                    <p className="text-stone-500 mt-1">Check that Ollama is running and that you have {(info.ollamaModels.find(m => m.name === llmModel)?.sizeGB || 1) * 2} GB of free disk space, then try again. Or in a terminal: <code className="font-mono">ollama pull {llmModel}</code></p>
+                                                </div>
+                                                <button onClick={() => pullModel(llmModel)} className="bg-forest-dark text-white px-4 py-2 rounded-lg text-sm font-bold hover:bg-forest-light flex items-center gap-2"><RefreshCw size={14} /> Try again</button>
+                                            </div>
                                         ) : !installedNames.has(llmModel) ? (
                                             <div className="flex items-center gap-3">
                                                 <div className="flex-1 text-xs text-stone-600">
                                                     <p className="font-bold text-forest-dark">{llmModel} is not downloaded yet</p>
-                                                    <p>{(info.ollamaModels.find(m => m.name === llmModel)?.sizeGB || 0) ? `${info.ollamaModels.find(m => m.name === llmModel)!.sizeGB} GB, ` : ''}one-time download; the model is kept by Ollama. Or in a terminal: <code className="font-mono">ollama pull {llmModel}</code></p>
+                                                    <p>{(info.ollamaModels.find(m => m.name === llmModel)?.sizeGB || 0) ? `${info.ollamaModels.find(m => m.name === llmModel)!.sizeGB} GB, ` : ''}one-time download; the model is kept by Ollama. Progress appears right here.</p>
                                                 </div>
-                                                <button onClick={() => pullModel(llmModel)} disabled={!!ollamaBusy} className="bg-forest-dark text-white px-4 py-2 rounded-lg text-sm font-bold hover:bg-forest-light disabled:opacity-40 flex items-center gap-2">{ollamaBusy === 'pull' ? <Loader2 size={14} className="animate-spin" /> : <Download size={14} />} Download</button>
+                                                <button onClick={() => pullModel(llmModel)} disabled={!!ollamaBusy} className="bg-forest-dark text-white px-4 py-2 rounded-lg text-sm font-bold hover:bg-forest-light disabled:opacity-40 flex items-center gap-2"><Download size={14} /> Download {llmModel}</button>
                                             </div>
                                         ) : (
                                             <div className="flex items-center gap-3">
                                                 <div className="flex-1 text-xs text-stone-600">
-                                                    <p className="font-bold text-forest-dark flex items-center gap-1"><CheckCircle size={12} className="text-green-600" /> {llmModel} is installed</p>
+                                                    <p className="font-bold text-forest-dark flex items-center gap-1"><CheckCircle size={12} className="text-green-600" /> {llmModel} is {pull?.model === llmModel && pull.done ? 'downloaded and ready' : 'installed'}</p>
                                                     <p>Run the app's real agenda-extraction test to confirm it answers correctly and quickly on this machine.</p>
                                                 </div>
                                                 <button onClick={testModel} disabled={!!ollamaBusy} className="bg-sage-500 text-white px-4 py-2 rounded-lg text-sm font-bold hover:bg-sage-600 disabled:opacity-40 flex items-center gap-2">{ollamaBusy === 'test' ? <Loader2 size={14} className="animate-spin" /> : <Zap size={14} />} {ollamaBusy === 'test' ? 'Testing…' : 'Test with the app'}</button>
@@ -759,7 +802,7 @@ const LocalSetup: React.FC<LocalSetupProps> = ({ onBack, onComplete, initialWhis
                             </div>
                             <div className={`p-4 rounded-xl border ${skipBrain ? 'border-stone-200 bg-stone-50' : 'border-green-200 bg-green-50'}`}>
                                 <p className="text-sm font-bold text-forest-dark flex items-center gap-2"><Brain size={16} /> AI brain {skipBrain ? <span className="text-[10px] font-bold text-stone-400">skipped</span> : <CheckCircle size={14} className="text-green-600" />}</p>
-                                <p className="text-xs text-stone-600 mt-1">{skipBrain ? 'Mode: Local speech. The Context Engine keeps using Gemini when a key is set, otherwise basic extraction.' : `Mode: Fully local. Ollama ${llmModel} at ${llmUrl}.`}</p>
+                                <p className="text-xs text-stone-600 mt-1">{skipBrain ? 'Mode: Local speech. The Context Engine keeps using Gemini when a key is set, otherwise basic extraction.' : `Mode: Fully local. ${llmModel} handles the Municipality Wizard, agenda extraction, Auto-Learn and audience translation on this machine; Gemini caption polish is switched off.`}</p>
                             </div>
                         </div>
                         <div className="p-3 rounded-xl bg-stone-50 border border-stone-200 text-xs text-stone-600 flex items-start gap-2"><Info size={14} className="mt-0.5 shrink-0" /><span>The Dashboard shows a <strong>Local</strong> pill while captioning: green when the speech server is answering, red if it drops. Click it to come back here.</span></div>

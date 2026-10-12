@@ -19,7 +19,7 @@ import { itemsToEntries } from './context-sources.js';
 import { DATA_DIR } from './context-learner.js';
 
 const DEFAULT_URL = 'http://127.0.0.1:11434';
-let brain = { enabled: false, url: DEFAULT_URL, model: 'gemma3:4b' };
+let brain = { enabled: false, url: DEFAULT_URL, model: 'gemma4:e2b' };
 let loaded = false;
 
 function brainFile() { return join(DATA_DIR, 'local', 'brain.json'); }
@@ -96,6 +96,18 @@ export async function ollamaJson({ url = DEFAULT_URL, model, prompt, maxTokens =
         tokensPerSec: data.eval_count && data.eval_duration ? +(data.eval_count / (data.eval_duration / 1e9)).toFixed(1) : null,
         evalTokens: data.eval_count || 0,
     };
+}
+
+/** Plain-text answer from Ollama (translation etc.). Thinking models answer directly. */
+export async function ollamaText({ url = DEFAULT_URL, model, prompt, maxTokens = 400, timeoutMs = 20000, temperature = 0.1 }) {
+    const caps = await modelCapabilities(model, url);
+    const body = { model, prompt, stream: false, options: { temperature, num_predict: maxTokens, num_ctx: 4096 } };
+    if (caps.includes('thinking')) body.think = false;
+    const t0 = Date.now();
+    const res = await fetch(`${url}/api/generate`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body), signal: AbortSignal.timeout(timeoutMs) });
+    if (!res.ok) throw new Error(`Ollama HTTP ${res.status}: ${(await res.text()).slice(0, 200)}`);
+    const data = await res.json();
+    return { text: stripThinking(data.response).trim(), latencyMs: Date.now() - t0 };
 }
 
 const EXTRACT_PROMPT = (chunk, hint) => `You prepare a correction dictionary for live closed captions of ${hint || 'a public meeting'}.

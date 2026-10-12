@@ -47,7 +47,7 @@ interface DashboardProps {
 const MODE_INFO: Record<OperationMode, { label: string; desc: string }> = {
     balanced:    { label: 'Browser',       desc: 'Web Speech API — Chrome/Edge send audio to Google\'s speech service. Free, zero setup.' },
     cloud:       { label: 'Cloud',         desc: 'Gemini Transcribe Live. Best accuracy on names; needs a Gemini API key.' },
-    local:       { label: 'Local speech',  desc: 'Whisper running on this machine. Audio never leaves the computer. Context Engine still uses Gemini if a key is set.' },
+    local:       { label: 'Local speech',  desc: 'Whisper running on this machine. Audio never leaves the computer. The Context Engine uses the local AI brain if you set one up, otherwise Gemini.' },
     fully_local: { label: 'Fully local',   desc: 'Local speech + Ollama for the Context Engine. Works with no internet at all.' },
     resilience:  { label: 'Resilience',    desc: 'Browser speech with aggressive automatic retry when the network drops.' },
 };

@@ -7,8 +7,8 @@ export const RELEASES_URL = `${GITHUB_REPO_URL}/releases/latest`;
 // Direct download links to the newest build for each platform.
 // Releases are tagged by product version (v10.x); asset names carry the app
 // version from package.json. Both assets live on the "Community Captioner v10.1" release.
-// Mac: app 6.5.0 — notarized, bundled DeckLink addon + guided local speech setup.
+// Mac: app 6.6.0 — notarized, bundled DeckLink addon, guided local speech + fully local AI brain.
 // Windows: app 6.4.0 — built on Windows with the DeckLink addon bundled
-//          (rebuild on a Windows machine to pick up 6.5.0, see WINDOWS-HANDOFF.md).
-export const MAC_DOWNLOAD_URL = `${GITHUB_REPO_URL}/releases/download/v10.1/Community-Captioner-6.5.0-mac-arm64.zip`;
+//          (rebuild on a Windows machine to pick up 6.6.0, see WINDOWS-HANDOFF.md).
+export const MAC_DOWNLOAD_URL = `${GITHUB_REPO_URL}/releases/download/v10.1/Community-Captioner-6.6.0-mac-arm64.zip`;
 export const WINDOWS_DOWNLOAD_URL = `${GITHUB_REPO_URL}/releases/download/v10.1/Community-Captioner-6.4.0-windows-x64.zip`;

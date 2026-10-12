@@ -49,7 +49,7 @@ const AudienceView: React.FC<AudienceViewProps> = ({ onBack }) => {
         };
         fetch(`${getApiBase()}/api/polisher/status`)
             .then(r => r.json())
-            .then(data => setTranslationAvailable(!!data.geminiKeySet))
+            .then(data => setTranslationAvailable(!!(data.translationAvailable ?? data.geminiKeySet)))
             .catch(() => setTranslationAvailable(false));
     }, []);
 
@@ -223,7 +223,7 @@ const AudienceView: React.FC<AudienceViewProps> = ({ onBack }) => {
                 <div className={`${borderColor} border-b ${darkMode ? 'bg-stone-800/80' : 'bg-stone-50'} backdrop-blur`}>
                     {translationAvailable === false && (
                         <div className={`mx-3 mt-3 p-2.5 rounded-lg text-xs ${darkMode ? 'bg-amber-900/40 text-amber-300 border border-amber-700/50' : 'bg-amber-50 text-amber-700 border border-amber-200'}`}>
-                            Translation requires a Gemini API key. The broadcaster can set one in <strong>Context Engine &rarr; Settings</strong>.
+                            Translation is not switched on for this broadcast. The broadcaster can enable it with the local AI brain (<strong>Connect Local AI</strong>) or a Gemini key in <strong>Context Engine &rarr; Settings</strong>.
                             <a href="https://aistudio.google.com/apikey" target="_blank" rel="noopener noreferrer" className="underline ml-1">Get a free key</a>
                         </div>
                     )}

@@ -6,6 +6,8 @@
  *   Layer 2: Gemini AI polish (optional, ~300ms, requires API key)
  */
 
+import { brainActive } from './local-llm.js';
+
 // --- Layer 1: Local Rules ---
 
 // Common STT split-contraction fixes
@@ -121,7 +123,7 @@ const POLISH_PROMPT = `Fix grammar, punctuation, and capitalization only. Do not
  * @returns {Promise<string>} Polished text
  */
 async function geminiPolish(text) {
-    if (!geminiApiKey || !geminiEnabled) return text;
+    if (!geminiApiKey || !geminiEnabled || brainActive()) return text;
     if (text.length < 5) return text;
 
     try {
@@ -167,7 +169,7 @@ async function geminiPolish(text) {
  * @returns {Promise<string>} Condensed text
  */
 async function geminiSummarize(text, maxChars) {
-    if (!geminiApiKey || !geminiEnabled) return truncateAtWord(text, maxChars);
+    if (!geminiApiKey || !geminiEnabled || brainActive()) return truncateAtWord(text, maxChars);
     if (text.length <= maxChars) return text;
 
     try {
@@ -226,8 +228,9 @@ export async function polish(text) {
     // Layer 1: Local rules (always)
     let result = localPolish(text);
 
-    // Layer 2: Gemini (optional)
-    if (geminiApiKey && geminiEnabled) {
+    // Layer 2: Gemini (optional). Skipped while the local AI brain is active so
+    // that Fully Local mode never sends caption text off the machine.
+    if (geminiApiKey && geminiEnabled && !brainActive()) {
         result = await geminiPolish(result);
     }
 
@@ -255,10 +258,12 @@ export function toggleGemini() {
  * Get polisher status.
  */
 export function getStatus() {
+    const local = brainActive();
     return {
         localEnabled: true,
-        geminiEnabled: geminiEnabled,
+        geminiEnabled: geminiEnabled && !local,
         geminiKeySet: !!geminiApiKey,
+        geminiBypassed: local && !!geminiApiKey && geminiEnabled,
     };
 }
 
