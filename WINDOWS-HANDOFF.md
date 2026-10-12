@@ -1,6 +1,6 @@
 # Windows release handoff
 
-> **Current task: bring Windows to 6.10.0** — read the "v6.8.0 update" section (still valid) and then the "v6.10.0 update" section at the very end, which adds what changed since. The v6.4.0 brief below still describes the DeckLink SDK, addon build and packaged-exe probes, which have not changed.
+> **Current task: bring Windows to 6.10.6** — read the "v6.8.0 update" and "v6.10.0 update" sections (still valid), then the "v6.10.6 update" section at the very end, which adds what changed since 6.10.0. The v6.4.0 brief below still describes the DeckLink SDK, addon build and packaged-exe probes, which have not changed.
 
 # v6.4.0 brief (DeckLink addon + packaging)
 
@@ -233,3 +233,35 @@ Publish by replacing the 6.4.0 Windows asset on the `v10.1` release with the 6.1
 ## Report back
 
 Zip size and SHA256, CPU/GPU, which Whisper backend ran, the prerecorded speed (× real time) for your test clip, whether the auto-start, the first-run display, the stale-server replace and the YouTube path worked, and every line of this brief that was wrong.
+
+
+# v6.10.6 update — parity with the Mac build (read after the v6.10.0 section)
+
+Everything below shipped on the Mac between 6.10.0 and 6.10.6 (commits after 67f54a4 on `main`, through 0478121). Still no native changes. Build, verify and publish as in the earlier sections; the zip is `build\Community-Captioner-6.10.6-windows-x64.zip`.
+
+## What changed and what to verify on Windows
+
+| Area | Where | Verify on Windows |
+|---|---|---|
+| Browser speech (Balanced / Resilience) | `App.tsx`, `components/GlobalSettings.tsx` ("Spoken language"), `types.ts` `BrowserEngineInfo` | The recognizer language is `localStorage cc_speech_lang` (default en-US), no longer the translation picker. In Chrome and Edge: press Start, the header pill must go "waiting for text…" → "listening" when you speak. Pick Español in the translation picker: English speech must still be recognised. Unplug the network and press Start: pill "no text" with the network message. |
+| Start failing silently | `App.tsx` `startRecording` catch; mic fallback | With the browser's microphone permission blocked for the site: a red "Problem" banner must explain it (Windows: Settings → Privacy & security → Microphone must allow desktop apps / the browser). Pick a device in the bottom bar, then run the app on another profile/machine where that device id does not exist: it must fall back to the default input and say so. |
+| Diagnostics | `utils/diagnostics.ts`, Help & Settings → Diagnostics | Run checks: micPermission, audioInputs, relay, local speech server and the relay log lines appear; Copy report works. Fix any Windows-only wording. |
+| Session log | Dashboard "Log" button, `utils/diagnostics.ts` (localStorage `cc_diag_log`) | Entries appear for session start, microphone, engines, relay; persist after a page reload; Download produces a .txt; "Relay log" opens the file. |
+| Relay log | `server/relay.js` top: console wrap → ring buffer + `DATA_DIR\logs\relay.log` (5 MB cap); `GET /api/logs?n=`, `GET /api/logs/download` | File lands at `%USERPROFILE%\.community-captioner\data\logs\relay.log`; both endpoints answer from the packaged exe; the Help guide / Diagnostics text names the Windows path correctly (fix if it only says `~/.community-captioner`). |
+| Dashboard scrolling | `components/Dashboard.tsx` (`min-h-0` chain, flex-row columns) | Produce 40+ captions (speak, or paste text via Caption Injection): both columns must scroll; with a translation language selected the right column follows. |
+| Side-by-side translation | `server/translation-service.js` timeouts (4 s audience, 10 s Dashboard), `translationFailed` | With a Gemini key: lines translate; a line that times out shows grey "not translated" rather than English pretending to be Spanish. |
+| Landing page | `components/LandingPage.tsx` + keyframes in `index.css` | Visual check: animated diagrams (routing, pipeline, utterance, phonetic keys, SDI conveyor) run smoothly in Edge; the footer has three links. |
+| Help guide | `components/HelpGuide.tsx` | Read it on Windows and correct anything Mac-specific (paths, "System Settings → Privacy & Security" → the Windows equivalent). |
+
+Packaged-exe probes to add to the earlier ones:
+
+```powershell
+curl.exe -s "http://localhost:8090/api/logs?n=5"            # {"ok":true,"lines":[...],"file":"C:\Users\...\.community-captioner\data\logs\relay.log"}
+curl.exe -s -o relay.log -w "%{http_code}`n" http://localhost:8090/api/logs/download   # 200
+```
+
+Publish by replacing the 6.4.0 Windows asset on `v10.1` with the 6.10.6 zip, update the notes (intro line, Downloads row, the "Windows zip is still 6.4.0" line), point `WINDOWS_DOWNLOAD_URL` in `utils/appLinks.ts` at it, note Windows-specific fixes in `CLAUDE.md` and the Help guide, commit small, push.
+
+## Report back
+
+Zip size and SHA256, CPU/GPU, browser(s) tested, Whisper backend, prerecorded speed, and which of these worked: browser-speech pill, spoken-language setting, mic-blocked banner, device fallback, Diagnostics, session log persistence, relay log file and endpoints, scrolling, translation tags, auto-start, stale-server replace, YouTube path, Ollama download panel. Plus every line of the brief that was wrong.
