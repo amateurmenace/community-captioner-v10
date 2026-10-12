@@ -58,6 +58,7 @@ public:
     std::mutex m;
     IDeckLinkInput* input = nullptr;
     std::string stillPath;
+    long lineHist[64] = {};
     long frames = 0, noSignal = 0, vancFrames = 0, cdpPackets = 0, otherAnc = 0, formatChanges = 0;
     double sumY = 0; long ySamples = 0;
     int width = 0, height = 0; std::string mode = "1080p29.97 (initial)";
@@ -174,6 +175,7 @@ public:
                     while (it->Next(&pkt) == S_OK) {
                         any = true;
                         if (pkt->GetDID() == 0x61 && pkt->GetSDID() == 0x01) {
+                            { uint32_t ln = pkt->GetLineNumber(); lineHist[ln < 64 ? ln : 63]++; }
                             const void* data = nullptr; uint32_t size = 0;
                             if (pkt->GetBytes(bmdAncillaryPacketFormatUInt8, &data, &size) == S_OK && data) ParseCdp((const uint8_t*)data, size);
                         } else otherAnc++;
@@ -257,6 +259,7 @@ static void RunOne(int idx, IDeckLink* dev, const std::string& name, int seconds
         audioOk = fabs(l1k + 20.0) <= 1.5 && fabs(r440 + 20.0) <= 1.5 && l440 < -40.0 && r1k < -40.0;
     } else printf("    audio: none\n");
     printf("    VANC: %ld frames with ancillary data, %ld CEA-708 CDP packets, %ld other packets\n", probe.vancFrames, probe.cdpPackets, probe.otherAnc);
+    { std::string h; for (int q = 0; q < 64; q++) if (probe.lineHist[q]) h += "line " + std::to_string(q) + (q == 63 ? "+" : "") + ": " + std::to_string(probe.lineHist[q]) + "  "; if (!h.empty()) printf("    caption packet lines: %s%c", h.c_str(), 10); }
     if (capOk) {
         printf("    caption text (CEA-608 CC1):\n");
         std::string line;

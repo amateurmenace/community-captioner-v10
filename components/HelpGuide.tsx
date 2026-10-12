@@ -92,7 +92,7 @@ const SECTIONS: Section[] = [
             'NDI runtime: the Mac app bundles it (nothing to install; NDI® is a registered trademark of Vizrt NDI AB). Windows needs the free NDI Tools or the NDI 6 Runtime from ndi.video; without it the NDI option says "Not available" and everything else works. NDI|HX cameras are fine.',
             'CEA-608 roll-up (2 or 3 rows, about 60 characters per second, works with every decoder) or DTVCC / CEA-708 (about 200+ characters per second, with CEA-608 still carried for older decoders).',
             'Caption strategy when speech outruns the standard: truncate at a word boundary, summarise with Gemini, or verbatim.',
-            'YouTube caption ingestion URL: the Blackmagic Web Presenter does not forward VANC captions into its RTMP stream, so the app can POST each caption straight to YouTube\'s per-stream ingestion URL instead.',
+            'YouTube caption ingestion URL: use this whenever a Blackmagic Web Presenter is your encoder. The Web Presenter 4K (firmware 4.2.3) forwards only a fraction of the embedded CEA-608 characters and none of the control codes, so YouTube shows garbled text that never rolls; the app can instead POST each caption straight to YouTube\'s per-stream ingestion URL. In YouTube Studio set the stream\'s Closed captions to the ingestion-URL (POST) option, copy the URL into the Caption Injection screen and Save; captions appear on the stream within a couple of seconds. Keep SDI injection running for the in-room/decoder path.',
             'Output designer: the OBS / vMix overlay URL, fonts, colours, size and position.',
         ],
         tech: [
