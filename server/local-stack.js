@@ -212,7 +212,8 @@ async function detectWhisper(port = 9000) {
     // An older copy of our own script (or a legacy server) is still listening: the app
     // can replace it so the operator gets the current captioning behaviour.
     const outdated = running && !managed && !!hello && serverVersion != null && serverVersion < bundledVersion;
-    return { running, managed, hello, url: `ws://127.0.0.1:${port}`, port, bundledVersion, serverVersion, outdated };
+    const saved = loadWhisperConfig();
+    return { running, managed, hello, url: `ws://127.0.0.1:${port}`, port, bundledVersion, serverVersion, outdated, configured: !!saved, savedModel: saved?.model || null };
 }
 
 /** Kill whatever is listening on the speech-server port (used to replace a stale server). */
@@ -331,13 +332,22 @@ function setState(patch) {
 export function subscribeLogs(fn) { subscribers.add(fn); return () => subscribers.delete(fn); }
 export function getWhisperStatus() { return { ...whisperState, logs: logRing.slice(-80) }; }
 
+const CONFIG_PATH = join(LOCAL_DIR, 'whisper.json');
+let lastLaunchConfig = null;
+export function loadWhisperConfig() {
+    try { return JSON.parse(readFileSync(CONFIG_PATH, 'utf-8')); } catch { return null; }
+}
+function saveWhisperConfig(cfg) {
+    try { mkdirSync(LOCAL_DIR, { recursive: true }); writeFileSync(CONFIG_PATH, JSON.stringify({ ...cfg, savedAt: Date.now() }, null, 2)); } catch {}
+}
+
 function handleScriptLine(line) {
     const m = line.match(/__WHISPER_STATUS__\s+(\{.*\})/);
     if (!m) { pushLog(line); return; }
     try {
         const s = JSON.parse(m[1]);
         if (s.state === 'loading') setState({ state: 'loading', message: s.message || `Loading ${s.model}…`, model: s.model, backend: s.backend, device: s.device, compute: s.compute });
-        else if (s.state === 'ready') setState({ state: 'ready', message: `Ready — ${s.model} on ${s.device}`, model: s.model, backend: s.backend, device: s.device, compute: s.compute, url: s.url });
+        else if (s.state === 'ready') { setState({ state: 'ready', message: `Ready — ${s.model} on ${s.device}`, model: s.model, backend: s.backend, device: s.device, compute: s.compute, url: s.url }); if (lastLaunchConfig) saveWhisperConfig(lastLaunchConfig); }
         else if (s.state === 'error') setState({ state: 'error', message: s.message || 'Server error' });
         else if (s.state === 'starting') setState({ state: 'starting', message: `Python ${s.python} starting…` });
         pushLog(`[status] ${s.state}${s.message ? ': ' + s.message : ''}`);
@@ -392,6 +402,7 @@ export async function startWhisper({ model = 'large-v3-turbo', backend = 'auto',
     const scriptPath = join(LOCAL_DIR, SCRIPT_NAME);
     writeFileSync(scriptPath, readScript(), 'utf-8');
     logRing.length = 0;
+    lastLaunchConfig = { model, backend, device, compute, language, port, interim, interimModel };
     setState({ state: 'installing', message: 'Preparing Python environment…', model, backend, device, compute, url: null, pid: null, startedAt: Date.now(), exitCode: null });
 
     const info = await probeSystem();
@@ -531,4 +542,130 @@ export async function ollamaStart(baseUrl = 'http://127.0.0.1:11434') {
         try { await fetchJson(`${baseUrl}/api/tags`, {}, 1500); invalidateProbe(); return { ok: true, started: true }; } catch {}
     }
     return { ok: false, error: 'Ollama did not start within 10 seconds' };
+}
+
+
+// ---------------------------------------------------------------------------
+// Make sure a speech server is up (auto-start the one the operator set up earlier)
+// ---------------------------------------------------------------------------
+const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+
+/**
+ * Resolve to a usable speech server. If one answers on the port, use it. If the
+ * operator completed the wizard before (whisper.json), start it again and wait
+ * for ready, reporting progress through onStatus. If nothing was ever set up,
+ * return needsSetup so the UI can send them to the wizard instead of guessing.
+ */
+export async function ensureWhisper({ port = 9000, onStatus, timeoutMs = 15 * 60 * 1000 } = {}) {
+    if (await portOpen(port)) return { ok: true, running: true, managed: !!whisperProc, status: getWhisperStatus() };
+    const busy = whisperProc && ['installing', 'starting', 'loading'].includes(whisperState.state);
+    if (!busy) {
+        const cfg = loadWhisperConfig();
+        if (!cfg) return { ok: false, needsSetup: true, error: 'The local speech engine has not been set up on this computer yet.' };
+        try {
+            await startWhisper({ ...cfg, port });
+        } catch (e) {
+            return { ok: false, error: e.message, status: getWhisperStatus() };
+        }
+    }
+    const t0 = Date.now();
+    let lastMsg = '';
+    while (Date.now() - t0 < timeoutMs) {
+        const st = whisperState;
+        if (st.message !== lastMsg) { lastMsg = st.message; onStatus?.(getWhisperStatus()); }
+        if (st.state === 'ready' && await portOpen(port)) return { ok: true, started: true, managed: true, status: getWhisperStatus() };
+        if (st.state === 'error' || st.state === 'stopped') return { ok: false, error: st.message || 'The speech server did not start', status: getWhisperStatus() };
+        await sleep(500);
+    }
+    return { ok: false, error: 'Timed out waiting for the speech server to start', status: getWhisperStatus() };
+}
+
+// ---------------------------------------------------------------------------
+// Prerecorded files: hand a path to the speech server and relay its events
+// ---------------------------------------------------------------------------
+/**
+ * Ask the running speech server to transcribe a file. onEvent receives the raw
+ * file_* messages plus the server's hello. Returns { cancel } immediately and
+ * resolves `done` when the job finishes.
+ */
+export function transcribeFileWithServer({ url = 'ws://127.0.0.1:9000', path, jobId, onEvent }) {
+    let ws;
+    let finished = false;
+    const done = new Promise((resolve, reject) => {
+        try { ws = new WsClient(url, { handshakeTimeout: 5000, maxPayload: 64 * 1024 * 1024 }); } catch (e) { return reject(e); }
+        const finish = (err) => { if (finished) return; finished = true; try { ws.close(); } catch {} err ? reject(err) : resolve(); };
+        ws.on('open', () => { /* wait for hello */ });
+        ws.on('message', (data) => {
+            let d; try { d = JSON.parse(data.toString()); } catch { return; }
+            if (d.type === 'hello') {
+                onEvent?.(d);
+                if (typeof d.scriptVersion !== 'number' || d.scriptVersion < 4) {
+                    return finish(new Error('The running speech server is too old to transcribe files. Open Local AI setup and replace it with the new version.'));
+                }
+                ws.send(JSON.stringify({ type: 'transcribe_file', jobId, path }));
+                return;
+            }
+            if (typeof d.type === 'string' && d.type.startsWith('file_')) {
+                onEvent?.(d);
+                if (d.type === 'file_done') finish();
+                else if (d.type === 'file_error') finish(new Error(d.error || 'transcription failed'));
+            }
+        });
+        ws.on('error', (e) => finish(new Error(e?.message || 'speech server connection failed')));
+        ws.on('close', () => finish(new Error('speech server connection closed')));
+    });
+    return {
+        done,
+        cancel() { try { ws?.send(JSON.stringify({ type: 'cancel_file', jobId })); } catch {} },
+    };
+}
+
+// ---------------------------------------------------------------------------
+// YouTube: fetch the audio with yt-dlp in the same Python environment
+// ---------------------------------------------------------------------------
+async function pythonRunner() {
+    const vpy = venvPython();
+    if (existsSync(vpy)) return { cmd: vpy, prefix: [] };
+    const info = await probeSystem();
+    if (info.uv.installed) return { cmd: info.uv.path, prefix: ['run', '--python', '3.12', '--with', 'yt-dlp', 'python'] , uv: true };
+    const py = info.python.find(p => p.ok);
+    if (py) return { cmd: py.cmd, prefix: [...py.args] };
+    throw new Error('No Python environment found. Set up Local AI first.');
+}
+
+/** Download the best audio of a YouTube URL into outDir. Resolves { path, title }. */
+export async function downloadYoutubeAudio(url, outDir, onProgress) {
+    if (!/^https?:\/\/(www\.|m\.|music\.)?(youtube\.com|youtu\.be)\//i.test(url)) throw new Error('That does not look like a YouTube link');
+    mkdirSync(outDir, { recursive: true });
+    const r = await pythonRunner();
+    if (!r.uv) {
+        const probe = await run(r.cmd, [...r.prefix, '-m', 'yt_dlp', '--version'], { timeout: 15000 });
+        if (!probe.ok) {
+            onProgress?.({ stage: 'installing', message: 'Installing yt-dlp (first time only)…' });
+            const pip = await new Promise((resolve) => execFile(r.cmd, [...r.prefix, '-m', 'pip', 'install', '--disable-pip-version-check', '--upgrade', 'yt-dlp'], { timeout: 180000, windowsHide: true, maxBuffer: 8 * 1024 * 1024 }, (err, so, se) => resolve({ ok: !err, out: String(so) + String(se) })));
+            if (!pip.ok) throw new Error('Could not install yt-dlp: ' + pip.out.slice(-300));
+        }
+    }
+    return new Promise((resolve, reject) => {
+        const args = [...r.prefix, '-m', 'yt_dlp', '--no-playlist', '--newline', '-f', 'bestaudio[ext=m4a]/bestaudio/best', '-o', join(outDir, '%(id)s.%(ext)s'), '--print', 'after_move:filepath', '--print', 'title', '--no-simulate', url];
+        const child = spawn(r.cmd, args, { windowsHide: true });
+        let out = '', err = '';
+        child.stdout.on('data', (d) => {
+            const text = d.toString(); out += text;
+            for (const line of text.split('\n')) {
+                const m = line.match(/\[download\]\s+([\d.]+)%\s+of\s+~?\s*([\d.]+\w+)(?:.*?at\s+([\d.]+\w+\/s))?(?:.*?ETA\s+([\d:]+))?/);
+                if (m) onProgress?.({ stage: 'downloading', percent: +m[1], size: m[2], speed: m[3], eta: m[4], message: `Downloading audio ${m[1]}% of ${m[2]}${m[3] ? ` at ${m[3]}` : ''}` });
+            }
+        });
+        child.stderr.on('data', (d) => { err += d.toString(); });
+        child.on('error', (e) => reject(new Error('yt-dlp failed to start: ' + e.message)));
+        child.on('exit', (code) => {
+            if (code !== 0) return reject(new Error('YouTube download failed: ' + (err.trim().split('\n').pop() || `exit ${code}`)));
+            const lines = out.split('\n').map(l => l.trim()).filter(l => l && !l.startsWith('['));
+            const filePath = lines.find(l => existsSync(l));
+            const title = lines.find(l => l !== filePath) || 'YouTube video';
+            if (!filePath) return reject(new Error('yt-dlp finished but no file was written'));
+            resolve({ path: filePath, title });
+        });
+    });
 }

@@ -40,7 +40,7 @@ import time
 # name → (faster-whisper id, mlx-community repo, description, approx download MB, english_only)
 # Bumped whenever the protocol or the captioning behaviour changes; the app compares it
 # with the server it finds on port 9000 so an older copy can be replaced.
-SCRIPT_VERSION = 3
+SCRIPT_VERSION = 4
 
 MODELS = {
     "tiny.en":          ("tiny.en",          "mlx-community/whisper-tiny.en-mlx",        "Lightest. Rough accuracy; fine for testing.",            75,   True),
@@ -231,6 +231,103 @@ class Segmenter:
 
 
 # ---------------------------------------------------------------------------
+# Prerecorded files: decode with PyAV (ships with faster-whisper, no ffmpeg CLI
+# needed), cut into utterances with the same energy VAD, transcribe each one.
+# ---------------------------------------------------------------------------
+
+def decode_media(path, progress=None):
+    """Decode any audio/video file to 16 kHz mono int16. Returns (pcm_int16, duration_s)."""
+    import av  # noqa: WPS433
+    import numpy as np
+    container = av.open(path)
+    stream = next((st for st in container.streams if st.type == "audio"), None)
+    if stream is None:
+        container.close()
+        raise RuntimeError("This file has no audio track")
+    duration = float(stream.duration * stream.time_base) if stream.duration else (float(container.duration) / 1e6 if container.duration else 0.0)
+    resampler = av.AudioResampler(format="s16", layout="mono", rate=SAMPLE_RATE)
+    chunks = []
+    last_report = 0.0
+    try:
+        for frame in container.decode(stream):
+            for out in resampler.resample(frame):
+                arr = out.to_ndarray()
+                chunks.append(arr.reshape(-1).astype(np.int16))
+            if progress and frame.time is not None and duration and frame.time - last_report >= 2.0:
+                last_report = frame.time
+                progress(min(0.999, frame.time / duration))
+        for out in resampler.resample(None):  # flush
+            chunks.append(out.to_ndarray().reshape(-1).astype(np.int16))
+    finally:
+        container.close()
+    pcm = np.concatenate(chunks) if chunks else np.zeros(0, dtype=np.int16)
+    if not duration:
+        duration = len(pcm) / SAMPLE_RATE
+    return pcm, duration
+
+
+def split_utterances(pcm_int16, threshold=0.012, silence_ms=550, min_speech_ms=350, max_segment_s=15.0, pad_ms=250):
+    """Offline VAD with the live Segmenter's rules → list of (start_sample, end_sample)."""
+    import numpy as np
+    audio = pcm_int16.astype(np.float32) / 32768.0
+    hop = SAMPLE_RATE // 50  # 20 ms
+    n_hops = (len(audio) + hop - 1) // hop
+    noise_floor = 0.004
+    speech = np.zeros(n_hops, dtype=bool)
+    for i in range(n_hops):
+        chunk = audio[i * hop:(i + 1) * hop]
+        rms = float(np.sqrt(np.mean(chunk * chunk))) if len(chunk) else 0.0
+        if rms < noise_floor * 1.5:
+            noise_floor = 0.95 * noise_floor + 0.05 * max(rms, 1e-5)
+        speech[i] = rms > max(threshold, noise_floor * 3.0)
+    silence_hops = max(1, silence_ms // 20)
+    min_speech_hops = max(1, min_speech_ms // 20)
+    max_hops = int(max_segment_s * 50)
+    pad = int(SAMPLE_RATE * pad_ms / 1000)
+    segments = []
+    start = None
+    speech_hops = 0
+    quiet = 0
+    last_quiet_cut = None
+    for i in range(n_hops):
+        if speech[i]:
+            if start is None:
+                start = i
+                speech_hops = 0
+            speech_hops += 1
+            quiet = 0
+        else:
+            if start is not None:
+                quiet += 1
+                if quiet == 1:
+                    last_quiet_cut = i
+        if start is None:
+            continue
+        long_enough = speech_hops >= min_speech_hops
+        if long_enough and quiet >= silence_hops:
+            segments.append((start, i - quiet + 1))
+            start = None
+        elif i - start >= max_hops:
+            # Too long without a pause: cut at the most recent quiet hop if there is one
+            cut = last_quiet_cut if (last_quiet_cut and last_quiet_cut > start + min_speech_hops) else i
+            segments.append((start, cut))
+            start = cut if cut < i else None
+            speech_hops = 0 if start is None else (i - cut)
+            quiet = 0
+        elif not long_enough and quiet >= silence_hops * 4:
+            start = None  # just a click or noise
+    if start is not None and speech_hops >= min_speech_hops:
+        segments.append((start, n_hops))
+    out = []
+    for a, b in segments:
+        s0 = max(0, a * hop - pad)
+        s1 = min(len(pcm_int16), b * hop + pad)
+        if s1 - s0 >= SAMPLE_RATE // 4:
+            out.append((s0, s1))
+    return out
+
+
+# ---------------------------------------------------------------------------
 # Server
 # ---------------------------------------------------------------------------
 
@@ -267,8 +364,17 @@ class Server:
                         ctl = json.loads(message)
                     except Exception:
                         continue
-                    if ctl.get("type") == "ping":
+                    kind = ctl.get("type")
+                    if kind == "ping":
                         await websocket.send(json.dumps({"type": "pong"}))
+                    elif kind == "transcribe_file":
+                        job = {"id": str(ctl.get("jobId") or ""), "path": str(ctl.get("path") or ""), "cancel": False}
+                        conn.setdefault("jobs", {})[job["id"]] = job
+                        asyncio.ensure_future(self._run_file_job(websocket, job, loop))
+                    elif kind == "cancel_file":
+                        j = conn.get("jobs", {}).get(str(ctl.get("jobId") or ""))
+                        if j:
+                            j["cancel"] = True
                     continue
                 pcm = np.frombuffer(message, dtype=np.int16)
                 for kind, audio, last_speech_at in seg.feed(pcm):
@@ -296,6 +402,57 @@ class Server:
             if "closed" not in str(type(e)).lower() and "Closed" not in type(e).__name__:
                 log(f"Client error: {e}")
         log("Client disconnected")
+
+    async def _run_file_job(self, websocket, job, loop):
+        """Transcribe a whole media file, streaming timed segments back as they are done."""
+        import numpy as np
+        jid = job["id"]
+        t0 = time.time()
+        q = asyncio.Queue()
+
+        def emit(msg):
+            msg["jobId"] = jid
+            loop.call_soon_threadsafe(q.put_nowait, msg)
+
+        def work():
+            try:
+                emit({"type": "file_status", "stage": "decoding", "progress": 0.0, "message": "Decoding audio…"})
+                pcm, duration = decode_media(job["path"], progress=lambda p: emit({"type": "file_status", "stage": "decoding", "progress": p, "message": "Decoding audio…"}))
+                if job["cancel"]:
+                    emit({"type": "file_error", "error": "cancelled"}); return
+                if len(pcm) < SAMPLE_RATE // 2:
+                    emit({"type": "file_error", "error": "No audio found in this file"}); return
+                parts = split_utterances(pcm)
+                emit({"type": "file_status", "stage": "transcribing", "progress": 0.0, "durationSec": duration, "utterances": len(parts),
+                      "message": f"Transcribing {len(parts)} utterances with {self.backend.model_id}…"})
+                log(f"[file {jid}] {duration:.1f}s of audio → {len(parts)} utterances")
+                done_count = 0
+                for (s0, s1) in parts:
+                    if job["cancel"]:
+                        emit({"type": "file_error", "error": "cancelled"}); return
+                    audio = pcm[s0:s1].astype(np.float32) / 32768.0
+                    text = self._transcribe_safe(audio)
+                    done_count += 1
+                    if text:
+                        emit({"type": "file_segment", "start": round(s0 / SAMPLE_RATE, 2), "end": round(s1 / SAMPLE_RATE, 2), "text": text,
+                              "progress": min(0.999, s1 / max(1, len(pcm))), "durationSec": duration})
+                elapsed = int((time.time() - t0) * 1000)
+                log(f"[file {jid}] done in {elapsed} ms ({duration / max(0.001, elapsed / 1000):.1f}x real time)")
+                emit({"type": "file_done", "durationSec": duration, "segments": done_count, "elapsedMs": elapsed})
+            except Exception as e:
+                log(f"[file {jid}] error: {e}")
+                emit({"type": "file_error", "error": str(e)})
+
+        fut = loop.run_in_executor(None, work)
+        try:
+            while True:
+                msg = await q.get()
+                await websocket.send(json.dumps(msg))
+                if msg["type"] in ("file_done", "file_error"):
+                    break
+        except Exception:
+            job["cancel"] = True
+        await fut
 
     def _start_interim(self, loop, websocket, conn, audio):
         seg = conn["seg"]

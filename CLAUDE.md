@@ -378,6 +378,22 @@ The bundled Whisper server cuts audio into utterances with an energy VAD and tra
 
 The browser's local path sends 128 ms PCM chunks (`createScriptProcessor(2048)`), half the previous size.
 
+## Prerecorded files on the local engine (relay + whisper_server.py)
+
+The Prerecorded workflow's local path used to be a stub: it never connected to anything and showed "Could not connect to ws://127.0.0.1:9000" after a 2 s timer. It is now a real server-side pipeline:
+
+```
+browser  --XHR upload (progress)-->  POST /api/local/transcribe-file  (multer disk storage, DATA_DIR/local/uploads, 8 GB limit)
+relay    ensureWhisper()  → if nothing listens on 9000 and DATA_DIR/local/whisper.json exists (saved on every successful wizard start), start that server and wait for ready; if never set up → needsSetup
+relay    transcribeFileWithServer()  → ws client to 9000, sends {type:"transcribe_file", jobId, path} (requires hello.scriptVersion ≥ 4)
+server   decode_media() with PyAV (ships with faster-whisper; no ffmpeg CLI) → 16 kHz mono, split_utterances() = the live VAD rules offline (550 ms silence, 15 s max, cut at the last pause), each utterance → backend.transcribe under the shared lock
+server   → file_status (decoding/transcribing, progress) · file_segment {start, end, text} · file_done / file_error; cancel_file aborts between utterances
+relay    job registry (fileJobs): GET /api/local/jobs/:id, GET /api/local/jobs/:id/events (SSE: snapshot · job · segment · done), POST /api/local/jobs/:id/cancel; the upload is deleted when the job ends
+browser  EventSource → live transcript with timestamps, stage line, speed (× real time), ETA; on done applyCorrections() from shared/corrections.js (sensitivity 60) → Caption[] with timestamp = jobStart + start·1000 → Review (Analytics view)
+```
+
+Measured on the M1 Max with large-v3-turbo on MLX: a 4-minute MOV → 39 timestamped segments in 22 s (10.9× real time) including decoding and the auto-start of a stopped server. `POST /api/local/youtube {url}` runs the same job after fetching the best audio with yt-dlp (`python -m yt_dlp` in the venv, pip-installed on first use; uv runner uses `uv run --with yt-dlp`). `POST /api/local/whisper/ensure` is the same auto-start for the Dashboard: App.tsx calls it before connecting in local mode and shows "Checking the speech server…" in the Local pill (`LocalEngineInfo.starting`) instead of "Local server offline"; without a saved config it tells the operator to open Local AI setup. The probe's `whisper` block now carries `configured` and `savedModel`. Speaker labels stay Gemini-only (no diarization locally); the studio says so.
+
 ## Live machine metrics (server/system-metrics.js)
 
 The Dashboard header is two rows: row 1 holds the brand, the session metrics (duration, latency, WPM, confidence), the controls (which **wrap** instead of overflowing) and the Start/Stop button, which is `shrink-0` and outside the wrapping group so it can never be pushed off-screen; row 2 is the always-visible "This machine" strip with CPU, GPU, RAM and network values plus 40-sample sparklines, chips for what the Whisper server and Ollama cost, a "Watch this" badge when a warning applies, and a Details toggle that opens the full panel (bars, process list, warnings). It polls `GET /api/system/metrics` every 2 s while recording or while the panel is open, 4 s otherwise. Sources: `os.cpus()` deltas; `vm_stat` app memory (active + wired + compressed) and `kern.memorystatus_vm_pressure_level` on macOS, `/proc/meminfo` MemAvailable on Linux, `os.freemem()` on Windows; `ioreg -r -d 1 -c IOAccelerator` "Device Utilization %" on Macs and `nvidia-smi` elsewhere (other GPUs report `available: false`); `netstat -ibn` / `/proc/net/dev` / `netstat -e` byte counters turned into KB/s; `ps` (or `tasklist` on Windows, memory only) for the managed Whisper pid and `pgrep -f ollama`. GB values are GiB so a 32 GB Mac reads 32.
@@ -508,7 +524,7 @@ Landing Page ("Start Captioning")
                                    └── Run in Browser → Workflow Picker
 ```
 
-The workflow picker (`view: 'choice'`, "What are you captioning today?") shows four equal-weight cards — Live Session, Caption Injection, Prerecorded, Local AI — each with an accent colour, a tagline, "what you need" chips and an Open affordance; the Local AI card is no longer faded. Accent classes are literal strings in `ACCENT` so Tailwind keeps them.
+The workflow picker (`view: 'choice'`, heading "Choose a workflow") is deliberately plain: one display-font heading, one subtitle, four identical white cards (Live Session, Caption Injection, Prerecorded, Local AI) with the same sage icon circle, title and two-line description, in the landing page's own style. The Local AI card used to be faded (`opacity-75`) and is now equal weight. A more decorated version (accent colours, taglines, chips, "Open →") was tried and rejected by the user as looking like generic AI output — keep this page minimal.
 
 The deployment choice screen is **skipped** when running locally (from the standalone .app/.exe or `npm run dev`) since the user is already in the desktop app. It only appears on cloud-hosted deployments where visitors may need to download the desktop app for DeckLink/SDI features.
 

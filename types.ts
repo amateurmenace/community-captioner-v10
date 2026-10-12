@@ -53,6 +53,8 @@ export type CloudModel = 'transcribe-live' | 'native-audio';
 /** Live status of the local speech server connection (Local / Fully Local modes) */
 export interface LocalEngineInfo {
     connected: boolean;
+    /** Set while the app is bringing the speech server up ("Starting the speech server…") */
+    starting?: string;
     backend?: string;   // "mlx-whisper" | "faster-whisper" | legacy
     model?: string;
     device?: string;

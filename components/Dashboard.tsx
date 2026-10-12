@@ -880,9 +880,10 @@ const Dashboard: React.FC<DashboardProps> = ({
                     <button onClick={onOpenLocalSetup} className={`hidden md:flex items-center gap-2 px-3 py-1.5 rounded-lg border text-xs font-bold transition-colors ${
                         !isRecording ? 'bg-white text-stone-600 border-stone-200 hover:bg-stone-50'
                         : localEngine?.connected ? 'bg-green-50 text-green-700 border-green-200'
+                        : localEngine?.starting ? 'bg-amber-50 text-amber-700 border-amber-200'
                         : 'bg-red-50 text-red-600 border-red-200 animate-pulse'}`}>
                         <Server size={14} />
-                        <span>{!isRecording ? `${MODE_INFO[mode].label} · setup` : localEngine?.connected ? `Local: ${localEngine.model ? localEngine.model.replace(/^mlx-community\//, '') : 'connected'}` : 'Local server offline'}</span>
+                        <span>{!isRecording ? `${MODE_INFO[mode].label} · setup` : localEngine?.connected ? `Local: ${localEngine.model ? localEngine.model.replace(/^mlx-community\//, '') : 'connected'}` : localEngine?.starting ? localEngine.starting : (localEngine?.error || 'Local server offline')}</span>
                         {isRecording && localEngine?.connected && <span className="w-1.5 h-1.5 rounded-full bg-green-500 animate-pulse" />}
                     </button>
                 </Tooltip>

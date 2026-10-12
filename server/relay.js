@@ -14,7 +14,7 @@ import { getSystemMetrics } from './system-metrics.js';
 import { fetchPage, htmlToText, extractPdfText, extractUploadedText, pdfSupportAvailable, discoverLinks, locateMunicipalitySources, researchMunicipality, extractDictionaryFromUrl, itemsToEntries, getResearchGroups, GEMINI_TEXT_MODEL } from './context-sources.js';
 import { listProfiles, getProfile, saveProfile, deleteProfile } from './profiles.js';
 import { buildCorrectionIndex, applyCorrections } from '../shared/corrections.js';
-import { probeSystem, invalidateProbe, startWhisper, stopWhisper, getWhisperStatus, subscribeLogs, readScript, readHello, ollamaModels, ollamaPull, ollamaStart, WHISPER_MODELS, OLLAMA_MODELS } from './local-stack.js';
+import { probeSystem, invalidateProbe, startWhisper, stopWhisper, getWhisperStatus, subscribeLogs, readScript, readHello, ollamaModels, ollamaPull, ollamaStart, WHISPER_MODELS, OLLAMA_MODELS, ensureWhisper, transcribeFileWithServer, downloadYoutubeAudio, LOCAL_DIR } from './local-stack.js';
 import { getBrainConfig, setBrainConfig, brainActive, extractEntriesWithOllama, extractItemsWithOllama, testOllamaExtraction } from './local-llm.js';
 import { locateMunicipalityLocally, researchMunicipalityLocally } from './local-wizard.js';
 import { createRequire as _pkgRequire } from 'module';
@@ -24,6 +24,8 @@ const APP_VERSION = process.env.CC_APP_VERSION || (() => { try { return _pkgRequ
 // createRequire('multer') cannot be resolved inside the pkg snapshot, which left
 // file uploads silently disabled in every packaged .app/.exe build.
 import multer from 'multer';
+import { join, extname } from 'path';
+import { statSync, unlinkSync, mkdirSync as fsMkdirSync } from 'fs';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -1044,6 +1046,134 @@ app.post('/api/local/whisper/start', async (req, res) => {
     } catch (e) {
         res.status(400).json({ ok: false, error: e.message, status: getWhisperStatus() });
     }
+});
+
+// Make sure the speech server is up before a local workflow needs it. Starts the
+// server the operator configured earlier (whisper.json) and long-polls until ready.
+app.post('/api/local/whisper/ensure', async (req, res) => {
+    try {
+        const r = await ensureWhisper({ timeoutMs: Math.min(15 * 60 * 1000, Number(req.body?.timeoutMs) || 10 * 60 * 1000) });
+        res.json(r);
+    } catch (e) {
+        res.status(500).json({ ok: false, error: e.message });
+    }
+});
+
+// ---------------------------------------------------------------------------
+// Prerecorded files on the local engine: upload → (auto-start server) → decode →
+// transcribe utterance by utterance, streamed to the browser as SSE.
+// ---------------------------------------------------------------------------
+const UPLOAD_DIR = join(LOCAL_DIR, 'uploads');
+const fileJobs = new Map();
+const mediaUpload = multer ? multer({
+    storage: multer.diskStorage({
+        destination: (req, file, cb) => { try { fsMkdirSync(UPLOAD_DIR, { recursive: true }); } catch {} cb(null, UPLOAD_DIR); },
+        filename: (req, file, cb) => cb(null, `${Date.now()}-${Math.random().toString(36).slice(2, 8)}${extname(file.originalname || '') || '.bin'}`),
+    }),
+    limits: { fileSize: 8 * 1024 * 1024 * 1024 },
+}) : null;
+
+function jobPublic(job, withSegments = false) {
+    const { listeners, cancelFn, path, ...rest } = job;
+    return withSegments ? rest : { ...rest, segments: undefined, segmentCount: job.segments.length };
+}
+function jobEmit(job, ev) { for (const fn of job.listeners) { try { fn(ev); } catch {} } }
+function jobUpdate(job, patch) { Object.assign(job, patch); jobEmit(job, { type: 'job', job: jobPublic(job) }); }
+
+async function runFileJob(job) {
+    const t0 = Date.now();
+    try {
+        if (job.kind === 'youtube') {
+            jobUpdate(job, { status: 'downloading', message: 'Contacting YouTube…', progress: 0 });
+            const dl = await downloadYoutubeAudio(job.url, UPLOAD_DIR, (p) => jobUpdate(job, { message: p.message, progress: p.percent != null ? p.percent / 100 : job.progress }));
+            job.path = dl.path;
+            jobUpdate(job, { filename: dl.title, bytes: (() => { try { return statSync(dl.path).size; } catch { return 0; } })(), progress: 1 });
+        }
+        jobUpdate(job, { status: 'starting_server', message: 'Checking the local speech server…', progress: 0 });
+        const ens = await ensureWhisper({ onStatus: (st) => jobUpdate(job, { message: st.message || 'Starting the speech server…', serverState: st.state }) });
+        if (!ens.ok) {
+            jobUpdate(job, { status: 'error', needsSetup: !!ens.needsSetup, error: ens.needsSetup ? 'The local speech engine is not set up on this computer yet. Open Local AI setup, install the speech server, then come back.' : (ens.error || 'The speech server is not available') });
+            return;
+        }
+        if (job.cancelled) return jobUpdate(job, { status: 'cancelled', message: 'Cancelled' });
+        jobUpdate(job, { status: 'decoding', message: 'Decoding audio…', progress: 0 });
+        const client = transcribeFileWithServer({ path: job.path, jobId: job.id, onEvent: (m) => {
+            if (m.type === 'hello') { jobUpdate(job, { engine: { backend: m.backend, model: m.model, device: m.device, compute: m.compute } }); return; }
+            if (m.type === 'file_status') { jobUpdate(job, { status: m.stage === 'decoding' ? 'decoding' : 'transcribing', message: m.message, progress: m.progress ?? job.progress, durationSec: m.durationSec ?? job.durationSec, utterances: m.utterances ?? job.utterances }); return; }
+            if (m.type === 'file_segment') {
+                const seg = { start: m.start, end: m.end, text: m.text };
+                job.segments.push(seg);
+                job.progress = m.progress; job.durationSec = m.durationSec ?? job.durationSec; job.status = 'transcribing';
+                const elapsed = (Date.now() - t0) / 1000;
+                job.speed = elapsed > 2 && m.end ? +(m.end / elapsed).toFixed(1) : job.speed;
+                jobEmit(job, { type: 'segment', segment: seg, progress: job.progress, durationSec: job.durationSec, speed: job.speed, segmentCount: job.segments.length });
+                return;
+            }
+        } });
+        job.cancelFn = client.cancel;
+        await client.done;
+        if (job.cancelled) return jobUpdate(job, { status: 'cancelled', message: 'Cancelled' });
+        job.text = job.segments.map(s => s.text).join(' ');
+        job.elapsedMs = Date.now() - t0;
+        job.speed = job.durationSec ? +(job.durationSec / (job.elapsedMs / 1000)).toFixed(1) : null;
+        job.status = 'done'; job.progress = 1; job.message = `Done: ${job.segments.length} segments in ${(job.elapsedMs / 1000).toFixed(0)} s`;
+        jobEmit(job, { type: 'done', job: jobPublic(job, true) });
+        console.log(`[File] ${job.filename}: ${job.durationSec?.toFixed(0)}s → ${job.segments.length} segments in ${job.elapsedMs}ms (${job.speed}x)`);
+    } catch (e) {
+        if (job.cancelled) jobUpdate(job, { status: 'cancelled', message: 'Cancelled' });
+        else { console.warn(`[File] ${job.filename}: ${e.message}`); jobUpdate(job, { status: 'error', error: e.message }); }
+    } finally {
+        if (job.path) { try { unlinkSync(job.path); } catch {} }
+        setTimeout(() => fileJobs.delete(job.id), 30 * 60 * 1000).unref?.();
+    }
+}
+
+function newJob(fields) {
+    const job = { id: `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 7)}`, status: 'queued', message: 'Queued', progress: 0, segments: [], listeners: new Set(), startedAt: Date.now(), cancelled: false, ...fields };
+    fileJobs.set(job.id, job);
+    setImmediate(() => runFileJob(job));
+    return job;
+}
+
+if (mediaUpload) {
+    app.post('/api/local/transcribe-file', mediaUpload.single('file'), (req, res) => {
+        if (!req.file) return res.status(400).json({ ok: false, error: 'No file uploaded' });
+        const job = newJob({ kind: 'file', filename: req.file.originalname || 'media', bytes: req.file.size, path: req.file.path });
+        res.json({ ok: true, jobId: job.id, job: jobPublic(job) });
+    });
+} else {
+    app.post('/api/local/transcribe-file', (req, res) => res.status(503).json({ ok: false, error: 'File uploads are not available on this server (multer missing)' }));
+}
+app.post('/api/local/youtube', (req, res) => {
+    const url = String(req.body?.url || '').trim();
+    if (!url) return res.status(400).json({ ok: false, error: 'url required' });
+    const job = newJob({ kind: 'youtube', url, filename: url, bytes: 0, path: null });
+    res.json({ ok: true, jobId: job.id, job: jobPublic(job) });
+});
+app.get('/api/local/jobs/:id', (req, res) => {
+    const job = fileJobs.get(req.params.id);
+    if (!job) return res.status(404).json({ ok: false, error: 'No such job' });
+    res.json({ ok: true, job: jobPublic(job, req.query.segments === '1') });
+});
+app.get('/api/local/jobs/:id/events', (req, res) => {
+    const job = fileJobs.get(req.params.id);
+    if (!job) return res.status(404).json({ ok: false, error: 'No such job' });
+    const sse = sseInit(res);
+    sse.emit('snapshot', { job: jobPublic(job, true) });
+    if (job.status === 'done' || job.status === 'error' || job.status === 'cancelled') return sse.end();
+    const fn = (ev) => { sse.emit(ev.type, ev); if (ev.type === 'done' || (ev.type === 'job' && ['error', 'cancelled'].includes(ev.job.status))) { job.listeners.delete(fn); sse.end(); } };
+    job.listeners.add(fn);
+    res.on('close', () => job.listeners.delete(fn));
+    const keepAlive = setInterval(() => { try { res.write(': ping\n\n'); } catch {} }, 15000);
+    res.on('close', () => clearInterval(keepAlive));
+});
+app.post('/api/local/jobs/:id/cancel', (req, res) => {
+    const job = fileJobs.get(req.params.id);
+    if (!job) return res.status(404).json({ ok: false, error: 'No such job' });
+    job.cancelled = true;
+    try { job.cancelFn?.(); } catch {}
+    if (['queued', 'starting_server', 'downloading'].includes(job.status)) jobUpdate(job, { status: 'cancelled', message: 'Cancelled' });
+    res.json({ ok: true });
 });
 
 app.post('/api/local/whisper/stop', async (req, res) => {

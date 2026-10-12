@@ -185,7 +185,6 @@ function App() {
   // conditional view returns below changes the hook count between renders
   // and crashes React when navigating between views.
   const [addonStatus, setAddonStatus] = useState<{ loaded: boolean; platform: string; version?: string } | null>(null);
-  const appInfoVersion = addonStatus?.version;
   useEffect(() => {
     if (appState.view !== 'choice') return;
     const port = window.location.port;
@@ -689,6 +688,25 @@ function App() {
                     return;
                 }
                 
+                // If the speech server on this machine is down but was set up before, bring it
+                // up now instead of failing with "Local server offline".
+                const isLocalUrl = /^wss?:\/\/(127\.0\.0\.1|localhost|\[::1\])(:|\/|$)/i.test(appState.localServerUrl!);
+                if (isLocalUrl) {
+                    try {
+                        setLocalEngine(prev => ({ ...prev, connected: false, error: undefined, starting: 'Checking the speech server…' }));
+                        const ens = await fetch(`${getRelayHttpUrl()}/api/local/whisper/ensure`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' }).then(r => r.json());
+                        if (!mounted) return;
+                        if (!ens.ok) {
+                            setLocalEngine(prev => ({ ...prev, connected: false, starting: undefined, error: ens.needsSetup ? 'Local AI is not set up yet — open Local AI setup' : (ens.error || 'The speech server could not be started') }));
+                            setAppState(p => ({ ...p, isRecording: false, notifications: [...p.notifications, { id: Date.now().toString(), message: ens.needsSetup ? 'Local mode needs the speech server. Click the Local pill (top right) to set it up.' : `Speech server: ${ens.error}`, type: 'error', timestamp: Date.now() }] }));
+                            return;
+                        }
+                        setLocalEngine(prev => ({ ...prev, starting: undefined }));
+                    } catch {
+                        setLocalEngine(prev => ({ ...prev, starting: undefined }));
+                    }
+                }
+
                 const initLocal = () => {
                     const ws = new WebSocket(appState.localServerUrl!);
                     ws.binaryType = 'arraybuffer';
@@ -1177,66 +1195,44 @@ function App() {
 
   // --- EXISTING: Web App Workflow Selection (Renamed intent slightly) ---
   if (appState.view === 'choice') {
-      // Workflow picker. Accent classes are literal strings so Tailwind keeps them.
-      const ACCENT = {
-          sage:   { icon: 'bg-sage-100 text-forest-dark', hover: 'hover:border-sage-500 hover:shadow-sage-100', chip: 'bg-sage-50 text-forest-dark border-sage-200', cta: 'text-forest-dark' },
-          amber:  { icon: 'bg-amber-100 text-amber-700', hover: 'hover:border-amber-400 hover:shadow-amber-100', chip: 'bg-amber-50 text-amber-800 border-amber-200', cta: 'text-amber-700' },
-          blue:   { icon: 'bg-blue-100 text-blue-700', hover: 'hover:border-blue-400 hover:shadow-blue-100', chip: 'bg-blue-50 text-blue-800 border-blue-200', cta: 'text-blue-700' },
-          purple: { icon: 'bg-purple-100 text-purple-700', hover: 'hover:border-purple-400 hover:shadow-purple-100', chip: 'bg-purple-50 text-purple-800 border-purple-200', cta: 'text-purple-700' },
-      } as const;
-      const cards: { key: string; view: string; title: string; tagline: string; desc: string; icon: any; accent: keyof typeof ACCENT; needs: string[]; badge?: string; warn?: string }[] = [
-          { key: 'live', view: 'dashboard', title: 'Live Session', tagline: 'Caption a meeting as it happens', icon: Mic, accent: 'sage',
-            desc: 'Real-time captions from a microphone or line-in, with the Context Engine fixing names as they are spoken. Browser speech, Gemini cloud, or your local Whisper server.',
-            needs: ['Microphone or mixer feed', 'Any captioning mode'] },
-          { key: 'inject', view: 'caption_injection', title: 'Caption Injection', tagline: 'Closed captions on your SDI feed', icon: Zap, accent: 'amber',
-            desc: 'Embed CEA-608/708 captions into a DeckLink SDI output for broadcast, or pass them through a web presenter to YouTube.',
-            needs: ['DeckLink card', 'Desktop app'], warn: addonStatus && !addonStatus.loaded ? `DeckLink driver not loaded${addonStatus.platform === 'windows' ? ' on Windows' : ''} — setup required` : undefined },
-          { key: 'prerecorded', view: 'prerecorded', title: 'Prerecorded', tagline: 'Transcribe a recording', icon: FileVideo, accent: 'blue',
-            desc: 'Upload a video or audio file and get a full transcript and caption file, processed in the cloud or on this machine.',
-            needs: ['Video or audio file'] },
-          { key: 'local', view: 'local_setup', title: 'Local AI', tagline: 'Everything on this computer', icon: ShieldCheck, accent: 'purple', badge: 'Private',
-            desc: 'Set up Whisper for speech and an Ollama brain for names and translation, so nothing leaves the room. A guided wizard checks the machine and installs what it needs.',
-            needs: ['Nothing leaves this computer', '8 GB RAM or more'] },
+      // Workflow picker: four equal cards in the app's plain style — same icon treatment
+      // for every card (the Local AI card used to be faded), nothing decorative.
+      const cards: { view: string; title: string; desc: string; icon: any; warn?: string }[] = [
+          { view: 'dashboard', title: 'Live Session', icon: Mic,
+            desc: 'Real-time captions from a microphone or mixer feed. Browser speech, Gemini cloud, or a local Whisper server.' },
+          { view: 'caption_injection', title: 'Caption Injection', icon: Zap,
+            desc: 'Embed CEA-608/708 closed captions into an SDI feed for broadcast or web-presenter passthrough.',
+            warn: addonStatus && !addonStatus.loaded ? `Setup required — DeckLink driver not loaded${addonStatus.platform === 'windows' ? ' on Windows' : ''}` : undefined },
+          { view: 'prerecorded', title: 'Prerecorded', icon: FileVideo,
+            desc: 'Upload a recording and get a transcript and caption file, processed in the cloud or on this machine.' },
+          { view: 'local_setup', title: 'Local AI', icon: Server,
+            desc: 'Run Whisper and an Ollama brain on this computer so nothing leaves the room. A short wizard sets it up.' },
       ];
       return (
-          <div className="min-h-screen bg-cream flex flex-col items-center justify-center p-8 animate-fade-in relative overflow-y-auto">
-              <div className="absolute inset-0 pointer-events-none" aria-hidden style={{ background: 'radial-gradient(60% 50% at 50% 0%, rgba(167, 189, 171, 0.25), transparent 70%)' }} />
-              <button onClick={() => setAppState(p => ({...p, view: 'landing'}))} className="absolute top-8 left-8 text-stone-500 font-bold hover:text-forest-dark flex items-center gap-1.5 text-sm"><ArrowRight size={16} className="rotate-180" /> Back</button>
+          <div className="h-screen bg-cream flex flex-col items-center justify-center p-8 animate-fade-in relative">
+              <button onClick={() => setAppState(p => ({...p, view: 'landing'}))} className="absolute top-8 left-8 text-stone-500 font-bold hover:text-forest-dark text-sm">Back</button>
 
-              <div className="text-center mb-10 relative">
-                  <p className="text-[11px] font-bold uppercase tracking-[0.25em] text-sage-600 mb-3">Workspace</p>
-                  <h1 className="text-4xl md:text-5xl font-display font-bold text-forest-dark mb-3">What are you captioning today?</h1>
-                  <p className="text-stone-500 text-base max-w-2xl mx-auto">Pick a workflow. You can switch any time, and the Context Engine and your dictionary follow you across all of them.</p>
-              </div>
+              <h1 className="text-4xl font-display font-bold text-forest-dark mb-3">Choose a workflow</h1>
+              <p className="text-stone-500 mb-12">Your dictionary and Context Engine follow you across all four.</p>
 
-              <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-4 gap-5 max-w-7xl w-full relative">
+              <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-4 gap-6 max-w-7xl w-full">
                   {cards.map(c => {
-                      const a = ACCENT[c.accent];
                       const Icon = c.icon;
                       return (
-                          <button key={c.key} onClick={() => setAppState(p => ({...p, view: c.view as any}))}
-                              className={`group text-left bg-white p-7 rounded-3xl border-2 border-stone-200 shadow-sm ${a.hover} hover:shadow-2xl hover:-translate-y-1 cursor-pointer transition-all duration-200 flex flex-col min-h-[340px] focus:outline-none focus:ring-4 focus:ring-sage-200`}>
-                              <div className="flex items-start justify-between mb-5">
-                                  <div className={`w-14 h-14 rounded-2xl flex items-center justify-center ${a.icon} group-hover:scale-110 transition-transform shadow-inner`}><Icon size={26} /></div>
-                                  {c.badge && <span className={`text-[10px] font-bold uppercase tracking-wider px-2 py-1 rounded-full border ${a.chip}`}>{c.badge}</span>}
-                              </div>
-                              <p className={`text-[11px] font-bold uppercase tracking-wider mb-1 ${a.cta}`}>{c.tagline}</p>
-                              <h2 className="text-2xl font-display font-bold text-forest-dark mb-2">{c.title}</h2>
-                              <p className="text-stone-500 leading-relaxed text-sm flex-1">{c.desc}</p>
-                              <div className="flex flex-wrap gap-1.5 mt-5">
-                                  {c.needs.map(n => <span key={n} className={`text-[10px] font-medium px-2 py-1 rounded-full border ${a.chip}`}>{n}</span>)}
-                              </div>
+                          <button key={c.view} onClick={() => setAppState(p => ({...p, view: c.view as any}))}
+                              className="text-left bg-white p-7 rounded-2xl border-2 border-stone-200 hover:border-sage-500 hover:shadow-xl cursor-pointer transition-all group focus:outline-none focus:border-sage-500">
+                              <div className="bg-sage-100 w-14 h-14 rounded-full flex items-center justify-center text-forest-dark mb-5 group-hover:scale-110 transition-transform"><Icon size={28} /></div>
+                              <h2 className="text-xl font-bold text-stone-800 mb-2">{c.title}</h2>
+                              <p className="text-stone-500 leading-relaxed text-sm">{c.desc}</p>
                               {c.warn && (
                                   <div className="mt-3 px-2.5 py-1.5 bg-amber-50 border border-amber-200 text-amber-800 rounded-lg text-[11px] font-medium flex items-center gap-1.5">
                                       <span className="w-1.5 h-1.5 rounded-full bg-amber-500 shrink-0" /> {c.warn}
                                   </div>
                               )}
-                              <div className={`mt-5 flex items-center gap-1.5 text-sm font-bold ${a.cta} opacity-70 group-hover:opacity-100 transition-opacity`}>Open <ArrowRight size={16} className="group-hover:translate-x-1 transition-transform" /></div>
                           </button>
                       );
                   })}
               </div>
-              <p className="text-[11px] text-stone-400 mt-8 relative">Running {appInfoVersion ? `v${appInfoVersion}` : 'locally'} · Settings (gear, bottom right) hold API keys, audio devices and output styling.</p>
           </div>
       );
   }
@@ -1317,6 +1313,7 @@ function App() {
              dictionary={appState.dictionary}
              apiKey={appState.apiKey}
              localServerUrl={appState.localServerUrl}
+             onOpenLocalSetup={() => setAppState(p => ({...p, view: 'local_setup'}))}
           />
       )}
 
