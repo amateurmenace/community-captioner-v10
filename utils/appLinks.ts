@@ -7,8 +7,8 @@ export const RELEASES_URL = `${GITHUB_REPO_URL}/releases/latest`;
 // Direct download links to the newest build for each platform.
 // Releases are tagged by product version (v10.x); asset names carry the app
 // version from package.json. Both assets live on the "Community Captioner v10.1" release.
-// Mac: app 6.10.6 — notarized, bundled DeckLink addon, local-only mode with self-starting speech server, local prerecorded transcription, in-app guide, animated landing page.
+// Mac: app 6.11.0 — notarized, bundled DeckLink addon with NDI → SDI (NDI runtime bundled), local-only mode, local prerecorded transcription, in-app guide.
 // Windows: app 6.10.6 — built and tested on Windows with the DeckLink addon bundled, including
 //          NDI → SDI passthrough (needs NDI Tools / the NDI Runtime); local AI on CPU or NVIDIA.
-export const MAC_DOWNLOAD_URL = `${GITHUB_REPO_URL}/releases/download/v10.1/Community-Captioner-6.10.6-mac-arm64.zip`;
+export const MAC_DOWNLOAD_URL = `${GITHUB_REPO_URL}/releases/download/v10.1/Community-Captioner-6.11.0-mac-arm64.zip`;
 export const WINDOWS_DOWNLOAD_URL = `${GITHUB_REPO_URL}/releases/download/v10.1/Community-Captioner-6.10.6-windows-x64.zip`;

@@ -315,20 +315,33 @@ END_SCRIPT
   // /usr/local/lib. Redistribution is subject to the NDI SDK license: the SDK's
   // libndi_licenses.txt must ship with the binary and the README carries the
   // trademark attribution (see createMacReadme).
-  const bundleNdi = process.env.BUNDLE_NDI === '1' || process.argv.includes('--bundle-ndi');
+  const ndiSdk = process.env.NDI_SDK_DIR || '/Library/NDI SDK for Apple';
+  const ndiDylibSrc = path.join(ndiSdk, 'lib', 'macOS', 'libndi.dylib');
+  // Bundled by default when the SDK is present (decision 2026-10-12); BUNDLE_NDI=0
+  // or --no-bundle-ndi leaves it out and the app then needs NDI Tools for Mac.
+  const bundleNdi = process.env.BUNDLE_NDI !== '0' && !process.argv.includes('--no-bundle-ndi') && fs.existsSync(ndiDylibSrc);
   if (bundleNdi) {
-    const ndiSdk = process.env.NDI_SDK_DIR || '/Library/NDI SDK for Apple';
-    const dylib = path.join(ndiSdk, 'lib', 'macOS', 'libndi.dylib');
     const licenses = path.join(ndiSdk, 'lib', 'macOS', 'libndi_licenses.txt');
-    if (fs.existsSync(dylib)) {
-      const fwDir = path.join(contentsDir, 'Frameworks');
-      fs.mkdirSync(fwDir, { recursive: true });
-      fs.copyFileSync(dylib, path.join(fwDir, 'libndi.dylib'));
-      if (fs.existsSync(licenses)) fs.copyFileSync(licenses, path.join(resourcesDir, 'libndi_licenses.txt'));
-      console.log(`  Bundled NDI runtime (${dylib}) into Contents/Frameworks/`);
-    } else {
-      console.warn(`  WARNING: BUNDLE_NDI set but ${dylib} not found — NDI runtime not bundled`);
-    }
+    const fwDir = path.join(contentsDir, 'Frameworks');
+    fs.mkdirSync(fwDir, { recursive: true });
+    const dst = path.join(fwDir, 'libndi.dylib');
+    fs.copyFileSync(ndiDylibSrc, dst);
+    // The app is arm64-only; drop the x86_64 slice (29 MB → ~15 MB). The file is
+    // re-signed with our identity in signMacApp, so the SDK's signature going
+    // stale here does not matter.
+    try {
+      const archs = execSync(`lipo -archs "${dst}"`, { encoding: 'utf8' }).trim();
+      if (archs.includes('x86_64') && archs.includes('arm64')) {
+        execSync(`lipo -thin arm64 "${dst}" -output "${dst}.arm64"`, { stdio: 'inherit' });
+        fs.renameSync(`${dst}.arm64`, dst);
+      }
+    } catch (e) { console.warn('  Could not thin libndi.dylib to arm64 (kept universal):', e.message); }
+    if (fs.existsSync(licenses)) fs.copyFileSync(licenses, path.join(resourcesDir, 'libndi_licenses.txt'));
+    console.log(`  Bundled NDI runtime (${ndiDylibSrc}) into Contents/Frameworks/libndi.dylib (${(fs.statSync(dst).size / 1e6).toFixed(1)} MB)`);
+  } else if (process.env.BUNDLE_NDI === '0' || process.argv.includes('--no-bundle-ndi')) {
+    console.log('  NDI runtime not bundled (BUNDLE_NDI=0): the app will need NDI Tools for Mac for NDI → SDI');
+  } else {
+    console.warn(`  WARNING: ${ndiDylibSrc} not found — NDI runtime not bundled; the app will need NDI Tools for Mac for NDI → SDI`);
   }
 
   // Bundle .env.local (Gemini key) so the Context Engine works out-of-box,
@@ -348,7 +361,7 @@ END_SCRIPT
 }
 
 function createMacReadme(version) {
-  const bundledNdi = process.env.BUNDLE_NDI === '1' || process.argv.includes('--bundle-ndi');
+  const bundledNdi = fs.existsSync(path.join(BUILD, 'Community Captioner.app', 'Contents', 'Frameworks', 'libndi.dylib'));
   const ndiNote = bundledNdi
     ? `NDI
 ---
