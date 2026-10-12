@@ -233,9 +233,12 @@ export async function killPortListener(port = 9000) {
         const r = await run('netstat', ['-ano', '-p', 'tcp'], { timeout: 5000 });
         for (const line of r.stdout.split('\n')) {
             const m = line.trim().match(/^TCP\s+\S+:(\d+)\s+\S+\s+LISTENING\s+(\d+)/i);
-            if (m && +m[1] === port) pids.push(+m[2]);
+            if (m && +m[1] === port && +m[2] !== process.pid) pids.push(+m[2]);
         }
-        for (const pid of pids) await run('taskkill', ['/PID', String(pid), '/T', '/F'], { timeout: 5000 });
+        // TerminateProcess on the listener directly (process.kill is forceful on Windows).
+        // taskkill enumerates every process first, which took 45–50 s on the busy Windows
+        // test rig, far past any reasonable timeout; it stays below as a fallback.
+        for (const pid of pids) { try { process.kill(pid); } catch {} }
     } else {
         const r = await run('lsof', ['-ti', `tcp:${port}`, '-sTCP:LISTEN'], { timeout: 5000 });
         pids = r.stdout.split('\n').map(x => +x.trim()).filter(n => n > 0 && n !== process.pid);
@@ -244,6 +247,10 @@ export async function killPortListener(port = 9000) {
     for (let i = 0; i < 30 && await portOpen(port); i++) {
         if (i === 15 && process.platform !== 'win32') for (const pid of pids) { try { process.kill(pid, 'SIGKILL'); } catch {} }
         await new Promise(r => setTimeout(r, 200));
+    }
+    if (process.platform === 'win32' && pids.length && await portOpen(port)) {
+        for (const pid of pids) await run('taskkill', ['/PID', String(pid), '/T', '/F'], { timeout: 90000 });
+        for (let i = 0; i < 15 && await portOpen(port); i++) await new Promise(r => setTimeout(r, 200));
     }
     invalidateProbe();
     return { killed: pids, freed: !(await portOpen(port)) };
@@ -425,7 +432,9 @@ export async function startWhisper({ model = 'large-v3-turbo', backend = 'auto',
     const wantMlx = IS_APPLE_SILICON && (backend === 'auto' || backend === 'mlx');
     const pkgs = ['numpy', 'websockets', 'faster-whisper', ...(wantMlx ? ['mlx-whisper'] : [])];
     const serverArgs = [scriptPath, '--model', model, '--backend', backend, '--device', device, '--compute', compute, '--language', language, '--port', String(port), ...(interim ? [] : ['--no-interim']), ...(interimModel && interimModel !== 'auto' ? ['--interim-model', interimModel] : [])];
-    const env = { HF_HOME: join(LOCAL_DIR, 'hf-cache') };
+    // Windows without Developer Mode can't make symlinks; huggingface_hub copies instead and
+    // otherwise prints a long warning that reads like an error in the wizard's log.
+    const env = { HF_HOME: join(LOCAL_DIR, 'hf-cache'), HF_HUB_DISABLE_SYMLINKS_WARNING: '1' };
 
     let cmd, args, runner;
     if (info.uv.installed) {
@@ -554,10 +563,15 @@ export async function ollamaStart(baseUrl = 'http://127.0.0.1:11434') {
     const probe = await detectOllama(baseUrl);
     if (probe.running) return { ok: true, alreadyRunning: true };
     if (!probe.installed) return { ok: false, error: 'Ollama is not installed' };
-    const bin = IS_MAC && existsSync('/Applications/Ollama.app') ? 'open' : 'ollama';
+    // The Windows installer is per-user and its PATH entry only reaches processes started
+    // after the install, so prefer the install location over a bare "ollama".
+    const winExe = IS_WIN ? join(os.homedir(), 'AppData', 'Local', 'Programs', 'Ollama', 'ollama.exe') : null;
+    const bin = IS_MAC && existsSync('/Applications/Ollama.app') ? 'open' : winExe && existsSync(winExe) ? winExe : 'ollama';
     const args = bin === 'open' ? ['-a', 'Ollama'] : ['serve'];
+    let spawnError = null;
     try {
         const child = spawn(bin, args, { detached: true, stdio: 'ignore', windowsHide: true });
+        child.on('error', (e) => { spawnError = e; });  // ENOENT arrives as an event; unhandled it would crash the relay
         child.unref();
     } catch (e) { return { ok: false, error: e.message }; }
     for (let i = 0; i < 20; i++) {
