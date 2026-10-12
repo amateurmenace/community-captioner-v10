@@ -12,4 +12,4 @@ export const RELEASES_URL = `${GITHUB_REPO_URL}/releases/latest`;
 //          NDI → SDI passthrough (needs NDI Tools / the NDI Runtime), standard CEA-608/708 packets
 //          and a working YouTube caption-ingestion POST; local AI on CPU or NVIDIA.
 export const MAC_DOWNLOAD_URL = `${GITHUB_REPO_URL}/releases/download/v10.1/Community-Captioner-6.11.1-mac-arm64.zip`;
-export const WINDOWS_DOWNLOAD_URL = `${GITHUB_REPO_URL}/releases/download/v10.1/Community-Captioner-6.11.1-windows-x64.zip`;
+export const WINDOWS_DOWNLOAD_URL = `${GITHUB_REPO_URL}/releases/download/v10.1/Community-Captioner-6.11.3-windows-x64.zip`;
