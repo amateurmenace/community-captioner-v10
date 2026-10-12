@@ -75,15 +75,38 @@ class FasterWhisperBackend:
     def __init__(self, model_name, device, compute, language):
         from faster_whisper import WhisperModel  # noqa: WPS433
         fw_id = MODELS.get(model_name, (model_name,))[0]
+        self.language, self.model_id = language, fw_id
         if device == "auto":
-            device = "cuda" if _cuda_available() else "cpu"
-        if compute == "auto":
+            reason = _cuda_unusable_reason()
+            if reason is None:
+                cuda_compute = compute if compute != "auto" else _best_cuda_compute()
+                try:
+                    self._load(WhisperModel, fw_id, "cuda", cuda_compute)
+                    # Missing cuBLAS only shows up on the first inference, so warm up before trusting the GPU
+                    self.transcribe(_warmup_audio())
+                    return
+                except Exception as e:  # missing CUDA DLLs, unsupported compute type, out of GPU memory…
+                    reason = str(e).strip().splitlines()[0] if str(e).strip() else type(e).__name__
+                    self.model = None
+            if reason != "no CUDA device":
+                log(f"CUDA not usable ({reason}); falling back to CPU")
+            device = "cpu"
+            if compute in ("auto", "float16", "int8_float16", "bfloat16", "int8_bfloat16"):
+                compute = "int8"
+        elif compute == "auto":
             compute = "float16" if device == "cuda" else "int8"
-        self.device, self.compute, self.language = device, compute, language
+        self._load(WhisperModel, fw_id, device, compute)
+
+    def _load(self, WhisperModel, fw_id, device, compute):
+        self.device, self.compute = device, compute
         status("loading", backend=self.name, model=fw_id, device=device, compute=compute,
                message=f"Loading {fw_id} on {device} ({compute}) — first run downloads the model")
-        self.model = WhisperModel(fw_id, device=device, compute_type=compute)
-        self.model_id = fw_id
+        # faster-whisper uses 4 CPU threads by default. On a 24-core/48-thread Xeon one 4 s
+        # segment took (distil-large-v3 / small.en): 4 threads 5.1 / 1.28 s, 8 → 3.8 / 1.07 s,
+        # 12 → 3.5 / 0.95 s, 24 → 4.3 s. So scale with the machine but stop at 12; machines with
+        # 16 or fewer logical cores keep the default (0 = 4 threads, or OMP_NUM_THREADS).
+        threads = min(12, (os.cpu_count() or 4) // 4) if device == "cpu" else 0
+        self.model = WhisperModel(fw_id, device=device, compute_type=compute, cpu_threads=threads if threads > 4 else 0)
 
     def transcribe(self, audio):
         segments, _info = self.model.transcribe(
@@ -121,6 +144,40 @@ def _cuda_available():
         return ctranslate2.get_cuda_device_count() > 0
     except Exception:
         return False
+
+
+def _cuda_unusable_reason():
+    """None if CUDA looks usable, else a short reason. Checked before touching the GPU."""
+    if not _cuda_available():
+        return "no CUDA device"
+    if platform.system() == "Windows":
+        # The ctranslate2 wheel ships cuDNN but not cuBLAS; without the CUDA 12 runtime the
+        # model loads on the GPU and then every transcription fails. ctypes fails cleanly.
+        # winmode=0 = the classic search order including PATH, where the CUDA installer puts it.
+        import ctypes  # noqa: WPS433
+        try:
+            ctypes.WinDLL("cublas64_12.dll", winmode=0)
+        except OSError:
+            return "cublas64_12.dll not found — install the CUDA 12 runtime to use the GPU"
+    return None
+
+
+def _best_cuda_compute():
+    """float16 where the GPU supports it (Volta and newer), else int8 (e.g. Pascal cards)."""
+    try:
+        import ctranslate2  # noqa: WPS433
+        supported = ctranslate2.get_supported_compute_types("cuda")
+    except Exception:
+        return "float16"
+    for c in ("float16", "int8_float16", "int8", "float32"):
+        if c in supported:
+            return c
+    return "float32"
+
+
+def _warmup_audio():
+    import numpy as np
+    return np.random.default_rng(0).normal(0, 0.01, SAMPLE_RATE).astype(np.float32)
 
 
 def _is_apple_silicon():
@@ -501,7 +558,9 @@ async def serve(args, backend):
             try:
                 status("loading", backend=backend.name, model=choice, device=backend.device, compute=backend.compute,
                        message=f"Loading the fast live-caption model ({choice})…")
-                interim_backend = type(backend)(choice, args.device, args.compute, backend.language)
+                # Same device/compute the main model ended up on (after any CUDA → CPU fallback),
+                # so a GPU that just failed is not tried a second time.
+                interim_backend = type(backend)(choice, backend.device, backend.compute, backend.language)
                 log(f"Live captions use {interim_backend.model_id}; finals use {backend.model_id}")
             except Exception as e:
                 log(f"Could not load interim model '{choice}' ({e}); using the main model for live captions")
@@ -509,8 +568,11 @@ async def serve(args, backend):
     server = Server(backend, interim=not args.no_interim, interim_s=args.interim_interval, interim_backend=interim_backend)
     async with websockets.serve(server.handle, args.host, args.port, max_size=8 * 1024 * 1024):
         url = f"ws://127.0.0.1:{args.port}"
+        # pid: on Windows the venv's python.exe is a launcher that runs the real interpreter as a
+        # child, so the pid the app spawned is not the process that holds the model in memory.
         status("ready", url=url, backend=backend.name, model=backend.model_id, device=backend.device, compute=backend.compute,
-               scriptVersion=SCRIPT_VERSION, interimModel=getattr(interim_backend, "model_id", None), interimSeconds=server.interim_s)
+               scriptVersion=SCRIPT_VERSION, interimModel=getattr(interim_backend, "model_id", None), interimSeconds=server.interim_s,
+               pid=os.getpid())
         log("")
         log("✅ Speech server ready")
         log(f"   Backend : {backend.name}")
@@ -523,6 +585,12 @@ async def serve(args, backend):
 
 
 def main():
+    # A Windows log file / pipe defaults to cp1252: "✅" must not crash the server after it is ready
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(errors="replace")
+        except Exception:
+            pass
     p = argparse.ArgumentParser(description="Community Captioner local speech server")
     p.add_argument("--model", default="large-v3-turbo", help="model name (see --list-models) or a custom model id/path")
     p.add_argument("--backend", default="auto", choices=["auto", "mlx", "faster-whisper"])
