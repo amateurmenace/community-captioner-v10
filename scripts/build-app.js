@@ -623,11 +623,13 @@ import '../server/relay.js';
   if (buildWin) {
     console.log('\n=== Packaging Windows .exe (pkg) ===');
     const winExe = path.join(BUILD, 'CommunityCaptioner.exe');
+    // Quoted: Windows checkouts often live under a profile path with a space
+    // (C:\Users\First Last\...), which pkg would otherwise split into extra entries.
     run(
-      `npx @yao-pkg/pkg ${path.join(BUILD, 'launcher.cjs')} ` +
+      `npx @yao-pkg/pkg "${path.join(BUILD, 'launcher.cjs')}" ` +
       `--target node20-win-x64 ` +
-      `--output ${winExe} ` +
-      `--config ${path.join(BUILD, 'package.json')}`,
+      `--output "${winExe}" ` +
+      `--config "${path.join(BUILD, 'package.json')}"`,
       'pkg → Windows x64'
     );
 
