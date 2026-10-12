@@ -701,7 +701,7 @@ function App() {
                         if (ctx.state === 'suspended') await ctx.resume();
                         
                         source = ctx.createMediaStreamSource(stream!);
-                        const processor = ctx.createScriptProcessor(4096, 1, 1);
+                        const processor = ctx.createScriptProcessor(2048, 1, 1);
                         processor.onaudioprocess = (e) => {
                             if (ws.readyState === 1) {
                                 const data = e.inputBuffer.getChannelData(0);

@@ -149,9 +149,10 @@ class Segmenter:
     growing segment are produced every `interim_s` while the speaker continues.
     """
 
-    def __init__(self, threshold=0.012, silence_ms=650, min_speech_ms=350, max_segment_s=14.0, interim_s=2.0):
+    def __init__(self, threshold=0.012, silence_ms=650, min_speech_ms=350, max_segment_s=14.0, interim_s=0.5):
         import numpy as np
         self.np = np
+        self.segment_id = 0  # bumps on every reset so late interim results for an old segment are dropped
         self.threshold = threshold
         self.silence_frames = int(SAMPLE_RATE * silence_ms / 1000)
         self.min_speech_frames = int(SAMPLE_RATE * min_speech_ms / 1000)
@@ -211,7 +212,12 @@ class Segmenter:
                 self._reset()
         return out
 
+    def speaking(self):
+        """True while a segment is open and the speaker has not paused long enough to end it."""
+        return self.speech_frames >= self.min_speech_frames and self.trailing_silence < self.silence_frames
+
     def _reset(self):
+        self.segment_id += 1
         self.buffer = self.np.zeros(0, dtype=self.np.float32)
         self.speech_frames = 0
         self.trailing_silence = 0
@@ -225,9 +231,13 @@ class Segmenter:
 # ---------------------------------------------------------------------------
 
 class Server:
-    def __init__(self, backend, interim):
+    def __init__(self, backend, interim, interim_s=None):
         self.backend = backend
         self.interim = interim
+        # Interim cadence: on a GPU the model keeps up with ~0.5 s updates; on CPU a
+        # longer gap leaves room for the finals (interims and finals share one lock).
+        on_cpu = "cpu" in str(getattr(backend, "device", "")).lower()
+        self.interim_s = interim_s if interim_s else (1.2 if on_cpu else 0.5)
         self.lock = threading.Lock()  # one transcription at a time per process
 
     async def handle(self, websocket):
@@ -237,11 +247,11 @@ class Server:
         await websocket.send(json.dumps({
             "type": "hello", "version": 1, "backend": self.backend.name, "model": self.backend.model_id,
             "device": self.backend.device, "compute": self.backend.compute, "language": self.backend.language or "auto",
-            "interim": self.interim, "platform": platform.system().lower(),
+            "interim": self.interim, "interimSeconds": self.interim_s, "platform": platform.system().lower(),
         }))
-        seg = Segmenter()
+        seg = Segmenter(interim_s=self.interim_s)
         loop = asyncio.get_running_loop()
-        pending_interim = None
+        conn = {"seg": seg, "pending": None, "deferred": False, "final_pending": False}
         try:
             async for message in websocket:
                 if isinstance(message, str):
@@ -256,13 +266,20 @@ class Server:
                 pcm = np.frombuffer(message, dtype=np.int16)
                 for kind, audio, last_speech_at in seg.feed(pcm):
                     if kind == "interim":
-                        if not self.interim or (pending_interim and not pending_interim.done()):
-                            continue  # skip if a previous interim is still running
-                        pending_interim = loop.run_in_executor(None, self._transcribe_safe, audio)
-                        asyncio.ensure_future(self._send_when_done(websocket, pending_interim, False, None))
+                        if not self.interim:
+                            continue
+                        if conn["pending"] and not conn["pending"].done():
+                            conn["deferred"] = True  # run again the moment the current one finishes
+                            continue
+                        self._start_interim(loop, websocket, conn, audio)
                     else:
                         t0 = time.time()
-                        text = await loop.run_in_executor(None, self._transcribe_safe, audio)
+                        conn["final_pending"] = True
+                        conn["deferred"] = False
+                        try:
+                            text = await loop.run_in_executor(None, self._transcribe_safe, audio)
+                        finally:
+                            conn["final_pending"] = False
                         if text:
                             latency = int((time.time() - (last_speech_at or t0)) * 1000)
                             log(f"[{latency:5d} ms] {text}")
@@ -273,11 +290,25 @@ class Server:
                 log(f"Client error: {e}")
         log("Client disconnected")
 
-    async def _send_when_done(self, websocket, fut, is_final, latency):
+    def _start_interim(self, loop, websocket, conn, audio):
+        seg = conn["seg"]
+        fut = loop.run_in_executor(None, self._transcribe_safe, audio)
+        conn["pending"] = fut
+        conn["deferred"] = False
+        asyncio.ensure_future(self._send_interim(websocket, fut, conn, seg.segment_id, loop))
+
+    async def _send_interim(self, websocket, fut, conn, segment_id, loop):
         try:
             text = await fut
-            if text:
-                await websocket.send(json.dumps({"text": text, "isFinal": is_final}))
+            seg = conn["seg"]
+            # Drop it if the segment has already been finalized: a late interim would
+            # otherwise overwrite the cleared interim line in the UI with old words.
+            if text and seg.segment_id == segment_id:
+                await websocket.send(json.dumps({"text": text, "isFinal": False}))
+            # Audio kept arriving while we were busy: go straight into the next one,
+            # unless a final for this segment is waiting its turn.
+            if conn["deferred"] and not conn["final_pending"] and seg.segment_id == segment_id and seg.speaking():
+                self._start_interim(loop, websocket, conn, seg.buffer.copy())
         except Exception:
             pass
 
@@ -293,7 +324,7 @@ class Server:
 
 async def serve(args, backend):
     import websockets
-    server = Server(backend, interim=not args.no_interim)
+    server = Server(backend, interim=not args.no_interim, interim_s=args.interim_interval)
     async with websockets.serve(server.handle, args.host, args.port, max_size=8 * 1024 * 1024):
         url = f"ws://127.0.0.1:{args.port}"
         status("ready", url=url, backend=backend.name, model=backend.model_id, device=backend.device, compute=backend.compute)
@@ -318,6 +349,7 @@ def main():
     p.add_argument("--host", default="0.0.0.0")
     p.add_argument("--port", type=int, default=9000)
     p.add_argument("--no-interim", action="store_true", help="only send final segments (saves CPU)")
+    p.add_argument("--interim-interval", type=float, default=None, help="seconds of new speech between interim updates (default 0.5 on GPU, 1.2 on CPU)")
     p.add_argument("--list-models", action="store_true")
     args = p.parse_args()
 

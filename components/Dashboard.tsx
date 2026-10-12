@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { Mic, StopCircle, Home, Activity, Play, Globe, Layout, ShieldCheck, Zap, Lock, CloudLightning, Wifi, Info, Captions, ExternalLink, Link as LinkIcon, Copy, Monitor, Network, Check, Pause, X, Download, ShieldAlert, Edit2, Clock, Signal, AlertTriangle, Server, Video, QrCode, Eye, Terminal, ChevronRight, ChevronDown, WifiOff, Cloud } from 'lucide-react';
+import { Cpu, Mic, StopCircle, Home, Activity, Play, Globe, Layout, ShieldCheck, Zap, Lock, CloudLightning, Wifi, Info, Captions, ExternalLink, Link as LinkIcon, Copy, Monitor, Network, Check, Pause, X, Download, ShieldAlert, Edit2, Clock, Signal, AlertTriangle, Server, Video, QrCode, Eye, Terminal, ChevronRight, ChevronDown, WifiOff, Cloud } from 'lucide-react';
 import { Caption, DictionaryEntry, OperationMode, SessionStats, Notification, AudioDevice, UILanguage, OverlaySettings, LocalEngineInfo } from '../types';
 import { useTranslation } from '../utils/i18n';
 import { LANGUAGES } from '../utils/languages';
@@ -669,6 +669,130 @@ const Dashboard: React.FC<DashboardProps> = ({
       setMode(newMode);
   };
 
+  // ---- Live machine metrics (CPU / RAM / GPU / network) -------------------
+  // Local models are only as good as the machine running them, so the relay
+  // samples the host every 2 s (GET /api/system/metrics) while we ask for it.
+  type SysMetrics = {
+      ts: number;
+      cpu: { percent: number | null; cores: number; loadAvg1: number; model: string };
+      memory: { usedGB: number; totalGB: number; percent: number; pressure: string | null };
+      gpu: { available: boolean; percent?: number; rendererPercent?: number | null; memoryUsedGB?: number | null; memoryTotalGB?: number | null; unified?: boolean; name?: string };
+      network: { downKBps: number | null; upKBps: number | null; iface: string | null };
+      processes: { name: string; pid: number; cpu: number | null; memGB: number; count?: number }[];
+  };
+  const [sys, setSys] = useState<SysMetrics | null>(null);
+  const [sysHistory, setSysHistory] = useState<{ cpu: number; gpu: number; mem: number; down: number; up: number }[]>([]);
+  const [showSys, setShowSys] = useState(false);
+  const [sysError, setSysError] = useState(false);
+  useEffect(() => {
+      let stopped = false;
+      const tick = async () => {
+          try {
+              const r = await fetch(`${getRelayHttpUrl()}/api/system/metrics`);
+              const d = await r.json();
+              if (stopped || !d.ok) return;
+              setSys(d);
+              setSysError(false);
+              setSysHistory(h => [...h.slice(-39), { cpu: d.cpu.percent ?? 0, gpu: d.gpu.available ? (d.gpu.percent ?? 0) : 0, mem: d.memory.percent, down: d.network.downKBps ?? 0, up: d.network.upKBps ?? 0 }]);
+          } catch { if (!stopped) setSysError(true); }
+      };
+      tick();
+      const id = setInterval(tick, isRecording || showSys ? 2000 : 6000);
+      return () => { stopped = true; clearInterval(id); };
+  }, [isRecording, showSys]);
+  const sysTone = (pct: number | null | undefined) => pct == null ? 'text-stone-400' : pct >= 90 ? 'text-red-500' : pct >= 70 ? 'text-amber-500' : 'text-stone-800';
+  const sysBar = (pct: number | null | undefined) => pct == null ? 'bg-stone-300' : pct >= 90 ? 'bg-red-500' : pct >= 70 ? 'bg-amber-400' : 'bg-sage-500';
+  const fmtRate = (kb: number | null) => kb == null ? '—' : kb >= 1024 ? `${(kb / 1024).toFixed(1)} MB/s` : `${kb} KB/s`;
+  const memTone = sys?.memory.pressure === 'critical' ? 'text-red-500' : sys?.memory.pressure === 'warning' ? 'text-amber-500' : sysTone(sys?.memory.percent);
+  const Spark = ({ values, max = 100, tone }: { values: number[]; max?: number; tone: string }) => (
+      <div className={`flex items-end gap-px h-5 w-24 ${tone}`} aria-hidden>
+          {values.map((v, i) => <div key={i} className="flex-1 bg-current rounded-[1px] opacity-70" style={{ height: `${Math.max(6, Math.min(100, (v / (max || 1)) * 100))}%` }} />)}
+      </div>
+  );
+  const SysRow = ({ icon: Icon, label, value, pct, tone, bar, spark, sparkMax, note }: any) => (
+      <div className="py-2 border-b border-stone-100 last:border-0">
+          <div className="flex items-center gap-2">
+              <Icon size={13} className="text-stone-400 shrink-0" />
+              <span className="text-[11px] font-bold text-stone-500 uppercase tracking-wider w-16">{label}</span>
+              <span className={`font-mono text-sm font-bold flex-1 ${tone}`}>{value}</span>
+              <Spark values={spark} max={sparkMax} tone={tone} />
+          </div>
+          {pct != null && <div className="mt-1.5 ml-[22px] h-1.5 bg-stone-100 rounded-full overflow-hidden"><div className={`h-full rounded-full transition-all duration-500 ${bar}`} style={{ width: `${Math.max(1, Math.min(100, pct))}%` }} /></div>}
+          {note && <p className="ml-[22px] mt-1 text-[10px] text-stone-400">{note}</p>}
+      </div>
+  );
+  const sysWarnings: string[] = [];
+  if (sys) {
+      if ((sys.cpu.percent ?? 0) >= 90) sysWarnings.push(mode === 'local' || mode === 'fully_local' ? 'CPU is saturated: captions may lag. On a machine without a GPU, pick a smaller Whisper model in Local AI setup.' : 'CPU is saturated: close other apps if captions start to lag.');
+      if (sys.memory.pressure === 'critical' || sys.memory.percent >= 92) sysWarnings.push('Memory is nearly full: the OS will start swapping and the models will slow down. Close other apps or choose a smaller model.');
+      else if (sys.memory.pressure === 'warning') sysWarnings.push('Memory pressure is elevated. Fine for now; avoid opening more large apps.');
+      if (sys.gpu.available && (sys.gpu.percent ?? 0) >= 97 && isRecording) sysWarnings.push('GPU is fully busy, which is normal while transcribing. If captions lag, Auto-Learn and translation are competing for it.');
+  }
+  const systemCard = (
+      <div className="relative">
+          <Tooltip text="How this computer is coping: CPU, memory, GPU and network. Click for details.">
+              <button onClick={() => setShowSys(v => !v)} className={`flex flex-col items-start px-4 min-w-[150px] text-left rounded-lg transition-colors ${showSys ? 'bg-stone-200/70' : 'hover:bg-stone-100'}`}>
+                  <span className="text-[10px] font-bold text-stone-400 uppercase tracking-wider mb-1 flex items-center gap-1"><Cpu size={10} /> This machine</span>
+                  {sys ? (
+                      <span className="flex items-baseline gap-x-2 leading-none whitespace-nowrap">
+                          <span className={`text-xl font-display font-bold ${sysTone(sys.cpu.percent)}`}>{sys.cpu.percent ?? '—'}%</span><span className="text-[9px] font-bold text-stone-400 -ml-1">CPU</span>
+                          {sys.gpu.available && <><span className={`text-xl font-display font-bold ${sysTone(sys.gpu.percent)}`}>{sys.gpu.percent}%</span><span className="text-[9px] font-bold text-stone-400 -ml-1">GPU</span></>}
+                          <span className={`text-xl font-display font-bold ${memTone}`}>{sys.memory.percent}%</span><span className="text-[9px] font-bold text-stone-400 -ml-1">RAM</span>
+                      </span>
+                  ) : <span className="text-xl font-display font-bold text-stone-400">{sysError ? 'offline' : '…'}</span>}
+              </button>
+          </Tooltip>
+          {showSys && (
+              <>
+                  <div className="fixed inset-0 z-40" onClick={() => setShowSys(false)} />
+                  <div className="absolute top-full left-0 mt-3 w-[440px] bg-white rounded-2xl shadow-2xl border border-stone-200 p-4 z-50 text-left">
+                      <div className="flex items-center justify-between mb-1">
+                          <div>
+                              <p className="text-sm font-bold text-forest-dark">This machine</p>
+                              <p className="text-[10px] text-stone-400">{sys?.cpu.model || ''}{sys ? ` · ${sys.cpu.cores} cores · ${sys.memory.totalGB} GB RAM` : ''}{sys?.gpu.available ? ` · ${sys.gpu.name}` : ''}</p>
+                          </div>
+                          <button onClick={() => setShowSys(false)} className="p-1 text-stone-400 hover:text-stone-700"><X size={14} /></button>
+                      </div>
+                      {!sys ? (
+                          <p className="text-xs text-stone-500 py-4">{sysError ? 'The relay is not reachable, so there are no machine stats.' : 'Measuring…'}</p>
+                      ) : (
+                          <>
+                              <SysRow icon={Cpu} label="CPU" value={`${sys.cpu.percent ?? '—'}%`} pct={sys.cpu.percent} tone={sysTone(sys.cpu.percent)} bar={sysBar(sys.cpu.percent)} spark={sysHistory.map(h => h.cpu)} note={`Load ${sys.cpu.loadAvg1} on ${sys.cpu.cores} cores`} />
+                              <SysRow icon={Activity} label="RAM" value={`${sys.memory.usedGB} / ${sys.memory.totalGB} GB`} pct={sys.memory.percent} tone={memTone} bar={sys.memory.pressure === 'critical' ? 'bg-red-500' : sys.memory.pressure === 'warning' ? 'bg-amber-400' : sysBar(sys.memory.percent)} spark={sysHistory.map(h => h.mem)} note={sys.memory.pressure ? `Memory pressure: ${sys.memory.pressure}` : undefined} />
+                              {sys.gpu.available ? (
+                                  <SysRow icon={Zap} label="GPU" value={`${sys.gpu.percent}%`} pct={sys.gpu.percent} tone={sysTone(sys.gpu.percent)} bar={sysBar(sys.gpu.percent)} spark={sysHistory.map(h => h.gpu)} note={sys.gpu.memoryUsedGB != null ? (sys.gpu.unified ? `${sys.gpu.memoryUsedGB} GB of unified memory in use by the GPU` : `${sys.gpu.memoryUsedGB} / ${sys.gpu.memoryTotalGB} GB VRAM`) : undefined} />
+                              ) : (
+                                  <SysRow icon={Zap} label="GPU" value="not reported" pct={null} tone="text-stone-400" bar="" spark={[]} note="Only Apple and NVIDIA GPUs report utilization here. Local models still use whatever GPU they can." />
+                              )}
+                              <SysRow icon={Wifi} label="Network" value={`↓ ${fmtRate(sys.network.downKBps)}   ↑ ${fmtRate(sys.network.upKBps)}`} pct={null} tone="text-stone-800" bar="" spark={sysHistory.map(h => h.down + h.up)} sparkMax={Math.max(64, ...sysHistory.map(h => h.down + h.up))} note={sys.network.iface ? `${sys.network.iface}${mode === 'local' || mode === 'fully_local' ? ' · local modes send no audio over the network; cloud modes stream it continuously' : ''}` : undefined} />
+                              {sys.processes.length > 0 && (
+                                  <div className="mt-2 pt-2 border-t border-stone-100">
+                                      <p className="text-[10px] font-bold text-stone-400 uppercase tracking-wider mb-1">What the captioning stack is using</p>
+                                      {sys.processes.map(p => (
+                                          <div key={p.pid} className="flex items-center justify-between text-[11px] py-0.5">
+                                              <span className="text-stone-600">{p.name}{p.count && p.count > 1 ? ` (${p.count} processes)` : ''}</span>
+                                              <span className="font-mono text-stone-800">{p.cpu != null ? `${p.cpu}% CPU · ` : ''}{p.memGB} GB</span>
+                                          </div>
+                                      ))}
+                                      {(mode === 'local' || mode === 'fully_local') && !sys.processes.some(p => p.name.startsWith('Whisper')) && (
+                                          <p className="text-[10px] text-stone-400 mt-1">The speech server is not managed by this app (or not running), so it is not listed; its load still shows in the totals above.</p>
+                                      )}
+                                  </div>
+                              )}
+                              {sysWarnings.length > 0 && (
+                                  <div className="mt-2 bg-amber-50 border border-amber-200 rounded-lg p-2 space-y-1">
+                                      {sysWarnings.map((w, i) => <p key={i} className="text-[11px] text-amber-800 flex items-start gap-1"><AlertTriangle size={12} className="shrink-0 mt-0.5" /> {w}</p>)}
+                                  </div>
+                              )}
+                              <p className="text-[10px] text-stone-400 mt-2">Sampled every {isRecording ? 2 : 6} seconds · {Math.max(0, Math.round((Date.now() - sys.ts) / 1000))} s ago</p>
+                          </>
+                      )}
+                  </div>
+              </>
+          )}
+      </div>
+  );
+
   const MetricCard = ({ label, value, colorClass, icon: Icon }: any) => (
       <Tooltip text={`Real-time statistic for ${label}`}>
           <div className="flex flex-col items-start px-4 border-r border-stone-100 last:border-0 cursor-help min-w-[100px]">
@@ -716,6 +840,7 @@ const Dashboard: React.FC<DashboardProps> = ({
                <MetricCard label={t.latency} value={stats.latencySamples ? `${(stats.latencyMs / 1000).toFixed(1)}s` : '—'} colorClass={stats.latencySamples && stats.latencyMs > 3000 ? "text-red-500 animate-pulse" : stats.latencySamples && stats.latencyMs > 1500 ? "text-yellow-600" : "text-stone-800"} icon={Signal} />
                <MetricCard label={t.wpm} value={`${stats.wpmHistory.length > 0 ? Math.round(stats.wpmHistory[stats.wpmHistory.length - 1].wpm) : 0}`} colorClass="text-stone-800" />
                <MetricCard label={t.confidence} value={stats.confidenceSamples ? `${(stats.averageConfidence * 100).toFixed(0)}%` : '—'} colorClass={!stats.confidenceSamples ? "text-stone-400" : stats.averageConfidence > 0.9 ? "text-green-600" : "text-yellow-600"} />
+               {systemCard}
           </div>
         </div>
 

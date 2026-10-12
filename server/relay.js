@@ -10,6 +10,7 @@ import { spawn } from 'child_process';
 import { polish, localPolish, summarize, truncateAtWord, setApiKey as setPolisherApiKey, toggleGemini as togglePolisherGemini, getStatus as getPolisherStatus } from './caption-polisher.js';
 import { feedText as learnerFeedText, setApiKey as setLearnerApiKey, setEnabled as setLearnerEnabled, getSuggestions, acceptSuggestion, dismissSuggestion, setDictionary as setLearnerDictionary, getDictionary as getLearnerDictionary, extractDictionary, generateMishearings, getStatus as getLearnerStatus } from './context-learner.js';
 import { translateCaption, setApiKey as setTranslationApiKey, getSupportedLanguages, getCacheStats as getTranslationStats, translationAvailable } from './translation-service.js';
+import { getSystemMetrics } from './system-metrics.js';
 import { fetchPage, htmlToText, extractPdfText, extractUploadedText, pdfSupportAvailable, discoverLinks, locateMunicipalitySources, researchMunicipality, extractDictionaryFromUrl, itemsToEntries, getResearchGroups, GEMINI_TEXT_MODEL } from './context-sources.js';
 import { listProfiles, getProfile, saveProfile, deleteProfile } from './profiles.js';
 import { buildCorrectionIndex, applyCorrections } from '../shared/corrections.js';
@@ -918,6 +919,16 @@ app.get('/api/checklist', async (req, res) => {
 });
 
 // --- Caption Polisher API ---
+// Live machine stats for the Dashboard: CPU, RAM, GPU, network and what the local
+// models cost. Sampling starts on first request and idles out 20 s after the last.
+app.get('/api/system/metrics', async (req, res) => {
+    try {
+        res.json({ ok: true, ...(await getSystemMetrics()) });
+    } catch (e) {
+        res.status(500).json({ ok: false, error: e.message });
+    }
+});
+
 app.get('/api/polisher/status', async (req, res) => {
     res.json({ ...getPolisherStatus(), localBrain: brainActive(), translationAvailable: await translationAvailable() });
 });

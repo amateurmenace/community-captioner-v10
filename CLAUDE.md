@@ -166,6 +166,8 @@ Audio → Gemini Transcribe Live / Gemini native audio / Whisper / WebSpeech →
 | `/api/polisher/toggle` | POST | Toggle Gemini AI polishing on/off |
 | `/api/polisher/apikey` | POST | Set Gemini API key for summarization/polish/learning |
 | `/api/audience-url` | GET | Audience view URL, backup URL, viewer count |
+| `/api/system/metrics` | GET | Live machine stats: CPU %, RAM used/total + macOS memory pressure, GPU % (Apple via ioreg, NVIDIA via nvidia-smi), network KB/s, Whisper/Ollama/relay process cost. Sampler starts on first request, 2 s cadence, idles out after 20 s |
+| `/api/translate` | POST | Translate one caption `{text, lang}` with the active engine (local brain first, then Gemini) |
 | `/api/context/status` | GET | Auto-learn enabled state, API key presence |
 | `/api/context/enable` | POST | Toggle auto-learn on/off |
 | `/api/context/suggestions` | GET | Pending auto-learned suggestions |
@@ -365,6 +367,14 @@ The Blackmagic Web Presenter HD/4K **does not forward SDI VANC closed captions i
 - `sessionStartMs` is set when the URL is configured; timecodes are relative to that
 - Sequence number must increase monotonically across POSTs for the same stream — YouTube rejects out-of-order
 
+## Local speech latency (local/whisper_server.py)
+
+The bundled Whisper server cuts audio into utterances with an energy VAD and transcribes the growing segment for interim captions. Interims used to run every 2 s of speech (first words appeared ~2.5 s after you started talking, versus ~0.4 s for the browser's Web Speech API). They now run **back to back**: `interim_s` is 0.5 s on GPU backends (mlx / CUDA) and 1.2 s on CPU, and when audio keeps arriving while an interim is in flight the next one starts the moment it finishes (`conn.deferred`). Measured on the M1 Max with large-v3-turbo on the 11.8 s sample: first interim at 0.93 s (was 2.46 s), updates every ~0.5 s (was ~2 s), final unchanged at ~1.2 s after speech ends. Each segment carries a `segment_id`; an interim that completes after its segment was finalized is dropped so it cannot overwrite the cleared interim line, and a deferred interim never starts while a final is waiting for the shared transcription lock. `--interim-interval N` overrides the cadence; the hello message reports `interimSeconds`. The browser's local path sends 128 ms PCM chunks (`createScriptProcessor(2048)`), half the previous size. Finals still wait for 650 ms of silence plus one inference.
+
+## Live machine metrics (server/system-metrics.js)
+
+The Dashboard's "This machine" card (in the metrics bar, click for the panel) shows CPU, RAM, GPU and network with sparklines, what the Whisper server, Ollama and the relay are using, and plain-language warnings (CPU saturated, memory pressure, GPU busy). It polls `GET /api/system/metrics` every 2 s while recording or while the panel is open, 6 s otherwise. Sources: `os.cpus()` deltas; `vm_stat` app memory (active + wired + compressed) and `kern.memorystatus_vm_pressure_level` on macOS, `/proc/meminfo` MemAvailable on Linux, `os.freemem()` on Windows; `ioreg -r -d 1 -c IOAccelerator` "Device Utilization %" on Macs and `nvidia-smi` elsewhere (other GPUs report `available: false`); `netstat -ibn` / `/proc/net/dev` / `netstat -e` byte counters turned into KB/s; `ps` (or `tasklist` on Windows, memory only) for the managed Whisper pid and `pgrep -f ollama`. GB values are GiB so a 32 GB Mac reads 32.
+
 ## Caption Polisher (server/caption-polisher.js)
 
 **Layer 1 — Local rules (zero latency, always active)**:
@@ -528,7 +538,7 @@ Fixed: the relay now feeds the learner from the WebSocket final-caption handler,
 
 `local/whisper_server.py` is the bundled speech server (ships inside the .app/.exe under `local/`, and in the repo). `server/local-stack.js` lets the relay — which runs on the operator's machine — probe the system, install and launch the server, stream its logs, and talk to Ollama, so `components/LocalSetup.tsx` can guide the operator with real feedback.
 
-**Speech server protocol** (`ws://127.0.0.1:9000`): client sends 16 kHz 16-bit mono PCM binary frames; server sends `{"type":"hello", backend, model, device, compute, language, interim}` on connect, `{"text", "isFinal": false}` interims (~every 2 s while speaking), `{"text", "isFinal": true, "latencyMs"}` finals (energy VAD cuts a segment after 650 ms of silence following ≥350 ms of speech, max 14 s), and `{"type":"status", state, message}`. `App.tsx` handles all of these; legacy servers that only send `{"text"}` still work (treated as final).
+**Speech server protocol** (`ws://127.0.0.1:9000`): client sends 16 kHz 16-bit mono PCM binary frames; server sends `{"type":"hello", backend, model, device, compute, language, interim}` on connect, `{"text", "isFinal": false}` interims (back to back, ~every 0.5 s on a GPU while speaking), `{"text", "isFinal": true, "latencyMs"}` finals (energy VAD cuts a segment after 650 ms of silence following ≥350 ms of speech, max 14 s), and `{"type":"status", state, message}`. `App.tsx` handles all of these; legacy servers that only send `{"text"}` still work (treated as final).
 
 **Backends** (auto-picked): `mlx-whisper` on Apple Silicon (GPU; model repos `mlx-community/whisper-*`), else `faster-whisper` (CTranslate2; CPU int8 or NVIDIA float16). Model catalogue in `WHISPER_MODELS` (local-stack.js) mirrors `MODELS` in the script: `large-v3-turbo` (default on Apple Silicon ≥16 GB and NVIDIA), `distil-large-v3` (English, CPU-friendly), `small.en`/`base.en` (light), `medium.en`, `large-v3`. `recommend(info)` picks by GPU/RAM/cores. Tested 2026-10-11 on an M1 Max: base.en on CPU and on MLX both return finals ~0.8–1.1 s after the speaker stops.
 

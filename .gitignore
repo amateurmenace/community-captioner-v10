@@ -26,3 +26,4 @@ native/decklink/build/
 *.njsproj
 *.sln
 *.sw?
+__pycache__/
