@@ -88,11 +88,11 @@ const SECTIONS: Section[] = [
         id: 'inject', icon: Captions, title: 'Caption Injection (broadcast)',
         lead: 'Workspace → Caption Injection. Embeds standards-compliant closed captions into an SDI signal with a Blackmagic DeckLink card, or forwards them to YouTube.',
         bullets: [
-            'Three output modes: standalone (captions on black), SDI passthrough (SDI in → SDI out with captions added), and NDI passthrough (an NDI source → SDI with captions, audio resampled to 48 kHz).',
+            'Three output modes: standalone (captions on black), SDI passthrough (SDI in → SDI out with captions added), and NDI passthrough (an NDI source → SDI with captions, audio resampled to 48 kHz). NDI PTZ cameras usually send no audio: on Windows, "Audio on the SDI output" lets you embed any audio input of the PC instead (a DeckLink Line In, Dante, line-in, or "What this PC plays on" a playback device).',
             'NDI runtime: the Mac app bundles it (nothing to install; NDI® is a registered trademark of Vizrt NDI AB). Windows needs the free NDI Tools or the NDI 6 Runtime from ndi.video; without it the NDI option says "Not available" and everything else works. NDI|HX cameras are fine.',
-            'CEA-608 roll-up (2 or 3 rows, about 60 characters per second, works with every decoder) or DTVCC / CEA-708 (about 200+ characters per second, with CEA-608 still carried for older decoders).',
+            'CEA-608 roll-up (2 or 3 rows, 32-column rows, about 60 characters per second, works with every decoder) or DTVCC / CEA-708 (about 200+ characters per second). In CEA-708 mode the app redraws the whole caption window every second (adjustable), so a decoder or encoder that drops caption frames shows the right text again within that time, and CEA-608 can still be carried alongside for older decoders or switched off.',
             'Caption strategy when speech outruns the standard: truncate at a word boundary, summarise with Gemini, or verbatim.',
-            'YouTube caption ingestion URL: use this whenever a Blackmagic Web Presenter is your encoder. The Web Presenter 4K (firmware 4.2.3) forwards only a fraction of the embedded CEA-608 characters and none of the control codes, so YouTube shows garbled text that never rolls; the app can instead POST each caption straight to YouTube\'s per-stream ingestion URL. In YouTube Studio set the stream\'s Closed captions to the ingestion-URL (POST) option, copy the URL into the Caption Injection screen and Save; captions appear on the stream within a couple of seconds. Keep SDI injection running for the in-room/decoder path.',
+            'YouTube caption ingestion URL: use this whenever a Blackmagic Web Presenter is your encoder. The Web Presenter 4K (firmware 4.2.3) drops 15–50 % of the caption frames, CEA-608 and CEA-708 alike, in blocks (measured with a numbered test pattern on two units), so CEA-608 arrives with characters and carriage returns missing; the app can instead POST each caption straight to YouTube\'s per-stream ingestion URL. In YouTube Studio set the stream\'s Closed captions to the ingestion-URL (POST) option, copy the URL into the Caption Injection screen and Save; captions appear on the stream within a couple of seconds. Keep SDI injection running for the in-room/decoder path.',
             'Output designer: the OBS / vMix overlay URL, fonts, colours, size and position.',
         ],
         tech: [
@@ -133,7 +133,7 @@ const SECTIONS: Section[] = [
             'Captions fall behind on SDI: CEA-608 is limited to about 60 characters per second. Switch the strategy to truncate with a lower line length, use summarise, or switch to DTVCC if your decoder supports it.',
             'PDF upload finds nothing: the PDF has no text layer (a scan). Export a text PDF from the agenda software or paste the text.',
             'The Municipality Wizard cannot read a town site: many municipal hosts block automated readers. With Gemini the pages are read from Google\'s side; locally, upload the agenda PDF for full coverage.',
-            'The Web Presenter shows captions but YouTube does not: use the YouTube caption ingestion URL instead of the encoder path.',
+            'The Web Presenter shows captions but YouTube does not, or shows garbled text: the Web Presenter drops caption frames. Use the YouTube caption ingestion URL instead of the encoder path, or CEA-708 with the window redraw (self-healing) if the destination renders 708.',
         ],
     },
     {

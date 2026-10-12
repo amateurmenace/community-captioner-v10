@@ -32,25 +32,24 @@ console.log('\n═══ CEA-608 Encoder ═══');
 
 const enc = new Cea608Encoder();
 
-// Test: Initialization produces RU2 + PAC control codes
-enc.enqueueText('Hi', false);
+// Test: a caption row goes out as RU2×2, PAC×2 (first row only), CR×2, then text
+enc.enqueueText('Hi');
 assert(enc.queueLength > 0, 'Queues byte pairs after enqueueText');
 
-// Drain init sequence: RU2×2 + PAC×2 = 4 control pairs, then 1 char pair ("Hi")
 const initPairs = [];
 while (enc.queueLength > 0) {
     initPairs.push(enc.drainPair());
 }
-assert(initPairs.length === 5, `Init + "Hi" = 5 pairs (got ${initPairs.length})`);
+assert(initPairs.length === 7, `RU2×2 + PAC×2 + CR×2 + "Hi" = 7 pairs (got ${initPairs.length})`);
 
-// The first pair should be RU2 (0x14, 0x25) with odd parity
-const ru2 = initPairs[0];
-assert((ru2.cc1 & 0x7F) === 0x14, 'RU2 cc1 = 0x14 (masked)');
-assert((ru2.cc2 & 0x7F) === 0x25, 'RU2 cc2 = 0x25 (masked)');
+const masked = (p) => [p.cc1 & 0x7F, p.cc2 & 0x7F];
+assert(masked(initPairs[0]).join() === '20,37' && masked(initPairs[1]).join() === '20,37', 'RU2 (0x14 0x25) sent twice first');
+assert(masked(initPairs[2]).join() === '20,112' && masked(initPairs[3]).join() === '20,112', 'PAC row 15 (0x14 0x70) sent twice');
+assert(masked(initPairs[4]).join() === '20,45' && masked(initPairs[5]).join() === '20,45', 'CR (0x14 0x2D) sent twice before the text');
 
 // Verify odd parity on a known char — 'H' = 0x48
 function countBits(n) { let c = 0; while (n) { c += n & 1; n >>= 1; } return c; }
-const hiPair = initPairs[4]; // "Hi" char pair
+const hiPair = initPairs[6]; // "Hi" char pair
 assert(countBits(hiPair.cc1) % 2 === 1, `Parity: 'H' byte has odd bit count`);
 assert(countBits(hiPair.cc2) % 2 === 1, `Parity: 'i' byte has odd bit count`);
 
@@ -58,22 +57,39 @@ assert(countBits(hiPair.cc2) % 2 === 1, `Parity: 'i' byte has odd bit count`);
 const nullPair = enc.drainPair();
 assert(nullPair.cc1 === 0x80 && nullPair.cc2 === 0x80, 'Empty queue returns null padding (0x80, 0x80)');
 
-// Test: Delta encoding — only new chars are queued
-enc.reset();
-enc.initialized = true; // skip init codes for cleaner test
-enc.enqueueText('Hello', false);
-const helloPairs = enc.queueLength;
-enc.enqueueText('Hello World', false); // should only queue " World"
-const deltaPairs = enc.queueLength - helloPairs;
-// "Hello" = 3 pairs (He, ll, o+null), " World" = 3 pairs (" W", "or", "ld")
-assert(deltaPairs === 3, `Delta encoding: " World" = 3 new pairs (got ${deltaPairs})`);
+// Test: the second caption does not repeat the PAC, and every caption gets its own CR
+enc.enqueueText('Done');
+// RU2×2 + CR×2 + "Do" "ne" = 6
+assert(enc.queueLength === 6, `Second caption "Done" = RU2×2 + CR×2 + 2 char pairs (got ${enc.queueLength})`);
 
-// Test: isFinal appends CR control codes
+// Test: long captions wrap at 32 columns on word boundaries, one CR per row
 enc.reset();
-enc.initialized = true;
-enc.enqueueText('Done', true);
-// "Done" = 2 char pairs + 2 CR control pairs = 4
-assert(enc.queueLength === 4, `Final text "Done" = 4 pairs: 2 chars + 2 CR (got ${enc.queueLength})`);
+enc.enqueueText('The quick brown fox jumps over the lazy dog near the riverbank today');
+const wrapped = [];
+while (enc.queueLength > 0) wrapped.push(enc.drainPair());
+const crCount = wrapped.filter(p => masked(p).join() === '20,45').length;
+assert(crCount === 6, `3 rows → 3 doubled CRs (got ${crCount / 2})`);
+const rowText = [];
+let cur = '';
+for (const p of wrapped) {
+    const [a, b] = masked(p);
+    if (a === 0x14) { if (b === 0x2D && cur) { rowText.push(cur); cur = ''; } continue; }
+    if (a >= 0x20) cur += String.fromCharCode(a);
+    if (b >= 0x20) cur += String.fromCharCode(b);
+}
+if (cur) rowText.push(cur);
+assert(rowText.every(r => r.length <= 32), `Every row ≤ 32 columns (${rowText.map(r => r.length).join('/')})`);
+assert(rowText.join(' ') === 'The quick brown fox jumps over the lazy dog near the riverbank today', 'Wrapped rows re-join to the original text');
+
+// Test: pacing — one pair every 3 frames, nulls in between
+enc.reset();
+enc.setPacing(3);
+enc.enqueueText('Go');
+const paced = [];
+for (let i = 0; i < 24; i++) paced.push(enc.drainPair());
+const dataFrames = paced.map((p, i) => (p.cc1 !== 0x80 || p.cc2 !== 0x80) ? i : -1).filter(i => i >= 0);
+assert(dataFrames.join() === '2,5,8,11,14,17,20', `Pacing 3: data on every third frame (got ${dataFrames.join()})`);
+enc.setPacing(1);
 
 // Test: enqueueClear sends EDM
 enc.reset();
@@ -84,11 +100,11 @@ assert(enc.queueLength === 2, `Clear sends 2 EDM pairs (got ${enc.queueLength})`
 // Test: Non-ASCII replaced with '?'
 enc.reset();
 enc.initialized = true;
-enc.enqueueText('café', false);
-// c, a, f, é→? = "ca" + "f?" = 2 pairs
+enc.enqueueText('café');
+// RU2×2 + CR×2, then c, a, f, é→? = "ca" + "f?" = 6 pairs
 const nonAsciiPairs = [];
 while (enc.queueLength > 0) nonAsciiPairs.push(enc.drainPair());
-assert(nonAsciiPairs.length === 2, `Non-ASCII "café" → 2 pairs with ? substitution`);
+assert(nonAsciiPairs.length === 6 && (nonAsciiPairs[5].cc2 & 0x7F) === 0x3F, `Non-ASCII "café" → "ca" "f?" with ? substitution (got ${nonAsciiPairs.length} pairs)`);
 
 // ─────────────────────────────────────────────
 // 2. CEA-708 CDP Builder Tests

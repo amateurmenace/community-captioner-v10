@@ -147,6 +147,7 @@ elseif(WIN32)
     add_library(${PROJECT_NAME} SHARED
         ${COMMON_SOURCES}
         ${NDI_SOURCES}
+        src/wasapi_capture.cpp
         ${BMD_HEADER}
         ${BMD_IID}
         ${CMAKE_JS_SRC}

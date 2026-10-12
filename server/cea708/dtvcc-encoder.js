@@ -16,6 +16,8 @@
  *   New text appended with CR for line breaks
  */
 
+import { wrapRows, CEA608_COLUMNS } from './cea608-encoder.js';
+
 // DTVCC command codes
 const CMD = {
     // Window commands (C1 codes, 0x80-0x9F)
@@ -44,6 +46,41 @@ export class DtvccEncoder {
         this._lastEnqueuedText = '';
         this._lastEnqueuedTime = 0;
         this._rows = 2;
+        // Repaint mode (0 = off): keep the visible rows and re-send the whole window
+        // every N frames and on every change. Idempotent for the decoder, so a lossy
+        // encoder downstream (Blackmagic Web Presenter drops 15–50 % of caption
+        // frames) only delays a caption instead of mangling it.
+        this._repaintFrames = 0;
+        this._framesSinceRepaint = 0;
+        this._lines = [];
+    }
+
+    /** Re-send the full window every `frames` frames (0 = classic roll-up, no repaints). */
+    setRepaint(frames) {
+        this._repaintFrames = Math.max(0, Math.min(300, Math.round(frames) || 0));
+        this._framesSinceRepaint = 0;
+    }
+
+    get repaintFrames() { return this._repaintFrames; }
+
+    /**
+     * One full redraw of window 0: define it (recovers a lost DefineWindow), then write
+     * every row from column 0 padded to the full width (overwrites stale characters).
+     */
+    _buildRepaint() {
+        const block = [];
+        block.push(...this._buildDefineWindow());
+        block.push(CMD.CW0);
+        for (let r = 0; r < this._rows; r++) {
+            const text = (this._lines[r] || '').padEnd(CEA608_COLUMNS, ' ');
+            block.push(CMD.SPL, r & 0x0F, 0);  // SetPenLocation row r, column 0
+            for (let i = 0; i < CEA608_COLUMNS; i++) {
+                const code = text.charCodeAt(i);
+                block.push(code >= 0x20 && code <= 0x7E ? code : 0x20);
+            }
+        }
+        block.push(CMD.ETX);
+        return block;
     }
 
     /**
@@ -109,6 +146,19 @@ export class DtvccEncoder {
         this._lastEnqueuedText = trimmed;
         this._lastEnqueuedTime = now;
 
+        if (this._repaintFrames > 0) {
+            // Repaint mode: new rows scroll in at the bottom, then redraw everything.
+            for (const row of wrapRows(trimmed, CEA608_COLUMNS)) {
+                this._lines.push(row);
+                while (this._lines.length > this._rows) this._lines.shift();
+            }
+            this.blockQueue = [];              // a pending repaint is obsolete now
+            this.blockQueue.push(this._buildRepaint());
+            this._framesSinceRepaint = 0;
+            this._windowDefined = true;
+            return;
+        }
+
         const block = [];
 
         // Define window on first use or after config change
@@ -143,6 +193,13 @@ export class DtvccEncoder {
      * Enqueue a clear command.
      */
     enqueueClear() {
+        this._lines = [];
+        if (this._repaintFrames > 0) {
+            this.blockQueue = [];
+            this.blockQueue.push(this._buildRepaint());   // blank rows
+            this._framesSinceRepaint = 0;
+            return;
+        }
         const block = [];
         block.push(CMD.CLW);
         block.push(0x01); // Clear window 0 (bitmap: bit 0)
@@ -164,6 +221,12 @@ export class DtvccEncoder {
      * @returns {number[]|null} DTVCC bytes or null if idle
      */
     drainFrame(maxBytes = 36) {
+        if (this._repaintFrames > 0 && this.blockQueue.length === 0) {
+            if (++this._framesSinceRepaint >= this._repaintFrames && this._lines.some(Boolean)) {
+                this.blockQueue.push(this._buildRepaint());
+                this._framesSinceRepaint = 0;
+            }
+        }
         if (this.blockQueue.length === 0) return null;
 
         const output = [];
@@ -216,5 +279,7 @@ export class DtvccEncoder {
         this._windowDefined = false;
         this._lastEnqueuedText = '';
         this._lastEnqueuedTime = 0;
+        this._lines = [];
+        this._framesSinceRepaint = 0;
     }
 }

@@ -9,6 +9,10 @@
  * Custom IDeckLinkAncillaryPacket implementation for CEA-708 CDP data.
  * DID=0x61, SDID=0x01 per SMPTE 334.
  */
+// Caption VANC line (0 = driver default, i.e. line 9 on 1080 formats)
+void SetCaptionLine(int line);
+int GetCaptionLine();
+
 class CaptionAncillaryPacket : public IDeckLinkAncillaryPacket {
 public:
     CaptionAncillaryPacket(const uint8_t* cdpData, size_t cdpSize);

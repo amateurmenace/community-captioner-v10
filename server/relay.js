@@ -160,6 +160,7 @@ let cea608Encoder = null;
 let dtvccEncoder = null;
 let cea708Builder = null;
 let captionFrameInterval = null;
+let lastInjectedCaption = { text: '', at: 0 };  // last final pushed through POST /api/inject/caption
 let deckLinkRunning = false;
 let deckLinkMode = null; // 'standalone' | 'passthrough'
 let deckLinkFrameRate = '29.97';
@@ -172,7 +173,29 @@ let captionConfig = {
     rollupRows: 2,                 // 2 | 3
     polishEnabled: true,           // auto-punctuate, capitalize, fix contractions
     profanityFilter: false,        // bleep profanity with ***
+    // CEA-608 transport tuning (see cea608-encoder.js). paceFrames = one 608
+    // pair every N frames; repeat = each pair on N consecutive frames
+    // (diagnostic); cea608InDtvcc = also carry CEA-608 in DTVCC mode.
+    cea608PaceFrames: 1,
+    cea608Repeat: 1,
+    cea608InDtvcc: true,
+    // VANC line of the caption packet on SDI (0 = DeckLink default = line 9).
+    vancLine: 0,
+    // CEA-708: re-send the whole caption window every N frames (0 = classic roll-up).
+    // Lets a decoder behind a lossy encoder (Web Presenter) recover within N frames.
+    dtvccRepaintFrames: 30,
 };
+
+// The UI sends frame rates as fps.toFixed(2) ("30.00", "59.94"); the CDP and
+// loop tables are keyed "30", "59.94", "23.98" … — normalize once here.
+function normalizeFrameRate(fr) {
+    const n = parseFloat(fr);
+    if (!Number.isFinite(n)) return '29.97';
+    const known = ['23.98', '24', '25', '29.97', '30', '50', '59.94', '60'];
+    let best = '29.97', dist = Infinity;
+    for (const k of known) { const d = Math.abs(parseFloat(k) - n); if (d < dist) { dist = d; best = k; } }
+    return best;
+}
 
 // YouTube Live caption ingestion. When the user enables "Closed Captions:
 // Caption ingestion URL" in YouTube Studio for a live stream, YouTube gives
@@ -376,8 +399,14 @@ async function initCaptionEncoder() {
         const { Cea608Encoder } = await import('./cea708/cea608-encoder.js');
         const { DtvccEncoder } = await import('./cea708/dtvcc-encoder.js');
         const { Cea708CdpBuilder } = await import('./cea708/cea708-cdp-builder.js');
-        cea608Encoder = new Cea608Encoder();
+        cea608Encoder = new Cea608Encoder({
+            rollupRows: captionConfig.rollupRows,
+            paceFrames: captionConfig.cea608PaceFrames,
+            repeat: captionConfig.cea608Repeat,
+        });
         dtvccEncoder = new DtvccEncoder();
+        dtvccEncoder.setRows(captionConfig.rollupRows);
+        dtvccEncoder.setRepaint(captionConfig.dtvccRepaintFrames);
         cea708Builder = new Cea708CdpBuilder();
         console.log('[CEA-708] Encoders initialized (CEA-608 + DTVCC)');
     } catch (e) {
@@ -403,8 +432,9 @@ function startFrameLoop(frameRate = '29.97') {
             // DTVCC mode: drain both encoders — DTVCC for modern decoders,
             // CEA-608 in Field 1 for backward compatibility with older decoders
             const dtvccData = dtvccEncoder.drainFrame(cea708Builder.dtvccCapacity(frameRate));
-            const pair = cea608Encoder ? cea608Encoder.drainPair() : { cc1: 0x80, cc2: 0x80 };
-            cdp = cea708Builder.buildCDP_DTVCC(dtvccData, frameRate, pair.cc1, pair.cc2);
+            const with608 = captionConfig.cea608InDtvcc && cea608Encoder;
+            const pair = with608 ? cea608Encoder.drainPair() : { cc1: 0x80, cc2: 0x80 };
+            cdp = cea708Builder.buildCDP_DTVCC(dtvccData, frameRate, pair.cc1, pair.cc2, !!with608);
             isActive = !!dtvccData || (pair.cc1 !== 0x80 || pair.cc2 !== 0x80);
         } else if (cea608Encoder) {
             // CEA-608 mode: drain one CC pair per frame
@@ -499,7 +529,7 @@ function feedCaptionToEncoder(captionData) {
                 // In DTVCC mode, feed BOTH encoders for backward compatibility
                 if (captionConfig.encodingMode === 'dtvcc') {
                     if (dtvccEncoder) dtvccEncoder.enqueueText(processed);
-                    if (cea608Encoder) cea608Encoder.enqueueText(truncateAtWord(processed, captionConfig.maxCharsPerLine));
+                    if (cea608Encoder && captionConfig.cea608InDtvcc) cea608Encoder.enqueueText(processed);
                 } else {
                     if (cea608Encoder) cea608Encoder.enqueueText(processed);
                 }
@@ -618,6 +648,17 @@ app.post('/api/decklink/stop', (req, res) => {
 });
 
 // --- NDI Source Discovery ---
+// Windows audio input devices that can be embedded on the SDI output in NDI mode
+// (the NDI PTZ cameras carry no audio). Empty list where the addon has no WASAPI.
+app.get('/api/audio/devices', (req, res) => {
+    if (!decklink || !decklink.listAudioDevices) return res.json({ available: false, devices: [] });
+    try {
+        res.json({ available: true, devices: decklink.listAudioDevices() });
+    } catch (e) {
+        res.json({ available: false, devices: [], error: e.message });
+    }
+});
+
 app.get('/api/ndi/sources', (req, res) => {
     if (!decklink || !decklink.findNdiSources) {
         return res.json({ available: false, sources: [], error: 'NDI not available in addon' });
@@ -637,7 +678,8 @@ app.post('/api/ndi/start', async (req, res) => {
     if (!decklink || !decklink.startNdiPassthrough) {
         return res.status(400).json({ ok: false, error: 'NDI passthrough not available in addon' });
     }
-    const { ndiSource, outputDevice, displayMode, frameRate } = req.body;
+    const { ndiSource, outputDevice, displayMode, audioDevice = '' } = req.body;
+    const frameRate = normalizeFrameRate(req.body?.frameRate);
 
     console.log('[NDI→SDI API] Start request:', JSON.stringify(req.body));
 
@@ -716,9 +758,10 @@ app.post('/api/inject/start', async (req, res) => {
         ndiSource,
         outputDevice = 0,
         displayMode = 0,
-        frameRate = '29.97',
         encodingMode,
+        audioDevice = '',   // NDI mode: Windows audio input device id ('' = the NDI source's audio)
     } = req.body || {};
+    const frameRate = normalizeFrameRate(req.body?.frameRate);
 
     console.log('[Inject] Start:', JSON.stringify(req.body));
 
@@ -741,6 +784,7 @@ app.post('/api/inject/start', async (req, res) => {
 
     try {
         await initCaptionEncoder();
+        if (decklink.setCaptionLine) { try { decklink.setCaptionLine(captionConfig.vancLine || 0); } catch {} }
         let ok = false;
         let mode = '';
 
@@ -751,7 +795,7 @@ app.post('/api/inject/start', async (req, res) => {
             if (!ndiSource) {
                 return res.status(400).json({ ok: false, error: 'ndiSource required for NDI mode' });
             }
-            ok = decklink.startNdiPassthrough(ndiSource, outputDevice, displayMode);
+            ok = decklink.startNdiPassthrough(ndiSource, outputDevice, displayMode, String(audioDevice || ''));
             mode = 'inject_ndi';
         } else if (sourceKind === 'standalone') {
             // Black frames + captions — useful when the video pipeline is elsewhere
@@ -836,6 +880,7 @@ function refreshCorrectionIndex() { correctionIndex = buildCorrectionIndex(getLe
 
 app.post('/api/inject/caption', (req, res) => {
     const { text, isFinal = true, applyDictionary = true } = req.body || {};
+    if (isFinal && typeof text === 'string') lastInjectedCaption = { text: text.trim(), at: Date.now() };
     if (!text || typeof text !== 'string') return res.status(400).json({ ok: false, error: 'text required' });
     let processed = text;
     let applied = [];
@@ -864,7 +909,8 @@ app.get('/api/caption/config', (req, res) => {
 });
 
 app.post('/api/caption/config', (req, res) => {
-    const { encodingMode, captionStrategy, maxCharsPerLine, rollupRows, polishEnabled, profanityFilter } = req.body;
+    const { encodingMode, captionStrategy, maxCharsPerLine, rollupRows, polishEnabled, profanityFilter,
+            cea608PaceFrames, cea608Repeat, cea608InDtvcc, vancLine, dtvccRepaintFrames } = req.body;
 
     if (encodingMode && ['cea608', 'dtvcc'].includes(encodingMode)) {
         captionConfig.encodingMode = encodingMode;
@@ -878,12 +924,29 @@ app.post('/api/caption/config', (req, res) => {
     if (rollupRows !== undefined) {
         captionConfig.rollupRows = rollupRows === 3 ? 3 : 2;
         if (cea608Encoder) cea608Encoder.setRollupRows(captionConfig.rollupRows);
+        if (dtvccEncoder) dtvccEncoder.setRows(captionConfig.rollupRows);
+    }
+    if (dtvccRepaintFrames !== undefined) {
+        captionConfig.dtvccRepaintFrames = Math.max(0, Math.min(300, parseInt(dtvccRepaintFrames) || 0));
+        if (dtvccEncoder) dtvccEncoder.setRepaint(captionConfig.dtvccRepaintFrames);
     }
     if (polishEnabled !== undefined) {
         captionConfig.polishEnabled = !!polishEnabled;
     }
     if (profanityFilter !== undefined) {
         captionConfig.profanityFilter = !!profanityFilter;
+    }
+    if (cea608PaceFrames !== undefined || cea608Repeat !== undefined) {
+        if (cea608PaceFrames !== undefined) captionConfig.cea608PaceFrames = Math.max(1, Math.min(8, parseInt(cea608PaceFrames) || 1));
+        if (cea608Repeat !== undefined) captionConfig.cea608Repeat = Math.max(1, Math.min(4, parseInt(cea608Repeat) || 1));
+        if (cea608Encoder) cea608Encoder.setPacing(captionConfig.cea608PaceFrames, captionConfig.cea608Repeat);
+    }
+    if (cea608InDtvcc !== undefined) {
+        captionConfig.cea608InDtvcc = !!cea608InDtvcc;
+    }
+    if (vancLine !== undefined) {
+        captionConfig.vancLine = Math.max(0, Math.min(41, parseInt(vancLine) || 0));
+        if (decklink?.setCaptionLine) { try { decklink.setCaptionLine(captionConfig.vancLine); } catch {} }
     }
 
     console.log(`[Caption Config] Updated:`, captionConfig);
@@ -2183,15 +2246,21 @@ wss.on('connection', (ws, req) => {
                         }
                     }
 
-                    // Forward to CEA-708 bridge and encoder with polished text (English only)
+                    // Forward to CEA-708 bridge and encoder with polished text (English only).
+                    // The Caption Injection screen already pushed this final through
+                    // POST /api/inject/caption (it marks the WS copy source:'inject', and
+                    // older builds are caught by the recent-POST check), so don't encode
+                    // it — or POST it to YouTube — a second time.
                     forwardToCea708(polishedData);
-                    feedCaptionToEncoder(polishedData);
+                    const alreadyInjected = data.source === 'inject'
+                        || (lastInjectedCaption.text === rawText.trim() && Date.now() - lastInjectedCaption.at < 5000);
+                    if (!alreadyInjected) {
+                        feedCaptionToEncoder(polishedData);
 
-                    // Also POST to YouTube's caption ingestion URL if configured.
-                    // This is the only working path for captions to reach YouTube
-                    // when streaming through a Blackmagic Web Presenter (its
-                    // RTMP encoder doesn't forward SDI VANC CC into H.264 SEI).
-                    {
+                        // Also POST to YouTube's caption ingestion URL if configured.
+                        // This is the only working path for captions to reach YouTube
+                        // when streaming through a Blackmagic Web Presenter (its
+                        // RTMP encoder drops about half of the caption packets).
                         const polishedText = (typeof polishedData.payload === 'string')
                             ? polishedData.payload
                             : (polishedData.payload?.text || '');

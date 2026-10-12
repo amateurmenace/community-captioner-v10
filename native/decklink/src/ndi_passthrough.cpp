@@ -197,8 +197,14 @@ std::vector<NdiPassthroughHandler::NdiSource> NdiPassthroughHandler::FindSources
 // ─────────────────────────────────────────────────────
 bool NdiPassthroughHandler::Start(const char* ndiSourceName,
                                    uint32_t outputDeviceIndex,
-                                   BMDDisplayMode displayMode) {
+                                   BMDDisplayMode displayMode,
+                                   const char* audioDeviceId) {
     if (m_running) return false;
+    m_externalAudio = false;
+    m_audioDeviceName.clear();
+    m_audioInFrames = 0;
+    m_audioInPeak = 0;
+    { std::lock_guard<std::mutex> lock(m_audioInMutex); m_audioInBuf.clear(); }
 
     // --- Initialize NDI ---
     std::string runtime;
@@ -315,6 +321,10 @@ bool NdiPassthroughHandler::Start(const char* ndiSourceName,
                 m_width = modeObj->GetWidth();
                 m_height = modeObj->GetHeight();
                 m_rowBytes = m_width * 2; // UYVY
+                BMDTimeValue dur = 1001; BMDTimeScale scale = 30000;
+                if (modeObj->GetFrameRate(&dur, &scale) == S_OK && dur > 0) m_fps = (double)scale / (double)dur;
+                // 29.97 / 59.94 use drop-frame timecode; 23.98 does not
+                m_dropFrame = (scale % 1000) != 0 && (std::fabs(m_fps - 29.97) < 0.05 || std::fabs(m_fps - 59.94) < 0.05);
                 modeObj->Release();
                 break;
             }
@@ -323,8 +333,10 @@ bool NdiPassthroughHandler::Start(const char* ndiSourceName,
         modeIter->Release();
     }
 
-    // Enable video output with VANC support
-    HRESULT hr = m_output->EnableVideoOutput(displayMode, bmdVideoOutputVANC);
+    // Enable video output with VANC and RP188 timecode (every frame gets a
+    // timecode: some downstream encoders key their caption handling on it)
+    HRESULT hr = m_output->EnableVideoOutput(displayMode, (BMDVideoOutputFlags)(bmdVideoOutputVANC | bmdVideoOutputRP188));
+    if (hr != S_OK) hr = m_output->EnableVideoOutput(displayMode, bmdVideoOutputVANC);
     if (hr != S_OK) {
         fprintf(stderr, "[NDI→SDI] EnableVideoOutput failed: 0x%08X\n", (unsigned)hr);
         Stop();
@@ -346,6 +358,31 @@ bool NdiPassthroughHandler::Start(const char* ndiSourceName,
         // Continuous mode: no preroll needed. Samples are written directly
         // and flow in sync with DisplayVideoFrameSync.
         fprintf(stderr, "[NDI→SDI] Audio output enabled: 48kHz 16-bit stereo (continuous)\n");
+#ifdef _WIN32
+        if (audioDeviceId && *audioDeviceId) {
+            // Embed a PC audio input instead of the NDI stream's audio. The capture
+            // thread writes straight into the continuous DeckLink audio stream.
+            std::string err;
+            bool ok = m_audioCapture.Start(audioDeviceId, [this](const int16_t* samples, uint32_t frames) {
+                int peak = 0;
+                for (uint32_t i = 0; i < frames * 2; i++) { int v = samples[i] < 0 ? -samples[i] : samples[i]; if (v > peak) peak = v; }
+                if (peak > m_audioInPeak) m_audioInPeak = peak;
+                m_audioInFrames += frames;
+                std::lock_guard<std::mutex> lock(m_audioInMutex);
+                if (m_audioInBuf.size() < 48000 * 2)  // keep at most ~1 s; the video thread drains every frame
+                    m_audioInBuf.insert(m_audioInBuf.end(), samples, samples + (size_t)frames * 2);
+            }, &err);
+            if (ok) {
+                m_externalAudio = true;
+                m_audioDeviceName = m_audioCapture.DeviceName();
+                fprintf(stderr, "[NDI→SDI] Audio from input device '%s' (NDI audio ignored)\n", m_audioDeviceName.c_str());
+            } else {
+                fprintf(stderr, "[NDI→SDI] Audio input device failed: %s - using NDI audio\n", err.c_str());
+            }
+        }
+#else
+        (void)audioDeviceId;
+#endif
     } else {
         m_audioEnabled = false;
         fprintf(stderr, "[NDI→SDI] Audio output failed: 0x%08X (video-only mode)\n", (unsigned)hr);
@@ -588,6 +625,28 @@ void NdiPassthroughHandler::RecvLoop() {
                     }
                 }
 
+                // RP188 timecode (VITC1 + LTC) counted from the start of the pipeline
+                {
+                    uint64_t n = m_framesOutput;
+                    int fpsInt = (int)std::lround(m_fps);
+                    if (fpsInt < 1) fpsInt = 30;
+                    if (m_dropFrame) {
+                        // Drop-frame counting: frame numbers 0 and 1 (×2 at 59.94) are skipped at
+                        // the start of every minute except each tenth minute.
+                        uint64_t dropPerMin = (uint64_t)fpsInt / 15;
+                        uint64_t framesPer10Min = (uint64_t)fpsInt * 600 - dropPerMin * 9;
+                        uint64_t framesPerMin = (uint64_t)fpsInt * 60 - dropPerMin;
+                        uint64_t tenMin = n / framesPer10Min, rest = n % framesPer10Min;
+                        uint64_t minutes = rest < (uint64_t)fpsInt * 60 ? 0 : 1 + (rest - (uint64_t)fpsInt * 60) / framesPerMin;
+                        n = tenMin * (uint64_t)fpsInt * 600 + rest + dropPerMin * minutes;
+                    }
+                    uint8_t ff = (uint8_t)(n % fpsInt), ss = (uint8_t)((n / fpsInt) % 60);
+                    uint8_t mm = (uint8_t)((n / fpsInt / 60) % 60), hh = (uint8_t)((n / fpsInt / 3600) % 24);
+                    BMDTimecodeFlags tf = m_dropFrame ? bmdTimecodeIsDropFrame : bmdTimecodeFlagDefault;
+                    outFrame->SetTimecodeFromComponents(bmdTimecodeRP188VITC1, hh, mm, ss, ff, tf);
+                    outFrame->SetTimecodeFromComponents(bmdTimecodeRP188LTC, hh, mm, ss, ff, tf);
+                }
+
                 // Display frame
                 hr = m_output->DisplayVideoFrameSync(outFrame);
                 if (hr == S_OK) {
@@ -595,6 +654,7 @@ void NdiPassthroughHandler::RecvLoop() {
                 } else {
                     m_droppedFrames++;
                 }
+                if (m_externalAudio) DrainAudioInput();
 
                 outFrame->Release();
             } else {
@@ -603,16 +663,17 @@ void NdiPassthroughHandler::RecvLoop() {
 
             NDIlib_recv_free_video_v2(m_ndiRecv, &videoFrame);
 
-        } else if (frameType == NDIlib_frame_type_audio && m_output) {
-            // Log first audio frame details
-            if (!audioLogged) {
-                fprintf(stderr, "[NDI→SDI] First audio frame: %d ch, %d Hz, %d samples\n",
-                        audioFrame.no_channels, audioFrame.sample_rate, audioFrame.no_samples);
-                audioLogged = true;
+        } else if (frameType == NDIlib_frame_type_audio) {
+            if (m_output && !m_externalAudio) {
+                // Log first audio frame details
+                if (!audioLogged) {
+                    fprintf(stderr, "[NDI→SDI] First audio frame: %d ch, %d Hz, %d samples\n",
+                            audioFrame.no_channels, audioFrame.sample_rate, audioFrame.no_samples);
+                    audioLogged = true;
+                }
+                // Pass audio through to DeckLink (with resampling if needed)
+                OutputAudio(audioFrame);
             }
-
-            // Pass audio through to DeckLink (with resampling if needed)
-            OutputAudio(audioFrame);
             NDIlib_recv_free_audio_v2(m_ndiRecv, &audioFrame);
         }
     }
@@ -621,12 +682,33 @@ void NdiPassthroughHandler::RecvLoop() {
 // ─────────────────────────────────────────────────────
 // Stop
 // ─────────────────────────────────────────────────────
+// Write whatever the audio input captured since the last frame (video thread only).
+void NdiPassthroughHandler::DrainAudioInput() {
+    std::vector<int16_t> buf;
+    {
+        std::lock_guard<std::mutex> lock(m_audioInMutex);
+        buf.swap(m_audioInBuf);
+    }
+    m_audioInPeak = (int)(m_audioInPeak * 0.9);
+    if (buf.empty() || !m_output || !m_audioEnabled) return;
+    uint32_t written = 0;
+    HRESULT ahr = m_output->WriteAudioSamplesSync(buf.data(), (uint32_t)(buf.size() / 2), &written);
+    m_audioSampleCount += written;
+    if (ahr != S_OK && m_audioSampleCount < 96000)
+        fprintf(stderr, "[NDI→SDI] WriteAudioSamplesSync (input device) failed: 0x%08X (wrote %u/%u)\n",
+                (unsigned)ahr, written, (unsigned)(buf.size() / 2));
+}
+
 void NdiPassthroughHandler::Stop() {
     m_running = false;
 
     if (m_recvThread.joinable()) {
         m_recvThread.join();
     }
+#ifdef _WIN32
+    m_audioCapture.Stop();   // before the DeckLink audio stream goes away
+#endif
+    m_externalAudio = false;
 
     if (m_ndiRecv) {
         NDIlib_recv_destroy(m_ndiRecv);

@@ -1,5 +1,9 @@
 #include <napi.h>
+#ifdef _WIN32
+#include "wasapi_capture.h"
+#endif
 #include "device_manager.h"
+#include "vanc_packet.h"
 #include "output_handler.h"
 #include "passthrough.h"
 #ifdef HAVE_NDI
@@ -113,9 +117,12 @@ Napi::Value StartNdiPassthrough(const Napi::CallbackInfo& info) {
     std::string source = info[0].As<Napi::String>().Utf8Value();
     uint32_t outputDevice = info[1].As<Napi::Number>().Uint32Value();
     uint32_t displayMode = info[2].As<Napi::Number>().Uint32Value();
+    // Optional 4th argument: Windows audio input device id (from listAudioDevices)
+    // to embed instead of the NDI source's audio.
+    std::string audioDevice = (info.Length() > 3 && info[3].IsString()) ? info[3].As<Napi::String>().Utf8Value() : "";
 
     g_ndiHandler = new NdiPassthroughHandler();
-    bool ok = g_ndiHandler->Start(source.c_str(), outputDevice, (BMDDisplayMode)displayMode);
+    bool ok = g_ndiHandler->Start(source.c_str(), outputDevice, (BMDDisplayMode)displayMode, audioDevice.c_str());
     if (!ok) {
         delete g_ndiHandler;
         g_ndiHandler = nullptr;
@@ -125,6 +132,42 @@ Napi::Value StartNdiPassthrough(const Napi::CallbackInfo& info) {
     return Napi::Boolean::New(env, true);
 }
 #endif
+
+#ifdef _WIN32
+/**
+ * listAudioDevices() -> [{ id, name, isDefault }]
+ * Active Windows audio capture endpoints (WASAPI). The id goes to startNdiPassthrough's 4th argument.
+ */
+Napi::Value ListAudioDevices(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    auto devices = ListAudioCaptureDevices();
+    Napi::Array arr = Napi::Array::New(env, devices.size());
+    for (size_t i = 0; i < devices.size(); i++) {
+        Napi::Object o = Napi::Object::New(env);
+        o.Set("id", Napi::String::New(env, devices[i].id));
+        o.Set("name", Napi::String::New(env, devices[i].name));
+        o.Set("isDefault", Napi::Boolean::New(env, devices[i].isDefault));
+        o.Set("isLoopback", Napi::Boolean::New(env, devices[i].isLoopback));
+        arr.Set((uint32_t)i, o);
+    }
+    return arr;
+}
+#endif
+
+/**
+ * setCaptionLine(line: number) / getCaptionLine() -> number
+ * VANC line of the caption packet on the SDI output (0 = driver default = line 9).
+ * Takes effect on the next frame; no restart needed.
+ */
+Napi::Value SetCaptionLineJs(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    int line = info.Length() > 0 && info[0].IsNumber() ? info[0].As<Napi::Number>().Int32Value() : 0;
+    SetCaptionLine(line);
+    return Napi::Number::New(env, GetCaptionLine());
+}
+Napi::Value GetCaptionLineJs(const Napi::CallbackInfo& info) {
+    return Napi::Number::New(info.Env(), GetCaptionLine());
+}
 
 /**
  * stopOutput() -> void
@@ -213,6 +256,9 @@ Napi::Value GetStatus(const Napi::CallbackInfo& info) {
         status.Set("framesOutput", Napi::Number::New(env, (double)g_ndiHandler->GetFramesOutput()));
         status.Set("droppedFrames", Napi::Number::New(env, (double)g_ndiHandler->GetDroppedFrames()));
         status.Set("ndiSource", Napi::String::New(env, g_ndiHandler->GetSourceName()));
+        status.Set("audioDevice", Napi::String::New(env, g_ndiHandler->GetAudioDeviceName()));
+        status.Set("audioInputFrames", Napi::Number::New(env, (double)g_ndiHandler->GetAudioInputFrames()));
+        status.Set("audioInputPeak", Napi::Number::New(env, g_ndiHandler->GetAudioInputPeak()));
 #endif
     } else {
         status.Set("running", false);
@@ -234,6 +280,11 @@ Napi::Object Init(Napi::Env env, Napi::Object exports) {
     exports.Set("stopOutput", Napi::Function::New(env, StopOutput));
     exports.Set("pushCDP", Napi::Function::New(env, PushCDP));
     exports.Set("getStatus", Napi::Function::New(env, GetStatus));
+    exports.Set("setCaptionLine", Napi::Function::New(env, SetCaptionLineJs));
+    exports.Set("getCaptionLine", Napi::Function::New(env, GetCaptionLineJs));
+#ifdef _WIN32
+    exports.Set("listAudioDevices", Napi::Function::New(env, ListAudioDevices));
+#endif
 #ifdef HAVE_NDI
     // Only offer NDI when its runtime loads: the relay treats the presence of
     // these functions as "NDI available" (Caption Injection, /api/ndi/*).

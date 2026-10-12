@@ -1,5 +1,6 @@
 #include "vanc_packet.h"
 #include <cstring>
+#include <cstdlib>
 
 CaptionAncillaryPacket::CaptionAncillaryPacket(const uint8_t* cdpData, size_t cdpSize)
     : m_data(cdpData, cdpData + cdpSize)
@@ -70,8 +71,26 @@ uint8_t CaptionAncillaryPacket::GetSDID() {
     return 0x01; // Caption Distribution Packet
 }
 
+// VANC line for the caption packet. 0 = Auto: the DeckLink driver picks the line
+// (9 for 1080 formats). The Blackmagic Web Presenter 4K drops about half of the
+// packets it finds on line 9 and far fewer on later lines, so the line is selectable
+// (setCaptionLine from JavaScript, or CC_VANC_LINE in the environment).
+static int g_captionLine = -1;
+
+void SetCaptionLine(int line) {
+    g_captionLine = (line < 0 || line > 41) ? 0 : line;
+}
+
+int GetCaptionLine() {
+    if (g_captionLine < 0) {
+        const char* env = getenv("CC_VANC_LINE");
+        SetCaptionLine(env ? atoi(env) : 0);
+    }
+    return g_captionLine;
+}
+
 uint32_t CaptionAncillaryPacket::GetLineNumber() {
-    return 0; // Auto — DeckLink SDK chooses appropriate VANC line
+    return (uint32_t)GetCaptionLine();
 }
 
 uint8_t CaptionAncillaryPacket::GetDataStreamIndex() {

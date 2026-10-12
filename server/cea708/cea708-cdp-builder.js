@@ -195,7 +195,7 @@ export class Cea708CdpBuilder {
         return triplets * 2 - 2;
     }
 
-    buildCDP_DTVCC(dtvccData, frameRate = '29.97', cc1 = 0x80, cc2 = 0x80) {
+    buildCDP_DTVCC(dtvccData, frameRate = '29.97', cc1 = 0x80, cc2 = 0x80, cc608Valid = true) {
         const frCode = FRAME_RATE_CODES[frameRate] || 0x04;
         const totalTriplets = FULL_CC_COUNT_BY_RATE[frameRate] || 20;
         const dtvccTriplets = totalTriplets - 2; // F1 + F2 fixed; remainder is DTVCC
@@ -251,15 +251,16 @@ export class Cea708CdpBuilder {
         cdp[pos++] = 0x72;
         cdp[pos++] = 0xE0 | totalTriplets;
 
-        // Triplet 0: Field 1 CEA-608
-        cdp[pos++] = 0xFC; // marker | cc_valid=1 | cc_type=00
-        cdp[pos++] = cc1;
-        cdp[pos++] = cc2;
+        // Triplet 0: Field 1 CEA-608 (cc_valid=0 with 0x00 bytes when this
+        // stream carries no CEA-608 at all, so decoders go straight to DTVCC)
+        cdp[pos++] = cc608Valid ? 0xFC : 0xF8; // marker | cc_valid | cc_type=00
+        cdp[pos++] = cc608Valid ? cc1 : 0x00;
+        cdp[pos++] = cc608Valid ? cc2 : 0x00;
 
         // Triplet 1: Field 2 null
-        cdp[pos++] = 0xFD; // marker | cc_valid=1 | cc_type=01
-        cdp[pos++] = 0x80;
-        cdp[pos++] = 0x80;
+        cdp[pos++] = cc608Valid ? 0xFD : 0xF9; // marker | cc_valid | cc_type=01
+        cdp[pos++] = cc608Valid ? 0x80 : 0x00;
+        cdp[pos++] = cc608Valid ? 0x80 : 0x00;
 
         // Triplets 2..N: DTVCC packet (start + continuations) or padding
         if (packetBytes && packetBytes.length > 0) {

@@ -155,7 +155,22 @@ const CaptionInjection: React.FC<CaptionInjectionProps> = ({ onBack, apiKey }) =
     const [displayMode, setDisplayMode] = useState(0);
     const [frameRate, setFrameRate] = useState('29.97');
     const [encodingMode, setEncodingMode] = useState<'cea608' | 'dtvcc'>('cea608');
+    // CEA-708 transport options (live-adjustable through /api/caption/config)
+    const [cea608InDtvcc, setCea608InDtvcc] = useState(true);
+    const [dtvccRepaintFrames, setDtvccRepaintFrames] = useState(30);
+    const postCaptionConfig = useCallback((patch: Record<string, unknown>) => {
+        fetch(`${getRelayUrl()}/api/caption/config`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(patch) }).catch(() => {});
+    }, []);
+    useEffect(() => {
+        fetch(`${getRelayUrl()}/api/caption/config`).then(r => r.json()).then(c => {
+            if (typeof c.cea608InDtvcc === 'boolean') setCea608InDtvcc(c.cea608InDtvcc);
+            if (typeof c.dtvccRepaintFrames === 'number') setDtvccRepaintFrames(c.dtvccRepaintFrames);
+        }).catch(() => {});
+    }, []);
     const [ndiSources, setNdiSources] = useState<{name: string; url: string}[]>([]);
+    // NDI mode: optional Windows audio input to embed on SDI (NDI PTZ cameras carry no audio)
+    const [audioDevices, setAudioDevices] = useState<{id: string; name: string; isDefault: boolean}[]>([]);
+    const [audioDevice, setAudioDevice] = useState<string>(() => { try { return localStorage.getItem('cc_inject_audio_device') || ''; } catch { return ''; } });
     const [selectedNdiSource, setSelectedNdiSource] = useState('');
     const [ndiScanning, setNdiScanning] = useState(false);
     const [ndiAvailable, setNdiAvailable] = useState(false);
@@ -241,6 +256,16 @@ const CaptionInjection: React.FC<CaptionInjectionProps> = ({ onBack, apiKey }) =
         if (sourceKind === 'ndi' && ndiAvailable) scanNdi();
     }, [sourceKind, ndiAvailable, scanNdi]);
 
+    useEffect(() => {
+        if (sourceKind !== 'ndi') return;
+        fetch(`${getRelayUrl()}/api/audio/devices`)
+            .then(r => r.json())
+            .then(d => setAudioDevices(d.devices || []))
+            .catch(() => setAudioDevices([]));
+    }, [sourceKind]);
+
+    useEffect(() => { try { localStorage.setItem('cc_inject_audio_device', audioDevice); } catch {} }, [audioDevice]);
+
     // Output device options (only devices with hasOutput)
     const outputDevices = devices.filter(d => d.hasOutput);
     const inputDevices = devices.filter(d => d.hasInput);
@@ -255,7 +280,7 @@ const CaptionInjection: React.FC<CaptionInjectionProps> = ({ onBack, apiKey }) =
                 sourceKind, outputDevice, displayMode, frameRate, encodingMode,
             };
             if (sourceKind === 'sdi') body.inputDevice = inputDevice;
-            if (sourceKind === 'ndi') body.ndiSource = selectedNdiSource;
+            if (sourceKind === 'ndi') { body.ndiSource = selectedNdiSource; body.audioDevice = audioDevice; }
 
             const res = await fetch(`${getRelayUrl()}/api/inject/start`, {
                 method: 'POST',
@@ -299,12 +324,12 @@ const CaptionInjection: React.FC<CaptionInjectionProps> = ({ onBack, apiKey }) =
                 const ws = new WebSocket(getWsRelayUrl());
                 ws.onopen = () => {
                     ws.send(JSON.stringify({ type: 'join', sessionId: 'demo', role: 'presenter' }));
-                    ws.send(JSON.stringify({ type: 'caption', isFinal, payload: { id: Date.now().toString(), text, timestamp: Date.now() } }));
+                    ws.send(JSON.stringify({ type: 'caption', isFinal, source: 'inject', payload: { id: Date.now().toString(), text, timestamp: Date.now() } }));
                 };
                 wsRef.current = ws;
             } catch {}
         } else {
-            wsRef.current.send(JSON.stringify({ type: 'caption', isFinal, payload: { id: Date.now().toString(), text, timestamp: Date.now() } }));
+            wsRef.current.send(JSON.stringify({ type: 'caption', isFinal, source: 'inject', payload: { id: Date.now().toString(), text, timestamp: Date.now() } }));
         }
 
         if (isFinal) {
@@ -660,6 +685,21 @@ const CaptionInjection: React.FC<CaptionInjectionProps> = ({ onBack, apiKey }) =
                                         <RefreshCw size={14} className={`text-stone-600 ${ndiScanning ? 'animate-spin' : ''}`} />
                                     </button>
                                 </div>
+                                {audioDevices.length > 0 && (
+                                    <div className="mt-3">
+                                        <label className="text-[10px] font-bold text-stone-400 uppercase tracking-wider mb-1 block">Audio on the SDI output</label>
+                                        <select
+                                            value={audioDevice}
+                                            onChange={e => setAudioDevice(e.target.value)}
+                                            disabled={running}
+                                            className="w-full px-3 py-2 rounded-lg border border-stone-200 text-sm"
+                                        >
+                                            <option value="">From the NDI source (if it carries audio)</option>
+                                            {audioDevices.map(d => <option key={d.id} value={d.id}>{d.name}{d.isDefault ? ' (Windows default)' : ''}</option>)}
+                                        </select>
+                                        <p className="text-[11px] text-stone-500 mt-1">NDI PTZ cameras usually send video only. Pick the input this computer hears the program audio on (a DeckLink "Line In", Dante, line-in…) to embed it on the SDI.</p>
+                                    </div>
+                                )}
                             </div>
                         )}
                     </section>
@@ -732,9 +772,29 @@ const CaptionInjection: React.FC<CaptionInjectionProps> = ({ onBack, apiKey }) =
                                 className={`p-3 rounded-lg border text-left transition-all ${encodingMode === 'dtvcc' ? 'border-sage-500 bg-sage-50' : 'border-stone-200 hover:border-sage-300'} disabled:opacity-50`}
                             >
                                 <p className="text-xs font-bold text-stone-800">CEA-708 (DTVCC)</p>
-                                <p className="text-[10px] text-stone-500">Higher throughput · 608 also sent</p>
+                                <p className="text-[10px] text-stone-500">Higher throughput · self-healing · optional 608</p>
                             </button>
                         </div>
+                        {encodingMode === 'dtvcc' && (
+                            <div className="mt-2 p-3 rounded-lg border border-stone-200 bg-stone-50 space-y-2">
+                                <label className="flex items-center gap-2 text-xs text-stone-700">
+                                    <input type="checkbox" checked={cea608InDtvcc}
+                                        onChange={e => { setCea608InDtvcc(e.target.checked); postCaptionConfig({ cea608InDtvcc: e.target.checked }); }} />
+                                    Also send CEA-608 (CC1) for older decoders
+                                </label>
+                                <label className="flex items-center gap-2 text-xs text-stone-700">
+                                    Redraw the whole caption window
+                                    <select value={dtvccRepaintFrames} className="px-2 py-1 rounded border border-stone-200 text-xs"
+                                        onChange={e => { const v = parseInt(e.target.value); setDtvccRepaintFrames(v); postCaptionConfig({ dtvccRepaintFrames: v }); }}>
+                                        <option value={0}>never (classic roll-up)</option>
+                                        <option value={15}>every ½ second</option>
+                                        <option value={30}>every second</option>
+                                        <option value={60}>every 2 seconds</option>
+                                    </select>
+                                </label>
+                                <p className="text-[11px] text-stone-500">Redrawing lets a decoder that misses caption frames (a Blackmagic Web Presenter drops 15–50 % of them) show the right text again within that time. Leave CEA-608 on unless the destination shows CC1 instead of the 708 captions.</p>
+                            </div>
+                        )}
                     </section>
 
                     {/* Big start/stop */}
