@@ -1,5 +1,6 @@
 import React, { useState, useEffect } from 'react';
 import { X, Globe, Key, Cpu, Settings, Cloud, Server, Terminal, ShieldCheck, BookOpen, AlertCircle, Loader2, Check } from 'lucide-react';
+import HelpGuide from './HelpGuide';
 import { AppState, UILanguage } from '../types';
 import { GoogleGenAI } from "@google/genai";
 
@@ -8,13 +9,13 @@ interface GlobalSettingsProps {
   onClose: () => void;
   appState: AppState;
   setAppState: React.Dispatch<React.SetStateAction<AppState>>;
-  initialTab?: 'general' | 'cloud' | 'local' | 'guide';
+  initialTab?: 'general' | 'cloud' | 'local' | 'guide' | 'help';
 }
 
 type ConnectionStatus = 'idle' | 'testing' | 'success' | 'error';
 
 const GlobalSettings: React.FC<GlobalSettingsProps> = ({ isOpen, onClose, appState, setAppState, initialTab = 'general' }) => {
-  const [activeTab, setActiveTab] = useState<'general' | 'cloud' | 'local' | 'guide'>(initialTab);
+  const [activeTab, setActiveTab] = useState<'general' | 'cloud' | 'local' | 'guide' | 'help'>(initialTab);
   const [apiKeyInput, setApiKeyInput] = useState(appState.apiKey || '');
   const [localUrlInput, setLocalUrlInput] = useState(appState.localServerUrl || 'ws://localhost:9000');
   const [llmUrlInput, setLlmUrlInput] = useState(appState.localLlmUrl || 'http://localhost:11434');
@@ -139,7 +140,7 @@ const GlobalSettings: React.FC<GlobalSettingsProps> = ({ isOpen, onClose, appSta
         {/* Header */}
         <div className="bg-stone-50 border-b border-stone-200 p-4 flex justify-between items-center shrink-0">
              <h2 className="font-display font-bold text-lg text-forest-dark flex items-center gap-2">
-                <Settings size={20} className="text-sage-600" /> Application Settings
+                <Settings size={20} className="text-sage-600" /> Help &amp; Settings
              </h2>
              <button onClick={onClose} className="p-1 hover:bg-stone-200 rounded-full transition-colors"><X size={20} className="text-stone-500" /></button>
         </div>
@@ -147,11 +148,15 @@ const GlobalSettings: React.FC<GlobalSettingsProps> = ({ isOpen, onClose, appSta
         <div className="flex flex-1 overflow-hidden">
             {/* Sidebar */}
             <div className="w-56 bg-stone-50 border-r border-stone-200 p-4 flex flex-col gap-2 shrink-0 overflow-y-auto">
+                <button onClick={() => setActiveTab('help')} className={`text-left px-4 py-2 rounded-lg text-sm font-bold flex items-center gap-2 ${activeTab === 'help' ? 'bg-white shadow-sm text-forest-dark' : 'text-stone-500 hover:bg-stone-100'}`}>
+                    <BookOpen size={16} /> Help &amp; Guide
+                </button>
+                <div className="h-px bg-stone-200 my-2"></div>
                 <button onClick={() => setActiveTab('general')} className={`text-left px-4 py-2 rounded-lg text-sm font-bold flex items-center gap-2 ${activeTab === 'general' ? 'bg-white shadow-sm text-forest-dark' : 'text-stone-500 hover:bg-stone-100'}`}>
                     <Globe size={16} /> General
                 </button>
                 <button onClick={() => setActiveTab('guide')} className={`text-left px-4 py-2 rounded-lg text-sm font-bold flex items-center gap-2 ${activeTab === 'guide' ? 'bg-white shadow-sm text-forest-dark' : 'text-stone-500 hover:bg-stone-100'}`}>
-                    <Terminal size={16} /> Build Guide
+                    <Terminal size={16} /> Developer build
                 </button>
                 <div className="h-px bg-stone-200 my-2"></div>
                 <button onClick={() => setActiveTab('cloud')} className={`text-left px-4 py-2 rounded-lg text-sm font-bold flex items-center gap-2 ${activeTab === 'cloud' ? 'bg-white shadow-sm text-forest-dark' : 'text-stone-500 hover:bg-stone-100'}`}>
@@ -200,6 +205,8 @@ const GlobalSettings: React.FC<GlobalSettingsProps> = ({ isOpen, onClose, appSta
                         </div>
                     </div>
                 )}
+
+                {activeTab === 'help' && <HelpGuide />}
 
                 {activeTab === 'guide' && (
                     <div className="space-y-8 animate-fade-in">

@@ -50,3 +50,7 @@
   background-color: #d6d3d1;
   border-radius: 20px;
 }
+
+/* Rows that may exceed the viewport (Dashboard header/status line): scroll silently instead of clipping */
+.scrollbar-none { scrollbar-width: none; -ms-overflow-style: none; }
+.scrollbar-none::-webkit-scrollbar { display: none; }

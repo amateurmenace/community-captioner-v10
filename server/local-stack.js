@@ -431,10 +431,17 @@ export async function startWhisper({ model = 'large-v3-turbo', backend = 'auto',
             const code = await waitExit(c);
             if (code !== 0) { setState({ state: 'error', message: `Could not create a Python virtual environment (exit ${code})` }); throw new Error('venv failed'); }
         }
-        setState({ state: 'installing', message: 'Installing speech packages (first time only, 1–3 minutes)…' });
-        const pip = spawnLogged(vpy, ['-m', 'pip', 'install', '--disable-pip-version-check', '--upgrade', ...pkgs]);
-        const pipCode = await waitExit(pip);
-        if (pipCode !== 0) { setState({ state: 'error', message: `Package installation failed (exit ${pipCode}). See the log.` }); throw new Error('pip failed'); }
+        // Only hit PyPI when something is missing: re-running pip on every start cost
+        // seconds and, worse, failed outright on a machine without internet.
+        const importCheck = await run(vpy, ['-c', `import ${['numpy', 'websockets', 'faster_whisper', ...(wantMlx ? ['mlx_whisper'] : [])].join(', ')}`], { timeout: 60000 });
+        if (importCheck.ok) {
+            pushLog('Speech packages already installed; skipping pip.');
+        } else {
+            setState({ state: 'installing', message: 'Installing speech packages (first time only, 1–3 minutes)…' });
+            const pip = spawnLogged(vpy, ['-m', 'pip', 'install', '--disable-pip-version-check', '--upgrade', ...pkgs]);
+            const pipCode = await waitExit(pip);
+            if (pipCode !== 0) { setState({ state: 'error', message: `Package installation failed (exit ${pipCode}). See the log.${/Could not find a version|No matching distribution|Temporary failure|Connection|SSL/i.test(logRing.slice(-30).map(l => l.line).join('\n')) ? ' This looks like a network problem: the first install needs internet.' : ''}` }); throw new Error('pip failed'); }
+        }
         cmd = vpy;
         args = serverArgs;
     }
@@ -559,22 +566,26 @@ const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 export async function ensureWhisper({ port = 9000, onStatus, timeoutMs = 15 * 60 * 1000 } = {}) {
     if (await portOpen(port)) return { ok: true, running: true, managed: !!whisperProc, status: getWhisperStatus() };
     const busy = whisperProc && ['installing', 'starting', 'loading'].includes(whisperState.state);
+    let startError = null;
+    let startPending = false;
     if (!busy) {
         const cfg = loadWhisperConfig();
         if (!cfg) return { ok: false, needsSetup: true, error: 'The local speech engine has not been set up on this computer yet.' };
-        try {
-            await startWhisper({ ...cfg, port });
-        } catch (e) {
-            return { ok: false, error: e.message, status: getWhisperStatus() };
-        }
+        // Do not await: on a first run startWhisper spends minutes in pip/uv before it
+        // resolves, and the caller needs the installing/loading status lines meanwhile.
+        startPending = true;
+        startWhisper({ ...cfg, port }).catch(e => { startError = e; }).finally(() => { startPending = false; });
+        await sleep(200);
     }
     const t0 = Date.now();
     let lastMsg = '';
+    let lastLogLen = -1;
     while (Date.now() - t0 < timeoutMs) {
         const st = whisperState;
-        if (st.message !== lastMsg) { lastMsg = st.message; onStatus?.(getWhisperStatus()); }
+        if (startError) return { ok: false, error: startError.message, status: getWhisperStatus() };
+        if (st.message !== lastMsg || logRing.length !== lastLogLen) { lastMsg = st.message; lastLogLen = logRing.length; onStatus?.(getWhisperStatus()); }
         if (st.state === 'ready' && await portOpen(port)) return { ok: true, started: true, managed: true, status: getWhisperStatus() };
-        if (st.state === 'error' || st.state === 'stopped') return { ok: false, error: st.message || 'The speech server did not start', status: getWhisperStatus() };
+        if (!startPending && (st.state === 'error' || st.state === 'stopped')) return { ok: false, error: st.message || 'The speech server did not start', status: getWhisperStatus() };
         await sleep(500);
     }
     return { ok: false, error: 'Timed out waiting for the speech server to start', status: getWhisperStatus() };

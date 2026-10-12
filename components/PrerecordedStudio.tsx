@@ -27,7 +27,7 @@ type Job = {
     status: 'queued' | 'downloading' | 'starting_server' | 'decoding' | 'transcribing' | 'done' | 'error' | 'cancelled';
     message?: string; progress: number; durationSec?: number; utterances?: number; speed?: number | null;
     engine?: { backend?: string; model?: string; device?: string }; segments?: Segment[]; segmentCount?: number;
-    elapsedMs?: number; error?: string; needsSetup?: boolean; serverState?: string;
+    elapsedMs?: number; error?: string; needsSetup?: boolean; serverState?: string; serverLog?: string[];
 };
 type WhisperInfo = { running: boolean; managed: boolean; configured: boolean; savedModel?: string | null; hello?: any; outdated?: boolean; port: number };
 
@@ -292,14 +292,15 @@ export const PrerecordedStudio: React.FC<PrerecordedStudioProps> = ({ onBack, on
       switch (job.status) {
           case 'queued': return 'Queued';
           case 'downloading': return job.message || 'Downloading…';
-          case 'starting_server': return job.message || 'Starting the speech server…';
+          case 'starting_server': return `${job.serverState === 'installing' ? 'Setting up the speech engine' : job.serverState === 'loading' ? 'Loading the model' : 'Starting the speech server'} · ${job.message || ''}`;
           case 'decoding': return `Decoding audio${job.progress ? ` · ${Math.round(job.progress * 100)}%` : ''}`;
           case 'transcribing': return `Transcribing · ${fmtTime((job.progress || 0) * (job.durationSec || 0))} of ${fmtTime(job.durationSec)}${job.speed ? ` · ${job.speed}× real time` : ''}`;
           default: return job.message || job.status;
       }
   })();
   const eta = job?.status === 'transcribing' && job.speed && job.durationSec ? Math.max(1, Math.round(((1 - (job.progress || 0)) * job.durationSec) / job.speed)) : null;
-  const overallPct = status === 'uploading' ? Math.round((upload?.percent || 0) * 0.3) : job ? (job.status === 'downloading' ? Math.round((job.progress || 0) * 20) : job.status === 'starting_server' ? 30 : job.status === 'decoding' ? 30 + Math.round((job.progress || 0) * 10) : job.status === 'transcribing' ? 40 + Math.round((job.progress || 0) * 60) : job.status === 'done' ? 100 : 30) : 0;
+  const overallPct = status === 'uploading' ? Math.round((upload?.percent || 0) * 0.3) : job ? (job.status === 'downloading' ? Math.round((job.progress || 0) * 20) : job.status === 'starting_server' ? (job.serverState === 'installing' ? 22 : job.serverState === 'starting' ? 26 : job.serverState === 'loading' ? 30 : 32) : job.status === 'decoding' ? 34 + Math.round((job.progress || 0) * 6) : job.status === 'transcribing' ? 40 + Math.round((job.progress || 0) * 60) : job.status === 'done' ? 100 : 30) : 0;
+  const serverFirstRun = job?.status === 'starting_server' && (job.serverState === 'installing' || (job.serverState === 'loading' && /download/i.test(job.message || '')));
 
   return (
     <div className="h-full bg-cream p-8 font-sans overflow-y-auto">
@@ -363,7 +364,16 @@ export const PrerecordedStudio: React.FC<PrerecordedStudioProps> = ({ onBack, on
                                         <span className="text-forest-dark font-bold flex items-center gap-2"><Loader2 size={13} className="animate-spin" /> {mode === 'local' ? stageLabel : (status === 'uploading' ? 'Reading file…' : 'Gemini is transcribing…')}</span>
                                         <span className="text-stone-400 font-mono">{mode === 'local' ? `${overallPct}%${eta ? ` · about ${eta >= 60 ? `${Math.round(eta / 60)} min` : `${eta} s`} left` : ''}` : ''}</span>
                                     </div>
-                                    {job?.status === 'starting_server' && <p className="text-[11px] text-stone-400 mt-1">The speech server you set up earlier is being started; the first start after a reboot loads the model (10–40 s).</p>}
+                                    {job?.status === 'starting_server' && (
+                                        <div className="mt-2 rounded-lg border border-amber-200 bg-amber-50 p-3 text-[11px] text-amber-900">
+                                            <p className="font-bold">{serverFirstRun ? 'First start on this computer: installing the speech engine' : 'The speech server is starting'}</p>
+                                            <p className="mt-0.5">{serverFirstRun ? 'The Python packages (about 500 MB) and the Whisper model (up to 1.6 GB) are being downloaded once. On a normal connection this takes 5–10 minutes; the file will be transcribed as soon as it is ready. You can watch the full log in Local AI setup.' : 'Loading the model takes 10–40 seconds after a restart.'}</p>
+                                            {job.serverLog && job.serverLog.length > 0 && (
+                                                <pre className="mt-2 bg-white/70 border border-amber-100 rounded p-2 font-mono text-[10px] text-stone-600 whitespace-pre-wrap max-h-20 overflow-hidden">{job.serverLog.join('\n')}</pre>
+                                            )}
+                                            {onOpenLocalSetup && <button onClick={onOpenLocalSetup} className="mt-2 underline font-bold">Open Local AI setup</button>}
+                                        </div>
+                                    )}
                                 </div>
                             )}
 

@@ -1040,8 +1040,12 @@ app.get('/api/local/whisper-server.py', (req, res) => {
 });
 
 app.post('/api/local/whisper/start', async (req, res) => {
+    // A first start spends minutes installing packages before startWhisper resolves.
+    // Answer within a few seconds either way; the wizard follows the status/log feed.
     try {
-        const r = await startWhisper(req.body || {});
+        const startP = startWhisper(req.body || {});
+        startP.catch(() => {});
+        const r = await Promise.race([startP, new Promise(resolve => setTimeout(() => resolve({ pending: true }), 3000))]);
         res.json({ ok: true, ...r, status: getWhisperStatus() });
     } catch (e) {
         res.status(400).json({ ok: false, error: e.message, status: getWhisperStatus() });
@@ -1090,7 +1094,8 @@ async function runFileJob(job) {
             jobUpdate(job, { filename: dl.title, bytes: (() => { try { return statSync(dl.path).size; } catch { return 0; } })(), progress: 1 });
         }
         jobUpdate(job, { status: 'starting_server', message: 'Checking the local speech server…', progress: 0 });
-        const ens = await ensureWhisper({ onStatus: (st) => jobUpdate(job, { message: st.message || 'Starting the speech server…', serverState: st.state }) });
+        const logTail = (st) => (st.logs || []).slice(-5).map(l => (l && typeof l === 'object') ? (l.line || '') : String(l)).filter(Boolean);
+        const ens = await ensureWhisper({ onStatus: (st) => jobUpdate(job, { message: st.message || 'Starting the speech server…', serverState: st.state, serverLog: logTail(st) }) });
         if (!ens.ok) {
             jobUpdate(job, { status: 'error', needsSetup: !!ens.needsSetup, error: ens.needsSetup ? 'The local speech engine is not set up on this computer yet. Open Local AI setup, install the speech server, then come back.' : (ens.error || 'The speech server is not available') });
             return;

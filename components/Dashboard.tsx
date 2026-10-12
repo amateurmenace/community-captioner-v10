@@ -693,7 +693,7 @@ const Dashboard: React.FC<DashboardProps> = ({
               if (stopped || !d.ok) return;
               setSys(d);
               setSysError(false);
-              setSysHistory(h => [...h.slice(-39), { cpu: d.cpu.percent ?? 0, gpu: d.gpu.available ? (d.gpu.percent ?? 0) : 0, mem: d.memory.percent, down: d.network.downKBps ?? 0, up: d.network.upKBps ?? 0 }]);
+              setSysHistory(h => [...h.slice(-149), { cpu: d.cpu.percent ?? 0, gpu: d.gpu.available ? (d.gpu.percent ?? 0) : 0, mem: d.memory.percent, down: d.network.downKBps ?? 0, up: d.network.upKBps ?? 0 }]);
           } catch { if (!stopped) setSysError(true); }
       };
       tick();
@@ -728,51 +728,83 @@ const Dashboard: React.FC<DashboardProps> = ({
       else if (sys.memory.pressure === 'warning') sysWarnings.push('Memory pressure is elevated. Fine for now; avoid opening more large apps.');
       if (sys.gpu.available && (sys.gpu.percent ?? 0) >= 97 && isRecording) sysWarnings.push('GPU is fully busy, which is normal while transcribing. If captions lag, Auto-Learn and translation are competing for it.');
   }
-  const StatCell = ({ icon: Icon, label, value, sub, tone, spark, sparkMax }: any) => (
-      <div className="flex items-center gap-2.5 min-w-0 shrink-0">
-          <Icon size={13} className="text-stone-400 shrink-0" />
-          <div className="leading-none">
-              <div className="text-[9px] font-bold text-stone-400 uppercase tracking-wider mb-0.5">{label}</div>
-              <div className={`font-display font-bold text-base whitespace-nowrap ${tone}`}>{value}{sub && <span className="text-[10px] font-sans font-medium text-stone-400 ml-1">{sub}</span>}</div>
-          </div>
-          <div className={`flex items-end gap-px h-6 w-24 ${tone}`} aria-hidden>
-              {(spark as number[]).map((v: number, i: number) => <div key={i} className="flex-1 bg-current rounded-[1px] opacity-60" style={{ height: `${Math.max(6, Math.min(100, (v / ((sparkMax as number) || 100)) * 100))}%` }} />)}
-          </div>
+  const formatDuration = (seconds: number) => {
+      const h = Math.floor(seconds / 3600);
+      const m = Math.floor((seconds % 3600) / 60);
+      const s = seconds % 60;
+      return `${h.toString().padStart(2, '0')}:${m.toString().padStart(2, '0')}:${s.toString().padStart(2, '0')}`;
+  };
+
+  // ---- row 2: slim session line · row 3: hairline graphs across the full width ----
+  const Stat = ({ label, value, unit, tone = 'text-stone-800', title }: any) => (
+      <div className="flex items-center gap-2 shrink-0" title={title}>
+          <span className="text-[9px] font-bold uppercase tracking-[0.14em] text-stone-400">{label}</span>
+          <span className={`text-[13px] font-semibold tabular-nums leading-none transition-colors duration-500 ${tone}`}>{value}{unit && <span className="text-[10px] font-medium text-stone-400 ml-1">{unit}</span>}</span>
       </div>
   );
+  const Sep = () => <span className="w-px h-4 bg-stone-200 shrink-0" aria-hidden />;
   const netMax = Math.max(64, ...sysHistory.map(h => h.down + h.up));
-  const systemStrip = (
-      <div className="relative hidden md:flex items-center gap-5 px-5 py-1.5 border-t border-stone-100 bg-stone-50/70">
-          <button onClick={() => setShowSys(v => !v)} className="flex items-center gap-1.5 text-[10px] font-bold text-stone-500 uppercase tracking-wider shrink-0 hover:text-forest-dark">
-              <Cpu size={12} /> This machine
-          </button>
-          {sys ? (
-              <div className="flex items-center gap-6 flex-1 min-w-0 overflow-hidden">
-                  <StatCell icon={Cpu} label="CPU" value={`${sys.cpu.percent ?? '—'}%`} sub={`${sys.cpu.cores} cores`} tone={sysTone(sys.cpu.percent)} spark={sysHistory.map(h => h.cpu)} />
-                  {sys.gpu.available && <StatCell icon={Zap} label="GPU" value={`${sys.gpu.percent}%`} sub={sys.gpu.memoryUsedGB != null ? `${sys.gpu.memoryUsedGB} GB` : undefined} tone={sysTone(sys.gpu.percent)} spark={sysHistory.map(h => h.gpu)} />}
-                  <StatCell icon={Activity} label="RAM" value={`${sys.memory.usedGB} GB`} sub={`of ${sys.memory.totalGB}${sys.memory.pressure && sys.memory.pressure !== 'normal' ? ` · pressure ${sys.memory.pressure}` : ''}`} tone={memTone} spark={sysHistory.map(h => h.mem)} />
-                  <StatCell icon={Wifi} label="Network" value={`↓ ${fmtRate(sys.network.downKBps)}`} sub={`↑ ${fmtRate(sys.network.upKBps)}`} tone="text-stone-800" spark={sysHistory.map(h => h.down + h.up)} sparkMax={netMax} />
-                  <div className="hidden xl:flex items-center gap-1.5 min-w-0">
-                      {sys.processes.filter(p => !p.name.startsWith('Captioner')).map(p => (
-                          <span key={p.pid} className="text-[10px] font-medium text-stone-500 bg-white border border-stone-200 rounded-full px-2 py-0.5 whitespace-nowrap">
-                              {p.name.replace(' speech server', '').replace(' (local AI brain)', '')} <span className="font-mono text-stone-700">{p.cpu != null ? `${p.cpu}% · ` : ''}{p.memGB} GB</span>
-                          </span>
+  const latencyTone = stats.latencySamples && stats.latencyMs > 3000 ? 'text-red-500' : stats.latencySamples && stats.latencyMs > 1500 ? 'text-amber-500' : 'text-stone-800';
+  const graphTone = (pct: number | null | undefined, quiet = 'text-stone-400') => pct == null ? quiet : pct >= 90 ? 'text-red-500' : pct >= 70 ? 'text-amber-500' : quiet;
+
+  // A hairline area graph that stretches across its cell: 150 samples (5 min at 2 s), a
+  // 1 px line with a faint fill, the path morphing between samples (CSS `d` transition).
+  const GRAPH_N = 150;
+  const Graph = ({ values, max = 100, tone }: { values: number[]; max?: number; tone: string }) => {
+      // Whatever history exists fills the whole cell; once 5 minutes are in, the window slides.
+      const have = values.slice(-GRAPH_N);
+      const pts = have.length >= 2 ? have : [have[0] ?? 0, have[0] ?? 0];
+      const y = (v: number) => (20 - Math.max(0.6, Math.min(19.4, (v / (max || 1)) * 18.8))).toFixed(2);
+      const line = pts.map((v, i) => `${((i / (pts.length - 1)) * 100).toFixed(2)},${y(v)}`).join(' L ');
+      const d = `M ${line}`;
+      const area = `${d} L 100,20 L 0,20 Z`;
+      const morph = { transition: 'd 700ms ease' } as React.CSSProperties;
+      return (
+          <svg viewBox="0 0 100 20" preserveAspectRatio="none" className={`w-full h-full block ${tone}`} aria-hidden>
+              <path d={area} fill="currentColor" fillOpacity={0.1} style={morph} />
+              <path d={d} fill="none" stroke="currentColor" strokeWidth={1} vectorEffect="non-scaling-stroke" strokeLinejoin="round" strokeLinecap="round" style={morph} />
+          </svg>
+      );
+  };
+  const GraphCell = ({ label, value, unit, tone, values, max, title }: any) => (
+      <div className="flex items-center flex-1 min-w-0 h-full px-3 gap-3 border-l border-stone-100 first:border-l-0" title={title}>
+          <div className="flex items-center gap-1.5 whitespace-nowrap shrink-0">
+              <span className="text-[9px] font-bold uppercase tracking-[0.14em] text-stone-400">{label}</span>
+              <span className={`text-[12px] font-semibold tabular-nums leading-none transition-colors duration-500 ${tone === 'text-stone-400' ? 'text-stone-700' : tone}`}>{value}{unit && <span className="text-[9px] font-medium text-stone-400 ml-1">{unit}</span>}</span>
+          </div>
+          <div className="flex-1 min-w-0 h-full py-[5px]"><Graph values={values} max={max} tone={tone} /></div>
+      </div>
+  );
+
+  const sessionLine = (
+      <div className="hidden md:flex items-center h-9 px-5 gap-5 border-t border-stone-100 bg-white/60 whitespace-nowrap overflow-x-auto scrollbar-none">
+          <Stat label="Duration" value={formatDuration(stats.durationSeconds)} tone={isRecording ? 'text-forest-dark' : 'text-stone-800'} />
+          <Stat label="Latency" value={stats.latencySamples ? `${(stats.latencyMs / 1000).toFixed(1)}s` : '—'} tone={latencyTone} />
+          <Stat label="WPM" value={`${stats.wpmHistory.length > 0 ? Math.round(stats.wpmHistory[stats.wpmHistory.length - 1].wpm) : 0}`} />
+          <Stat label="Confidence" value={stats.confidenceSamples ? `${(stats.averageConfidence * 100).toFixed(0)}%` : '—'} tone={!stats.confidenceSamples ? 'text-stone-400' : stats.averageConfidence > 0.9 ? 'text-green-600' : 'text-amber-500'} />
+          {sys && sys.processes.filter(p => !p.name.startsWith('Captioner')).length > 0 && (
+              <>
+                  <Sep />
+                  <span className="text-[11px] text-stone-400 tabular-nums shrink-0">
+                      {sys.processes.filter(p => !p.name.startsWith('Captioner')).map((p, i) => (
+                          <span key={p.pid}>{i > 0 && <span className="mx-1.5 text-stone-300">·</span>}{p.name.replace(' speech server', '').replace(' (local AI brain)', '')} <span className="text-stone-600">{p.cpu != null ? `${p.cpu}% ` : ''}{p.memGB} GB</span></span>
                       ))}
-                  </div>
-              </div>
-          ) : (
-              <span className="text-xs text-stone-400 flex-1">{sysError ? 'Relay offline — no machine stats' : 'Measuring…'}</span>
+                  </span>
+              </>
           )}
+          <span className="flex-1" />
           {sysWarnings.length > 0 && (
               <Tooltip text={sysWarnings.join(' ')}>
-                  <span className="flex items-center gap-1 text-[10px] font-bold text-amber-700 bg-amber-50 border border-amber-200 px-2 py-0.5 rounded-full shrink-0 cursor-help"><AlertTriangle size={11} /> {sysWarnings.length === 1 ? 'Watch this' : `${sysWarnings.length} warnings`}</span>
+                  <span className="flex items-center gap-1 text-[10px] font-bold text-amber-700 shrink-0 cursor-help"><AlertTriangle size={11} /> {sysWarnings.length === 1 ? 'Watch this' : `${sysWarnings.length} warnings`}</span>
               </Tooltip>
           )}
-          <button onClick={() => setShowSys(v => !v)} className="text-[10px] font-bold text-stone-500 hover:text-forest-dark shrink-0 flex items-center gap-1">{showSys ? <ChevronDown size={12} /> : <ChevronRight size={12} />} {showSys ? 'Hide details' : 'Details'}</button>
+          <button onClick={() => setShowSys(v => !v)} className="text-[10px] font-bold text-stone-400 hover:text-forest-dark shrink-0 flex items-center gap-1 transition-colors">
+              <span className={`w-1.5 h-1.5 rounded-full ${sys ? 'bg-green-500' : 'bg-stone-300'} ${sys && isRecording ? 'animate-pulse' : ''}`} /> {sys ? `${sys.cpu.model.replace(/^Apple /, '')} · ${sys.cpu.cores} cores · ${sys.memory.totalGB} GB` : sysError ? 'Relay offline' : 'Measuring…'} {showSys ? <ChevronDown size={11} /> : <ChevronRight size={11} />}
+          </button>
           {showSys && (
               <>
                   <div className="fixed inset-0 z-40" onClick={() => setShowSys(false)} />
-                  <div className="absolute top-full right-4 mt-1 w-[460px] bg-white rounded-2xl shadow-2xl border border-stone-200 p-4 z-50 text-left">
+                  <div className="fixed top-[104px] right-4 w-[460px] max-w-[calc(100vw-2rem)] bg-white rounded-2xl shadow-2xl border border-stone-200 p-4 z-50 text-left whitespace-normal">
                       <div className="flex items-center justify-between mb-1">
                           <div>
                               <p className="text-sm font-bold text-forest-dark">This machine</p>
@@ -820,23 +852,21 @@ const Dashboard: React.FC<DashboardProps> = ({
       </div>
   );
 
-  const MetricCard = ({ label, value, colorClass, icon: Icon }: any) => (
-      <Tooltip text={`Real-time statistic for ${label}`}>
-          <div className="flex flex-col items-start px-3 border-r border-stone-100 last:border-0 cursor-help min-w-[84px]">
-              <span className="text-[10px] font-bold text-stone-400 uppercase tracking-wider mb-1 flex items-center gap-1">
-                  {Icon && <Icon size={10} />} {label}
-              </span>
-              <span className={`text-lg font-display font-bold leading-none transition-colors duration-300 ${colorClass}`}>{value}</span>
-          </div>
-      </Tooltip>
+  const machineGraphs = (
+      <div className="hidden md:flex items-stretch h-8 border-t border-stone-100 bg-white/40">
+          {sys ? (
+              <>
+                  <GraphCell label="CPU" value={`${sys.cpu.percent ?? '—'}%`} tone={graphTone(sys.cpu.percent)} values={sysHistory.map(h => h.cpu)} title={`${sys.cpu.model} · ${sys.cpu.cores} cores · load ${sys.cpu.loadAvg1} · last 5 minutes`} />
+                  {sys.gpu.available && <GraphCell label="GPU" value={`${sys.gpu.percent}%`} tone={graphTone(sys.gpu.percent)} values={sysHistory.map(h => h.gpu)} title={`${sys.gpu.name}${sys.gpu.memoryUsedGB != null ? ` · ${sys.gpu.memoryUsedGB} GB in use` : ''} · last 5 minutes`} />}
+                  <GraphCell label="RAM" value={`${sys.memory.usedGB}`} unit={`/ ${sys.memory.totalGB} GB`} tone={sys.memory.pressure === 'critical' ? 'text-red-500' : sys.memory.pressure === 'warning' ? 'text-amber-500' : graphTone(sys.memory.percent)} values={sysHistory.map(h => h.mem)} title={`${sys.memory.percent}% used${sys.memory.pressure ? ` · pressure ${sys.memory.pressure}` : ''} · last 5 minutes`} />
+                  <GraphCell label="Net" value={`↓ ${fmtRate(sys.network.downKBps)}`} unit={`↑ ${fmtRate(sys.network.upKBps)}`} tone="text-stone-400" values={sysHistory.map(h => h.down + h.up)} max={netMax} title={`${sys.network.iface || 'network'} · last 5 minutes`} />
+              </>
+          ) : (
+              <div className="flex-1 flex items-center px-5 text-[10px] text-stone-400">{sysError ? 'Relay offline — no machine stats' : 'Measuring…'}</div>
+          )}
+      </div>
   );
 
-  const formatDuration = (seconds: number) => {
-      const h = Math.floor(seconds / 3600);
-      const m = Math.floor((seconds % 3600) / 60);
-      const s = seconds % 60;
-      return `${h.toString().padStart(2, '0')}:${m.toString().padStart(2, '0')}:${s.toString().padStart(2, '0')}`;
-  };
 
   const lastNotification = notifications.length > 0 ? notifications[notifications.length - 1] : null;
   const activeStream = isRecording ? currentStream : previewStream;
@@ -847,145 +877,95 @@ const Dashboard: React.FC<DashboardProps> = ({
       <canvas ref={pipCanvasRef} width={300} height={150} className="hidden" />
       <video ref={pipVideoRef} muted className="hidden" />
 
-      {/* Top Bar — row 1: brand, session metrics, controls (wrap instead of overflowing), Start/Stop always visible; row 2: live machine stats */}
+      {/* Top bar: one row of controls that never wraps (the status line below carries the numbers) */}
       <div className="border-b border-stone-200 bg-white/90 backdrop-blur shrink-0 z-30 shadow-sm relative">
-        {/* Relay Disconnected Alert */}
         {!relayConnected && (
-            <div className="absolute top-0 left-0 right-0 h-1 bg-red-500 overflow-hidden">
-                <div className="w-full h-full bg-red-400 animate-pulse"></div>
-            </div>
+            <div className="absolute top-0 left-0 right-0 h-0.5 bg-red-500 overflow-hidden"><div className="w-full h-full bg-red-400 animate-pulse" /></div>
         )}
-
-        <div className="flex items-center gap-4 px-5 py-2.5 min-h-[4.5rem]">
+        <div className="flex items-center h-16 px-5 gap-2 whitespace-nowrap overflow-x-auto scrollbar-none">
           <Tooltip text="Return to the main landing page">
-              <button onClick={goHome} className="p-2 hover:bg-stone-100 rounded-xl transition-all hover:scale-105 active:scale-95 flex items-center justify-center shrink-0">
-                <BrandLogo />
-              </button>
+              <button onClick={goHome} className="p-1.5 mr-2 hover:bg-stone-100 rounded-xl transition-all hover:scale-105 active:scale-95 flex items-center justify-center shrink-0"><BrandLogo /></button>
           </Tooltip>
-          <div id="metrics" className="hidden lg:flex items-center bg-stone-50 rounded-xl p-1.5 border border-stone-100 shadow-inner shrink-0">
-               <MetricCard label="Duration" value={formatDuration(stats.durationSeconds)} colorClass="text-stone-800" icon={Clock} />
-               <MetricCard label={t.latency} value={stats.latencySamples ? `${(stats.latencyMs / 1000).toFixed(1)}s` : '—'} colorClass={stats.latencySamples && stats.latencyMs > 3000 ? "text-red-500 animate-pulse" : stats.latencySamples && stats.latencyMs > 1500 ? "text-yellow-600" : "text-stone-800"} icon={Signal} />
-               <MetricCard label={t.wpm} value={`${stats.wpmHistory.length > 0 ? Math.round(stats.wpmHistory[stats.wpmHistory.length - 1].wpm) : 0}`} colorClass="text-stone-800" />
-               <MetricCard label={t.confidence} value={stats.confidenceSamples ? `${(stats.averageConfidence * 100).toFixed(0)}%` : '—'} colorClass={!stats.confidenceSamples ? "text-stone-400" : stats.averageConfidence > 0.9 ? "text-green-600" : "text-yellow-600"} />
-          </div>
 
           <div className="flex-1 min-w-[8px]" />
 
-          <div className="flex items-center justify-end gap-2.5 flex-wrap min-w-0">
-           {/* Local speech server status (Local / Fully Local modes) */}
-           {(mode === 'local' || mode === 'fully_local') && (
-                <Tooltip text={isRecording
-                    ? (localEngine?.connected ? `Connected to the local speech server${localEngine.model ? ` (${localEngine.model}${localEngine.device ? ` on ${localEngine.device}` : ''})` : ''}` : (localEngine?.error || 'The local speech server is not answering. Click to open the setup wizard.'))
-                    : 'Local mode: audio stays on this machine. Click to check or change the speech server.'}>
-                    <button onClick={onOpenLocalSetup} className={`hidden md:flex items-center gap-2 px-3 py-1.5 rounded-lg border text-xs font-bold transition-colors ${
-                        !isRecording ? 'bg-white text-stone-600 border-stone-200 hover:bg-stone-50'
-                        : localEngine?.connected ? 'bg-green-50 text-green-700 border-green-200'
-                        : localEngine?.starting ? 'bg-amber-50 text-amber-700 border-amber-200'
-                        : 'bg-red-50 text-red-600 border-red-200 animate-pulse'}`}>
-                        <Server size={14} />
-                        <span>{!isRecording ? `${MODE_INFO[mode].label} · setup` : localEngine?.connected ? `Local: ${localEngine.model ? localEngine.model.replace(/^mlx-community\//, '') : 'connected'}` : localEngine?.starting ? localEngine.starting : (localEngine?.error || 'Local server offline')}</span>
-                        {isRecording && localEngine?.connected && <span className="w-1.5 h-1.5 rounded-full bg-green-500 animate-pulse" />}
-                    </button>
-                </Tooltip>
-           )}
+          {/* Active dictionary */}
+          {activeContextName && (
+              <Tooltip text="Active dictionary. Click to show the corrections log.">
+                  <button onClick={() => setShowCorrections(!showCorrections)} className={`hidden xl:flex h-9 px-3 rounded-lg border text-xs font-bold flex items-center gap-1.5 shrink-0 transition-colors bg-white border-stone-200 text-stone-600 hover:bg-stone-50`}>
+                      <span className="w-1.5 h-1.5 rounded-full bg-green-500 animate-pulse" /><span className="max-w-[160px] truncate">{activeContextName}</span>
+                  </button>
+              </Tooltip>
+          )}
 
-           {/* Relay Error Indicator */}
-           {!relayConnected && (
-                <div className="hidden md:flex items-center gap-2 bg-red-50 text-red-600 px-3 py-1.5 rounded-lg border border-red-200 text-xs font-bold animate-pulse">
-                    <WifiOff size={14} />
-                    <span>Relay Disconnected</span>
-                    <Tooltip text="The Relay Server (port 8080) is unreachable. Run 'npm run start' or check your terminal.">
-                        <Info size={14} className="cursor-help opacity-70" />
-                    </Tooltip>
-                </div>
-           )}
+          {/* Local speech server (local modes) */}
+          {(mode === 'local' || mode === 'fully_local') && (
+              <Tooltip text={isRecording
+                  ? (localEngine?.connected ? `Connected to the local speech server${localEngine.model ? ` (${localEngine.model}${localEngine.device ? ` on ${localEngine.device}` : ''})` : ''}` : (localEngine?.starting || localEngine?.error || 'The local speech server is not reachable. Click to open Local AI setup.'))
+                  : 'Local mode: audio stays on this machine. Click to check or change the speech server.'}>
+                  <button onClick={onOpenLocalSetup} className={`h-9 px-3 rounded-lg border text-xs font-bold flex items-center gap-1.5 shrink-0 transition-colors ${!isRecording ? 'bg-white text-stone-600 border-stone-200 hover:bg-stone-50' : localEngine?.connected ? 'bg-green-50 text-green-700 border-green-200' : localEngine?.starting ? 'bg-amber-50 text-amber-700 border-amber-200' : 'bg-red-50 text-red-600 border-red-200'}`}>
+                      <Server size={13} />
+                      <span className="max-w-[180px] truncate">{!isRecording ? `${MODE_INFO[mode].label} · setup` : localEngine?.connected ? `Local: ${localEngine.model ? localEngine.model.replace(/^mlx-community\//, '') : 'connected'}` : localEngine?.starting ? localEngine.starting : (localEngine?.error || 'Local server offline')}</span>
+                      {isRecording && localEngine?.connected && <span className="w-1.5 h-1.5 rounded-full bg-green-500 animate-pulse" />}
+                  </button>
+              </Tooltip>
+          )}
 
-           <div className="flex flex-col items-end gap-1">
-                <div className="flex items-center gap-2">
-                    <Tooltip text={!learnKeyReady ? 'Auto-Learn needs a Gemini API key (Context Engine → Settings).' : learnEnabled ? 'Auto-Learn is ON: new names heard in live captions are suggested as toasts and added after 10s unless rejected.' : 'Auto-Learn is OFF. Turn on to learn names, places and acronyms from live speech.'}>
-                        <button
-                            onClick={toggleLearn}
-                            className={`flex items-center gap-1.5 px-3 py-2.5 text-xs font-bold rounded-xl border transition-all active:scale-95 ${learnEnabled ? 'bg-green-50 text-green-700 border-green-300' : 'bg-white text-stone-500 border-stone-200 hover:bg-stone-50'}`}
-                        >
-                            <Zap size={14} className={learnEnabled ? 'text-green-600' : 'text-stone-400'} /> Learn
-                            <span className={`w-1.5 h-1.5 rounded-full ${learnEnabled ? 'bg-green-500 animate-pulse' : 'bg-stone-300'}`} />
-                            {dictionary.length > 0 && <span className="text-[10px] font-mono text-stone-400 ml-0.5">{dictionary.length}</span>}
-                        </button>
-                    </Tooltip>
-                    <Tooltip text="Manage dictionary definitions, scrape websites for context, and configure engine settings.">
-                        <button id="context-btn" onClick={onOpenContext} className="flex items-center gap-2 px-4 py-2.5 bg-sage-200 hover:bg-sage-300 text-forest-dark text-sm font-bold rounded-xl border border-sage-400 transition-all shadow-sm active:scale-95">
-                            <ShieldCheck size={16} /> Context Engine
-                        </button>
-                    </Tooltip>
-                </div>
-                {activeContextName && (
-                    <button onClick={() => setShowCorrections(!showCorrections)} className="flex items-center gap-1.5 bg-white text-forest-dark px-2 py-1 rounded border border-stone-200 text-[10px] font-bold hover:bg-stone-50 transition-colors shadow-sm">
-                        <span className="w-1.5 h-1.5 rounded-full bg-green-500 animate-pulse"></span>
-                        <span className="max-w-[100px] truncate">{activeContextName}</span>
-                    </button>
-                )}
-           </div>
+          {!relayConnected && (
+              <Tooltip text="The relay server (port 8080) is unreachable. Run 'npm run start' or check your terminal.">
+                  <div className={`h-9 px-3 rounded-lg border text-xs font-bold flex items-center gap-1.5 shrink-0 transition-colors bg-red-50 text-red-600 border-red-200 animate-pulse`}><WifiOff size={13} /> Relay offline</div>
+              </Tooltip>
+          )}
 
-           <div id="output-btn" className="hidden md:flex items-center gap-2 bg-stone-100 rounded-xl p-1.5 border border-stone-200">
-              <div className="px-2 flex items-center gap-1 border-r border-stone-300/50">
-                  <Globe size={14} className="text-stone-500" />
-                  <select value={targetLanguage} onChange={(e) => setTargetLanguage(e.target.value)} className="bg-transparent text-xs font-bold text-stone-700 outline-none cursor-pointer py-1 w-24" title="Show a live translation next to the English captions (needs a Gemini key)">
+          <Tooltip text={!learnKeyReady ? 'Auto-Learn needs a Gemini API key (Context Engine → Settings).' : learnEnabled ? 'Auto-Learn is ON: new names heard in live captions are suggested as toasts and added after 10s unless rejected.' : 'Auto-Learn is OFF. Click to let the Context Engine learn names from live captions.'}>
+              <button onClick={toggleLearn} className={`h-9 px-3 rounded-lg border text-xs font-bold flex items-center gap-1.5 shrink-0 transition-colors active:scale-95 ${learnEnabled ? 'bg-green-50 text-green-700 border-green-300' : 'bg-white text-stone-500 border-stone-200 hover:bg-stone-50'}`}>
+                  <Zap size={13} className={learnEnabled ? 'text-green-600' : 'text-stone-400'} /> Learn
+                  <span className={`w-1.5 h-1.5 rounded-full ${learnEnabled ? 'bg-green-500 animate-pulse' : 'bg-stone-300'}`} />
+                  {dictionary.length > 0 && <span className="text-[10px] font-mono text-stone-400">{dictionary.length}</span>}
+              </button>
+          </Tooltip>
+          <Tooltip text="Manage dictionary definitions, scrape websites for context, and configure engine settings.">
+              <button id="context-btn" onClick={onOpenContext} className={`h-9 px-3 rounded-lg border text-xs font-bold flex items-center gap-1.5 shrink-0 transition-colors bg-sage-200 hover:bg-sage-300 text-forest-dark border-sage-400`}><ShieldCheck size={14} /> <span className="hidden lg:inline">Context Engine</span></button>
+          </Tooltip>
+
+          <span className="w-px h-6 bg-stone-200 mx-1 shrink-0" aria-hidden />
+
+          <div id="output-btn" className="hidden md:flex items-center gap-1 shrink-0">
+              <div className="hidden xl:flex items-center gap-1 h-9 px-2 rounded-lg border border-stone-200 bg-white">
+                  <Globe size={13} className="text-stone-400" />
+                  <select value={targetLanguage} onChange={(e) => setTargetLanguage(e.target.value)} className="bg-transparent text-xs font-bold text-stone-700 outline-none cursor-pointer w-24" title="Show a live translation next to the captions">
                       {LANGUAGES.map(l => <option key={l.code} value={l.code}>{l.flag} {l.native}</option>)}
                   </select>
               </div>
-              
-              {/* Audience View - Shows server status */}
-               <Tooltip text={`Audience Relay: ${relayConnected ? 'Online' : 'Offline (Check Terminal)'}`}>
-                  <button 
-                    onClick={() => setShowQrModal(true)} 
-                    className={`p-2 rounded-lg transition-all shadow-sm ${relayConnected ? 'bg-green-100 text-green-700' : 'bg-red-50 text-red-600 animate-pulse'}`}
-                  >
-                      {relayConnected ? <QrCode size={16} /> : <WifiOff size={16} />}
-                  </button>
+              <Tooltip text={`Audience relay: ${relayConnected ? 'online' : 'offline (check terminal)'}`}>
+                  <button onClick={() => setShowQrModal(true)} className={`h-9 w-9 rounded-lg border flex items-center justify-center transition-colors ${relayConnected ? 'bg-green-50 text-green-700 border-green-200 hover:bg-green-100' : 'bg-red-50 text-red-600 border-red-200 animate-pulse'}`}>{relayConnected ? <QrCode size={15} /> : <WifiOff size={15} />}</button>
               </Tooltip>
-
-              {/* Monitor Mode (PiP) */}
-              <Tooltip text="Monitor Mode (Keeps app active in background)">
-                  <button 
-                    onClick={togglePiP} 
-                    className={`p-2 rounded-lg transition-all shadow-sm ${isPiPActive ? 'bg-forest-dark text-white' : 'hover:bg-white text-stone-600'}`}
-                  >
-                      <Eye size={16} />
-                  </button>
+              <Tooltip text="Monitor mode (keeps the app active in the background)">
+                  <button onClick={togglePiP} className={`h-9 w-9 rounded-lg border flex items-center justify-center transition-colors ${isPiPActive ? 'bg-forest-dark text-white border-forest-dark' : 'bg-white text-stone-500 border-stone-200 hover:bg-stone-50'}`}><Eye size={15} /></button>
               </Tooltip>
-
               <Tooltip text="Generate a URL for OBS or vMix">
-                  <button onClick={() => setShowLinkModal(true)} className="p-2 hover:bg-white text-stone-600 rounded-lg transition-all shadow-sm"><LinkIcon size={16} /></button>
+                  <button onClick={() => setShowLinkModal(true)} className="h-9 w-9 rounded-lg border border-stone-200 bg-white text-stone-500 hover:bg-stone-50 flex items-center justify-center transition-colors"><LinkIcon size={15} /></button>
               </Tooltip>
               <Tooltip text="Configure size, font, and colors of the output">
-                  <button onClick={openObsView} className="flex items-center gap-2 px-4 py-1.5 hover:bg-white text-xs font-bold text-stone-600 rounded-lg transition-all shadow-sm"><Layout size={16} /> Output</button>
+                  <button onClick={openObsView} className={`h-9 px-3 rounded-lg border text-xs font-bold flex items-center gap-1.5 shrink-0 transition-colors bg-white text-stone-600 border-stone-200 hover:bg-stone-50`}><Layout size={14} /> <span className="hidden xl:inline">Output</span></button>
               </Tooltip>
-
-              {/* CEA-708 SDI Status */}
               {cea708Enabled && (
-                  <Tooltip text="CEA-708 CC output is active. Captions are being forwarded to SDI bridge.">
-                      <div className="flex items-center gap-1.5 px-3 py-1.5 bg-green-50 text-green-700 rounded-lg border border-green-200 text-xs font-bold">
-                          <Captions size={14} />
-                          <span>CC</span>
-                          <div className="w-1.5 h-1.5 rounded-full bg-green-500 animate-pulse" />
-                      </div>
+                  <Tooltip text="CEA-708 CC output is active. Captions are being forwarded to the SDI bridge.">
+                      <div className={`h-9 px-3 rounded-lg border text-xs font-bold flex items-center gap-1.5 shrink-0 transition-colors bg-green-50 text-green-700 border-green-200`}><Captions size={13} /> CC <span className="w-1.5 h-1.5 rounded-full bg-green-500 animate-pulse" /></div>
                   </Tooltip>
               )}
-           </div>
-           
           </div>
 
-           <Tooltip text="Pauses the recording (Stop) or Finishes the session completely.">
-             <button 
-                onClick={() => isRecording ? setIsRecording(false) : setIsRecording(true)} 
-                className={`shrink-0 flex items-center gap-2 px-6 py-3 rounded-xl font-bold text-sm transition-all shadow-lg transform hover:-translate-y-0.5 ${isRecording ? 'bg-orange-50 text-orange-600 border border-orange-200 hover:bg-orange-100' : 'bg-forest-dark text-white hover:bg-forest-light'}`}
-             >
-                {isRecording ? <><Pause size={20} /> Stop</> : <><Play size={20} /> Start</>}
-             </button>
+          <Tooltip text="Pauses the recording (Stop) or Finishes the session completely.">
+              <button onClick={() => isRecording ? setIsRecording(false) : setIsRecording(true)}
+                  className={`h-9 px-4 ml-1 rounded-lg font-bold text-sm flex items-center gap-2 shrink-0 transition-all active:scale-95 ${isRecording ? 'bg-orange-50 text-orange-600 border border-orange-200 hover:bg-orange-100' : 'bg-forest-dark text-white hover:bg-forest-light shadow-md'}`}>
+                  {isRecording ? <><Pause size={16} /> Stop</> : <><Play size={16} /> Start</>}
+              </button>
           </Tooltip>
         </div>
 
-        {systemStrip}
+        {sessionLine}
+        {machineGraphs}
       </div>
 
       <div className="flex flex-1 overflow-hidden relative">
@@ -1088,11 +1068,28 @@ const Dashboard: React.FC<DashboardProps> = ({
                 
                 <div className="w-px h-10 bg-stone-200"></div>
                 
-                <Tooltip text="End current session and view analytics.">
-                    <button onClick={onEndSession} className="flex items-center gap-2 px-6 py-2.5 rounded-xl font-bold text-sm bg-red-50 text-red-600 border border-red-200 hover:bg-red-100 hover:border-red-300 transition-all shadow-sm active:scale-95">
-                        <Download size={18} /> End
-                    </button>
-                </Tooltip>
+                {isRecording ? (
+                    <Tooltip text="End the session and open the transcript, analytics and highlights.">
+                        <button onClick={onEndSession} className="flex items-center gap-2 px-6 py-2.5 rounded-xl font-bold text-sm bg-red-50 text-red-600 border border-red-200 hover:bg-red-100 hover:border-red-300 transition-all shadow-sm active:scale-95">
+                            <Download size={18} /> End
+                        </button>
+                    </Tooltip>
+                ) : (
+                    <div className="flex items-center gap-2">
+                        <Tooltip text={captions.length > 0 ? 'Resume captioning this session.' : 'Start captioning with the selected mode and audio source.'}>
+                            <button onClick={() => setIsRecording(true)} className="flex items-center gap-2 px-6 py-2.5 rounded-xl font-bold text-sm bg-forest-dark text-white hover:bg-forest-light transition-all shadow-md active:scale-95">
+                                <Play size={18} /> {captions.length > 0 ? 'Resume' : 'Start'}
+                            </button>
+                        </Tooltip>
+                        {captions.length > 0 && (
+                            <Tooltip text="End the session and open the transcript, analytics and highlights.">
+                                <button onClick={onEndSession} className="flex items-center gap-2 px-4 py-2.5 rounded-xl font-bold text-sm bg-white text-red-600 border border-red-200 hover:bg-red-50 transition-all shadow-sm active:scale-95">
+                                    <Download size={16} /> End
+                                </button>
+                            </Tooltip>
+                        )}
+                    </div>
+                )}
              </div>
           </div>
         </div>

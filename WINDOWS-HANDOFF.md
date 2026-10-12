@@ -1,6 +1,6 @@
 # Windows release handoff
 
-> **Current task: bring Windows to 6.8.0** — see the section at the end ("v6.8.0 update"). The v6.4.0 brief below still describes the DeckLink SDK, addon build and packaged-exe probes, which have not changed.
+> **Current task: bring Windows to 6.10.0** — read the "v6.8.0 update" section (still valid) and then the "v6.10.0 update" section at the very end, which adds what changed since. The v6.4.0 brief below still describes the DeckLink SDK, addon build and packaged-exe probes, which have not changed.
 
 # v6.4.0 brief (DeckLink addon + packaging)
 
@@ -198,3 +198,38 @@ Then `utils/appLinks.ts`: `WINDOWS_DOWNLOAD_URL` → `Community-Captioner-6.8.0-
 ## Report back
 
 Zip size and SHA256, CPU/GPU of the test machine, which Whisper model and backend ran and the measured interim/final timing from the mic test, whether the stale-server replace worked, whether the Ollama download panel worked, and every brief line above that was wrong.
+
+
+# v6.10.0 update — parity with the Mac build (read after the v6.8.0 section)
+
+Everything below shipped on the Mac between 6.8.0 and 6.10.0 (commits after 443bf71 on `main`). Still no native changes, so the DeckLink addon from 6.4.0 remains valid. Build and verify exactly as in the v6.8.0 section, with these additions.
+
+## What changed and what is untested on Windows
+
+| Area | Where | Verify on Windows |
+|---|---|---|
+| Prerecorded → "On this computer" | `components/PrerecordedStudio.tsx`, relay `POST /api/local/transcribe-file`, `GET /api/local/jobs/:id/events`, `local/whisper_server.py` (`decode_media`, `split_utterances`, SCRIPT_VERSION 4) | Upload a 1–5 minute MP4/MOV/MP3 through the packaged exe: progress bar, timed lines appearing, done state with corrections count. Decoding uses PyAV (`av`), which faster-whisper installs; confirm `import av` works in the venv. Speed will be lower on CPU; report the × real time figure. |
+| Speech server starts itself | `ensureWhisper()` in `server/local-stack.js`, `POST /api/local/whisper/ensure`, `DATA_DIR\local\whisper.json` (written on every successful wizard start) | Set up Local AI once, quit, relaunch, go straight to Prerecorded or live local mode: the server must start on its own with the status visible ("Setting up the speech engine" / "Loading the model") and the Local pill mirroring it. Never set up → the card offers the wizard instead of hanging. |
+| First-run visibility | same | On a machine with no venv: during pip/model download the job card must show the phase, the live log tail and the first-run note, and the bar must move (22/26/30 %). The wizard's Install & start returns within 3 s (`pending: true`) and the log feed carries on. |
+| pip only when needed | `startWhisper()` import check | Second start must log "Speech packages already installed; skipping pip" and must work with Wi-Fi off. |
+| Replace a stale server | `killPortListener()` → `netstat -ano -p tcp` + `taskkill /PID … /T /F` | Start the old script (`git show 1a65eab:local/whisper_server.py`) on 9000, open the wizard: "An older speech server is running" → Replace works. |
+| YouTube on the local engine | `downloadYoutubeAudio()` in local-stack.js → `python -m yt_dlp` in the venv (pip-installed on first use) | Paste a short public YouTube link in Prerecorded → YouTube link → Transcribe. First use installs yt-dlp. |
+| Dashboard header | `components/Dashboard.tsx` | Three rows: controls (one line, Start always visible), session line, full-width hairline graphs. GPU graph appears only with `nvidia-smi`; RAM uses `os.freemem()`; network uses `netstat -e`; process chips come from `tasklist` (memory only, no CPU %). Check at 1366×768 and 1920×1080. |
+| Help & Settings | `components/HelpGuide.tsx` | The floating button opens the Help tab; read it for anything that is wrong on Windows (paths, commands) and fix the text. |
+| Landing page, bottom Start/End, workspace picker | `components/LandingPage.tsx`, `Dashboard.tsx`, `App.tsx` | Visual check only. |
+
+## Build, verify, publish
+
+Same commands as the v6.8.0 section; the zip is `build\Community-Captioner-6.10.0-windows-x64.zip` (version from package.json). Add to the packaged-exe probes:
+
+```powershell
+curl.exe -s -F "file=@C:\path\to\clip.mp4" http://localhost:8090/api/local/transcribe-file     # {"ok":true,"jobId":...}
+curl.exe -s -N http://localhost:8090/api/local/jobs/<jobId>/events                               # snapshot → job → segment … → done
+curl.exe -s -X POST http://localhost:8090/api/local/whisper/ensure -H "Content-Type: application/json" -d "{}"   # ok:true (or needsSetup:true before the wizard ran)
+```
+
+Publish by replacing the 6.4.0 Windows asset on the `v10.1` release with the 6.10.0 zip, update the notes (the intro line, the Downloads row and the "Windows zip is still 6.4.0" line), point `WINDOWS_DOWNLOAD_URL` in `utils/appLinks.ts` at the new asset, note any Windows-specific fixes in `CLAUDE.md` and in the Help guide, commit small, push.
+
+## Report back
+
+Zip size and SHA256, CPU/GPU, which Whisper backend ran, the prerecorded speed (× real time) for your test clip, whether the auto-start, the first-run display, the stale-server replace and the YouTube path worked, and every line of this brief that was wrong.

@@ -176,7 +176,7 @@ function App() {
   const [showContextModal, setShowContextModal] = useState(false);
   const [showOutputModal, setShowOutputModal] = useState(false);
   const [showGlobalSettings, setShowGlobalSettings] = useState(false);
-  const [globalSettingsTab, setGlobalSettingsTab] = useState<'general'|'cloud'|'local'|'guide'>('general');
+  const [globalSettingsTab, setGlobalSettingsTab] = useState<'general'|'cloud'|'local'|'guide'|'help'>('general');
   const [relayStatus, setRelayStatus] = useState<'connected'|'disconnected'>('disconnected');
 
   // Detect platform + DeckLink addon status so the workflow picker can
@@ -694,7 +694,16 @@ function App() {
                 if (isLocalUrl) {
                     try {
                         setLocalEngine(prev => ({ ...prev, connected: false, error: undefined, starting: 'Checking the speech server…' }));
-                        const ens = await fetch(`${getRelayHttpUrl()}/api/local/whisper/ensure`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' }).then(r => r.json());
+                        // While the relay brings the server up (seconds normally, minutes on a first
+                        // install), mirror the launcher's own status line in the Local pill.
+                        const poll = setInterval(async () => {
+                            try {
+                                const st = await fetch(`${getRelayHttpUrl()}/api/local/whisper/status`).then(r => r.json());
+                                if (!mounted) return;
+                                if (['installing', 'starting', 'loading'].includes(st.state)) setLocalEngine(prev => ({ ...prev, starting: `${st.state === 'installing' ? 'Setting up speech engine' : st.state === 'loading' ? 'Loading model' : 'Starting'} · ${String(st.message || '').slice(0, 60)}` }));
+                            } catch {}
+                        }, 2000);
+                        const ens = await fetch(`${getRelayHttpUrl()}/api/local/whisper/ensure`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' }).then(r => r.json()).finally(() => clearInterval(poll));
                         if (!mounted) return;
                         if (!ens.ok) {
                             setLocalEngine(prev => ({ ...prev, connected: false, starting: undefined, error: ens.needsSetup ? 'Local AI is not set up yet — open Local AI setup' : (ens.error || 'The speech server could not be started') }));
@@ -1240,12 +1249,14 @@ function App() {
   return (
     <div className="relative h-screen w-full bg-cream text-forest-dark font-sans overflow-hidden">
       
-      {/* Floating Settings Button */}
-      <button 
-        onClick={() => { setGlobalSettingsTab('general'); setShowGlobalSettings(true); }}
-        className="fixed bottom-6 right-6 z-50 bg-white p-4 rounded-full shadow-xl border border-stone-200 text-stone-600 hover:text-forest-dark hover:scale-110 transition-all hover:bg-stone-50"
+      {/* Floating Help & Settings button */}
+      <button
+        onClick={() => { setGlobalSettingsTab('help'); setShowGlobalSettings(true); }}
+        className="fixed bottom-6 right-6 z-50 bg-white pl-4 pr-5 py-3 rounded-full shadow-xl border border-stone-200 text-stone-700 hover:text-forest-dark hover:border-sage-400 hover:shadow-2xl transition-all hover:bg-stone-50 flex items-center gap-2.5"
+        title="Help, guide and settings"
       >
-        <Settings size={28} />
+        <Settings size={22} />
+        <span className="font-bold text-sm">Help &amp; Settings</span>
       </button>
 
       {appState.view === 'landing' && <LandingPage
