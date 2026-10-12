@@ -5,7 +5,9 @@ export const GITHUB_CLONE_URL = `${GITHUB_REPO_URL}.git`;
 export const RELEASES_URL = `${GITHUB_REPO_URL}/releases/latest`;
 
 // Direct download links to the newest build for each platform.
-// Mac: v6.4.0 (Context Engine wizard rewrite, bundled DeckLink addon, signed .app).
-// Windows: v6.3.2 (must be rebuilt on a Windows machine to pick up 6.4.0 changes).
-export const MAC_DOWNLOAD_URL = `${GITHUB_REPO_URL}/releases/download/v6.4.0/Community-Captioner-6.4.0-mac-arm64.zip`;
-export const WINDOWS_DOWNLOAD_URL = `${GITHUB_REPO_URL}/releases/download/v6.3.2/Community-Captioner-6.3.2-windows-x64.zip`;
+// Both live on the "Community Captioner v10.1" release (tag v10.1); the app
+// inside is version 6.4.0, so the asset names keep 6.4.0.
+// Mac: signed .app with the bundled DeckLink addon.
+// Windows: .exe built on Windows with the DeckLink addon bundled.
+export const MAC_DOWNLOAD_URL = `${GITHUB_REPO_URL}/releases/download/v10.1/Community-Captioner-6.4.0-mac-arm64.zip`;
+export const WINDOWS_DOWNLOAD_URL = `${GITHUB_REPO_URL}/releases/download/v10.1/Community-Captioner-6.4.0-windows-x64.zip`;
