@@ -183,7 +183,10 @@ async function network() {
 // Processes we care about: the managed Whisper server and Ollama
 // ---------------------------------------------------------------------------
 async function processes() {
-    const whisperPid = getWhisperStatus().pid || null;
+    // serverPid = the interpreter that holds the model (on Windows the spawned venv python.exe
+    // is only a 3 MB launcher for it); pid until the server has reported ready.
+    const ws = getWhisperStatus();
+    const whisperPid = ws.serverPid || ws.pid || null;
     const rows = [];
     if (PLATFORM === 'win32') {
         // tasklist has memory but not CPU; good enough to show what the models cost

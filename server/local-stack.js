@@ -363,7 +363,7 @@ function handleScriptLine(line) {
     try {
         const s = JSON.parse(m[1]);
         if (s.state === 'loading') setState({ state: 'loading', message: s.message || `Loading ${s.model}…`, model: s.model, backend: s.backend, device: s.device, compute: s.compute });
-        else if (s.state === 'ready') { setState({ state: 'ready', message: `Ready — ${s.model} on ${s.device}`, model: s.model, backend: s.backend, device: s.device, compute: s.compute, url: s.url }); if (lastLaunchConfig) saveWhisperConfig(lastLaunchConfig); }
+        else if (s.state === 'ready') { setState({ state: 'ready', message: `Ready — ${s.model} on ${s.device}`, model: s.model, backend: s.backend, device: s.device, compute: s.compute, url: s.url, serverPid: s.pid || null }); if (lastLaunchConfig) saveWhisperConfig(lastLaunchConfig); }
         else if (s.state === 'error') setState({ state: 'error', message: s.message || 'Server error' });
         else if (s.state === 'starting') setState({ state: 'starting', message: `Python ${s.python} starting…` });
         pushLog(`[status] ${s.state}${s.message ? ': ' + s.message : ''}`);
@@ -419,7 +419,7 @@ export async function startWhisper({ model = 'large-v3-turbo', backend = 'auto',
     writeFileSync(scriptPath, readScript(), 'utf-8');
     logRing.length = 0;
     lastLaunchConfig = { model, backend, device, compute, language, port, interim, interimModel };
-    setState({ state: 'installing', message: 'Preparing Python environment…', model, backend, device, compute, url: null, pid: null, startedAt: Date.now(), exitCode: null });
+    setState({ state: 'installing', message: 'Preparing Python environment…', model, backend, device, compute, url: null, pid: null, serverPid: null, startedAt: Date.now(), exitCode: null });
 
     const info = await probeSystem();
     const wantMlx = IS_APPLE_SILICON && (backend === 'auto' || backend === 'mlx');
@@ -471,8 +471,8 @@ export async function startWhisper({ model = 'large-v3-turbo', backend = 'auto',
         const wasReady = whisperState.state === 'ready';
         whisperProc = null;
         invalidateProbe();
-        if (whisperState.state === 'stopping' || code === 0 || code === null) setState({ state: 'stopped', message: 'Speech server stopped', pid: null, exitCode: code });
-        else setState({ state: 'error', message: whisperState.state === 'error' ? whisperState.message : `Speech server exited with code ${code}${wasReady ? '' : ' before becoming ready'} — see the log`, pid: null, exitCode: code });
+        if (whisperState.state === 'stopping' || code === 0 || code === null) setState({ state: 'stopped', message: 'Speech server stopped', pid: null, serverPid: null, exitCode: code });
+        else setState({ state: 'error', message: whisperState.state === 'error' ? whisperState.message : `Speech server exited with code ${code}${wasReady ? '' : ' before becoming ready'} — see the log`, pid: null, serverPid: null, exitCode: code });
     });
     invalidateProbe();
     return { ok: true, pid: child.pid, runner, command: [cmd, ...args].join(' ') };
@@ -486,7 +486,7 @@ export async function stopWhisper() {
     const exited = await Promise.race([waitExit(child), new Promise(r => setTimeout(() => r('timeout'), 4000))]);
     if (exited === 'timeout') { try { child.kill('SIGKILL'); } catch {} }
     whisperProc = null;
-    setState({ state: 'stopped', message: 'Speech server stopped', pid: null, url: null });
+    setState({ state: 'stopped', message: 'Speech server stopped', pid: null, serverPid: null, url: null });
     invalidateProbe();
     return { ok: true, wasRunning: true };
 }
@@ -562,6 +562,7 @@ export async function ollamaStart(baseUrl = 'http://127.0.0.1:11434') {
     } catch (e) { return { ok: false, error: e.message }; }
     for (let i = 0; i < 20; i++) {
         await new Promise(r => setTimeout(r, 500));
+        if (spawnError) return { ok: false, error: `Could not run ${bin}: ${spawnError.message}` };
         try { await fetchJson(`${baseUrl}/api/tags`, {}, 1500); invalidateProbe(); return { ok: true, started: true }; } catch {}
     }
     return { ok: false, error: 'Ollama did not start within 10 seconds' };
@@ -675,7 +676,9 @@ export async function downloadYoutubeAudio(url, outDir, onProgress) {
     }
     return new Promise((resolve, reject) => {
         const args = [...r.prefix, '-m', 'yt_dlp', '--no-playlist', '--newline', '-f', 'bestaudio[ext=m4a]/bestaudio/best', '-o', join(outDir, '%(id)s.%(ext)s'), '--print', 'after_move:filepath', '--print', 'title', '--no-simulate', url];
-        const child = spawn(r.cmd, args, { windowsHide: true });
+        // UTF-8 stdout: on Windows a piped Python writes cp1252, so a printed path under a
+        // non-ASCII profile (C:\Users\José\…) would not match existsSync and titles would garble.
+        const child = spawn(r.cmd, args, { windowsHide: true, env: { ...process.env, PYTHONIOENCODING: 'utf-8' } });
         let out = '', err = '';
         child.stdout.on('data', (d) => {
             const text = d.toString(); out += text;
