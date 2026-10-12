@@ -14,7 +14,7 @@ interface LocalSetupProps {
 // --- shapes returned by the relay (server/local-stack.js) ---
 type ProbeInfo = {
     platform: string; arch: string; cpu: string; cpuCores: number; memoryGB: number;
-    gpu: { type: 'apple' | 'nvidia' | 'none'; name?: string; memory?: string };
+    gpu: { type: 'apple' | 'nvidia' | 'none'; name?: string; memory?: string; memoryGB?: number | null; cudaRuntime?: boolean | null };
     python: { cmd: string; version: string; ok: boolean; note?: string }[];
     uv: { installed: boolean; path?: string; version?: string };
     ollama: { installed: boolean; running: boolean; models: { name: string; sizeGB?: number | null; parameterSize?: string }[]; version?: string | null; url: string };
@@ -343,6 +343,12 @@ const LocalSetup: React.FC<LocalSetupProps> = ({ onBack, onComplete, initialWhis
     // "more thorough" option for 16 GB+ machines.
     const recommendedLlm = 'gemma4:e2b';
     const osName = info?.platform === 'darwin' ? 'macOS' : info?.platform === 'win32' ? 'Windows' : info?.platform === 'linux' ? 'Linux' : '';
+    // An NVIDIA card is only used when the CUDA runtime is present and it has room for the models
+    // (mirrors recommend() in local-stack.js; the speech server falls back to the CPU otherwise).
+    const nvidiaSkipReason = info?.gpu.type === 'nvidia'
+        ? (info.gpu.cudaRuntime === false ? 'CUDA 12 runtime not installed' : info.gpu.memoryGB != null && info.gpu.memoryGB < 4 ? `only ${info.gpu.memoryGB} GB of GPU memory` : '')
+        : '';
+    const gpuUsable = info?.gpu.type === 'apple' || (info?.gpu.type === 'nvidia' && !nvidiaSkipReason);
     const speechDone = manualMode ? manualCheck.state === 'ok' : serverReady;
     const brainDone = skipBrain || (!!ollama?.running && installedNames.has(llmModel));
 
@@ -434,7 +440,8 @@ const LocalSetup: React.FC<LocalSetupProps> = ({ onBack, onComplete, initialWhis
                                         <p className="text-xs text-stone-600">{info.cpuCores} cores · {info.memoryGB} GB RAM · {osName} {info.arch}</p>
                                         <div className="mt-2">
                                             {info.gpu.type === 'apple' && <Pill ok><Zap size={10} /> Apple Silicon GPU — fast local speech</Pill>}
-                                            {info.gpu.type === 'nvidia' && <Pill ok><Zap size={10} /> NVIDIA {info.gpu.name} — GPU acceleration</Pill>}
+                                            {info.gpu.type === 'nvidia' && !nvidiaSkipReason && <Pill ok><Zap size={10} /> NVIDIA {info.gpu.name} — GPU acceleration</Pill>}
+                                            {info.gpu.type === 'nvidia' && nvidiaSkipReason && <Pill warn>NVIDIA {info.gpu.name} — not used for speech ({nvidiaSkipReason}); CPU models recommended</Pill>}
                                             {info.gpu.type === 'none' && <Pill warn>No supported GPU — CPU models recommended</Pill>}
                                         </div>
                                     </div>
@@ -544,7 +551,7 @@ const LocalSetup: React.FC<LocalSetupProps> = ({ onBack, onComplete, initialWhis
                                             </select></label>
                                         <label className="block"><span className="font-bold text-stone-600 block mb-1">Live caption model</span>
                                             <select value={interimModel} onChange={e => setInterimModel(e.target.value as any)} className="w-full border border-stone-200 rounded-lg p-2 bg-white">
-                                                <option value="auto">Auto ({info.gpu.type === 'none' ? 'small model for the live line, main model for finals' : 'main model for everything'})</option>
+                                                <option value="auto">Auto ({!gpuUsable ? 'small model for the live line, main model for finals' : 'main model for everything'})</option>
                                                 <option value="none">Main model only</option>
                                                 {language === 'en' ? <><option value="base.en">Whisper base (English) — fastest live line</option><option value="small.en">Whisper small (English)</option></> : <><option value="base">Whisper base — fastest live line</option><option value="small">Whisper small</option></>}
                                             </select>

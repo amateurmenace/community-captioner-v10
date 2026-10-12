@@ -176,9 +176,19 @@ async function detectGpu() {
     const r = await run('nvidia-smi', ['--query-gpu=name,memory.total', '--format=csv,noheader'], { timeout: 4000 });
     if (r.ok && r.stdout.trim()) {
         const [name, mem] = r.stdout.trim().split('\n')[0].split(',').map(s => s.trim());
-        return { type: 'nvidia', name, memory: mem };
+        const mib = parseFloat(mem);
+        // faster-whisper's Windows wheel ships cuDNN but not cuBLAS: without the CUDA 12
+        // runtime the speech server falls back to the CPU, so the recommendation should too.
+        const cudaRuntime = IS_WIN ? cublasOnPath() : null;
+        return { type: 'nvidia', name, memory: mem, memoryGB: Number.isFinite(mib) ? +(mib / 1024).toFixed(1) : null, cudaRuntime };
     }
     return { type: 'none' };
+}
+
+function cublasOnPath() {
+    const dirs = (process.env.PATH || '').split(';');
+    if (process.env.CUDA_PATH) dirs.push(join(process.env.CUDA_PATH, 'bin'));
+    return dirs.some(d => { try { return !!d && existsSync(join(d, 'cublas64_12.dll')); } catch { return false; } });
 }
 
 async function detectOllama(baseUrl = 'http://127.0.0.1:11434') {
@@ -264,12 +274,18 @@ export function recommend(info) {
         if (ram >= 16) return { backend: 'mlx', model: 'large-v3-turbo', compute: 'mlx', reason: `Apple Silicon with ${ram} GB: the GPU runs large-v3-turbo comfortably in real time.` };
         return { backend: 'mlx', model: 'distil-large-v3', compute: 'mlx', reason: `Apple Silicon with ${ram} GB: distil-large-v3 keeps memory low while staying accurate (English only).` };
     }
+    let gpuNote = '';
     if (info.gpu?.type === 'nvidia') {
-        return { backend: 'faster-whisper', model: 'large-v3-turbo', compute: 'float16', reason: `NVIDIA ${info.gpu.name || 'GPU'} detected: large-v3-turbo in float16 runs well ahead of real time.` };
+        const name = info.gpu.name || 'GPU';
+        if (info.gpu.cudaRuntime === false) gpuNote = `NVIDIA ${name} found, but the CUDA 12 runtime (cuBLAS) isn't installed, so speech runs on the CPU. `;
+        else if (info.gpu.memoryGB != null && info.gpu.memoryGB < 4) gpuNote = `NVIDIA ${name} has only ${info.gpu.memoryGB} GB of memory, too little for the GPU models, so speech runs on the CPU. `;
+        else return { backend: 'faster-whisper', model: 'large-v3-turbo', compute: 'float16', reason: `NVIDIA ${name} detected: large-v3-turbo in float16 runs well ahead of real time.` };
     }
+    // On a CPU every caption pays for Whisper's full 30 s encoder pass, so the large-encoder models
+    // fall behind even on big machines: measured on a 24-core Xeon Gold 6342 (12 threads, int8),
+    // one 4 s sentence took small.en 0.95 s, distil-large-v3 3.5 s, large-v3-turbo 3.6 s.
     const cores = info.cpuCores || 4;
-    if (cores >= 8 && ram >= 16) return { backend: 'faster-whisper', model: 'distil-large-v3', compute: 'int8', reason: `${cores}-core CPU, ${ram} GB: distil-large-v3 (int8) should keep up with speech; drop to small.en if captions lag.` };
-    return { backend: 'faster-whisper', model: 'small.en', compute: 'int8', reason: `CPU-only machine: small.en (int8) is the lightest model that keeps up in real time. Upgrade to distil-large-v3 if your CPU has headroom.` };
+    return { backend: 'faster-whisper', model: 'small.en', compute: 'int8', reason: `${gpuNote || 'No usable GPU: '}small.en (int8) keeps up in real time on a ${cores}-core CPU (about 1 s per caption). The large models (distil-large-v3, turbo) take 3–4 s per caption without a GPU, so captions fall behind.` };
 }
 
 export async function probeSystem({ ollamaUrl, whisperPort } = {}) {
