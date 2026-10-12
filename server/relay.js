@@ -826,6 +826,7 @@ app.get('/api/inject/status', (req, res) => {
         presenterUrl: `${presenterUrl}/?view=audience&session=demo`,
         addonLoaded: !!decklink,
         ndiAvailable: !!(decklink && decklink.startNdiPassthrough),
+        ndiRuntime: decklink && typeof decklink.ndiRuntime === 'string' ? decklink.ndiRuntime : null,
     });
 });
 

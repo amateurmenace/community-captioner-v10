@@ -308,6 +308,29 @@ END_SCRIPT
     console.warn('  WARNING: no macOS DeckLink addon found — run "npm run build:native" first for SDI caption injection.');
   }
 
+  // Optional: bundle the NDI runtime (libndi.dylib from the NDI SDK for Apple) so
+  // NDI → SDI works without NDI Tools installed. Off by default; enable with
+  // BUNDLE_NDI=1 (or --bundle-ndi). The addon's first rpath is
+  // @loader_path/../Frameworks, so Contents/Frameworks/libndi.dylib wins over
+  // /usr/local/lib. Redistribution is subject to the NDI SDK license: the SDK's
+  // libndi_licenses.txt must ship with the binary and the README carries the
+  // trademark attribution (see createMacReadme).
+  const bundleNdi = process.env.BUNDLE_NDI === '1' || process.argv.includes('--bundle-ndi');
+  if (bundleNdi) {
+    const ndiSdk = process.env.NDI_SDK_DIR || '/Library/NDI SDK for Apple';
+    const dylib = path.join(ndiSdk, 'lib', 'macOS', 'libndi.dylib');
+    const licenses = path.join(ndiSdk, 'lib', 'macOS', 'libndi_licenses.txt');
+    if (fs.existsSync(dylib)) {
+      const fwDir = path.join(contentsDir, 'Frameworks');
+      fs.mkdirSync(fwDir, { recursive: true });
+      fs.copyFileSync(dylib, path.join(fwDir, 'libndi.dylib'));
+      if (fs.existsSync(licenses)) fs.copyFileSync(licenses, path.join(resourcesDir, 'libndi_licenses.txt'));
+      console.log(`  Bundled NDI runtime (${dylib}) into Contents/Frameworks/`);
+    } else {
+      console.warn(`  WARNING: BUNDLE_NDI set but ${dylib} not found — NDI runtime not bundled`);
+    }
+  }
+
   // Bundle .env.local (Gemini key) so the Context Engine works out-of-box,
   // mirroring the Windows bundle. It lives in Resources/ (not MacOS/) because
   // codesign refuses non-code files inside Contents/MacOS. relay.js checks
@@ -325,8 +348,25 @@ END_SCRIPT
 }
 
 function createMacReadme(version) {
+  const bundledNdi = process.env.BUNDLE_NDI === '1' || process.argv.includes('--bundle-ndi');
+  const ndiNote = bundledNdi
+    ? `NDI
+---
+NDI → SDI passthrough (Caption Injection) uses the NDI runtime bundled in the app
+(Contents/Frameworks/libndi.dylib, © Vizrt NDI AB; see libndi_licenses.txt in the
+app's Resources). NDI® is a registered trademark of Vizrt NDI AB. This app is
+compatible with NDI and is not a product of NDI.
+`
+    : `NDI
+---
+NDI → SDI passthrough (Caption Injection) needs the NDI runtime, which the free
+NDI Tools for Mac install (https://ndi.video/tools/). Without it the NDI option
+shows "Not available"; everything else works. NDI® is a registered trademark of
+Vizrt NDI AB.
+`;
   return `Community Captioner ${version} — macOS (Apple Silicon)
 =====================================================
+${ndiNote}
 
 FIRST LAUNCH
   macOS blocks apps downloaded outside the App Store the first time.
@@ -392,6 +432,8 @@ function signMacApp(appDir) {
     const ts = devId ? '--timestamp' : '';
     const runtime = devId ? '--options runtime' : '';
     const ent = devId && fs.existsSync(entitlements) ? `--entitlements "${entitlements}"` : '';
+    const ndiDylib = path.join(appDir, 'Contents', 'Frameworks', 'libndi.dylib');
+    if (fs.existsSync(ndiDylib)) execSync(`codesign --force --sign "${id}" ${runtime} ${ts} "${ndiDylib}"`, { stdio: 'inherit' });
     if (fs.existsSync(addon)) execSync(`codesign --force --sign "${id}" ${runtime} ${ts} "${addon}"`, { stdio: 'inherit' });
     if (fs.existsSync(bin)) execSync(`codesign --force --sign "${id}" ${runtime} ${ent} ${ts} "${bin}"`, { stdio: 'inherit' });
     execSync(`codesign --force --sign "${id}" ${runtime} ${ent} ${ts} "${appDir}"`, { stdio: 'inherit' });

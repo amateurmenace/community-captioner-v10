@@ -50,8 +50,28 @@ if(APPLE)
         endif()
     endif()
 
+    # NDI → SDI passthrough (optional). Needs the NDI SDK for Apple at build time
+    # (-DNDI_SDK_DIR=…, $NDI_SDK_DIR, or the default install location). The
+    # dylib is linked WEAKLY: the addon still loads with the six SDI functions on
+    # a Mac without libndi.dylib, and NdiPassthroughHandler::RuntimeAvailable()
+    # checks at module init whether the weak import actually resolved.
+    if(NOT DEFINED NDI_SDK_DIR AND DEFINED ENV{NDI_SDK_DIR})
+        set(NDI_SDK_DIR "$ENV{NDI_SDK_DIR}")
+    endif()
+    if(NOT DEFINED NDI_SDK_DIR)
+        set(NDI_SDK_DIR "/Library/NDI SDK for Apple")
+    endif()
+    set(NDI_SOURCES "")
+    if(EXISTS "${NDI_SDK_DIR}/include/Processing.NDI.Lib.h" AND EXISTS "${NDI_SDK_DIR}/lib/macOS/libndi.dylib")
+        message(STATUS "NDI SDK: ${NDI_SDK_DIR} (building NDI passthrough, weak-linked libndi.dylib)")
+        set(NDI_SOURCES src/ndi_passthrough.cpp)
+    else()
+        message(STATUS "NDI SDK not found at ${NDI_SDK_DIR}: building without NDI passthrough (set NDI_SDK_DIR to enable)")
+    endif()
+
     add_library(${PROJECT_NAME} SHARED
         ${COMMON_SOURCES}
+        ${NDI_SOURCES}
         ${BMD_SDK_DIR}/DeckLinkAPIDispatch.cpp
     )
 
@@ -60,6 +80,22 @@ if(APPLE)
         ${DECKLINK_LINK}
         "-framework CoreFoundation"
     )
+
+    if(NDI_SOURCES)
+        target_include_directories(${PROJECT_NAME} PRIVATE "${NDI_SDK_DIR}/include")
+        target_compile_definitions(${PROJECT_NAME} PRIVATE HAVE_NDI)
+        # Weak link: unresolved NDIlib_* symbols become NULL instead of failing
+        # require(). The LINKER: form keeps the path (which contains spaces) intact.
+        target_link_options(${PROJECT_NAME} PRIVATE "LINKER:-weak_library,${NDI_SDK_DIR}/lib/macOS/libndi.dylib")
+        # Where the dylib is looked for at load time (install name @rpath/libndi.dylib):
+        #   a copy bundled in the app (Contents/Frameworks), next to the addon (dev/test),
+        #   NDI Tools for Mac (/usr/local/lib), then the SDK itself.
+        set_target_properties(${PROJECT_NAME} PROPERTIES
+            BUILD_RPATH "@loader_path/../Frameworks;@loader_path;/usr/local/lib;${NDI_SDK_DIR}/lib/macOS"
+            INSTALL_RPATH "@loader_path/../Frameworks;@loader_path;/usr/local/lib;${NDI_SDK_DIR}/lib/macOS"
+            BUILD_WITH_INSTALL_RPATH TRUE
+        )
+    endif()
 
 elseif(WIN32)
     # ---- Windows build ----

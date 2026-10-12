@@ -89,7 +89,7 @@ const SECTIONS: Section[] = [
         lead: 'Workspace → Caption Injection. Embeds standards-compliant closed captions into an SDI signal with a Blackmagic DeckLink card, or forwards them to YouTube.',
         bullets: [
             'Three output modes: standalone (captions on black), SDI passthrough (SDI in → SDI out with captions added), and NDI passthrough (an NDI source → SDI with captions, audio resampled to 48 kHz).',
-            'NDI on Windows needs the free NDI runtime (NDI Tools or the NDI 6 Runtime from ndi.video); without it the NDI option says "Not available" and everything else works. NDI|HX cameras are fine.',
+            'NDI needs the free NDI runtime on both platforms. Windows: NDI Tools or the NDI 6 Runtime from ndi.video. Mac: NDI Tools for Mac installs libndi.dylib in /usr/local/lib, which the app finds on its own; without it the NDI option says "Not available" and everything else works. NDI|HX cameras are fine.',
             'CEA-608 roll-up (2 or 3 rows, about 60 characters per second, works with every decoder) or DTVCC / CEA-708 (about 200+ characters per second, with CEA-608 still carried for older decoders).',
             'Caption strategy when speech outruns the standard: truncate at a word boundary, summarise with Gemini, or verbatim.',
             'YouTube caption ingestion URL: the Blackmagic Web Presenter does not forward VANC captions into its RTMP stream, so the app can POST each caption straight to YouTube\'s per-stream ingestion URL instead.',

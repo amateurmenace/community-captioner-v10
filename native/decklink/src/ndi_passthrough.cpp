@@ -10,6 +10,11 @@ static const int DECKLINK_AUDIO_RATE = 48000;
 // ─────────────────────────────────────────────────────
 // NDI runtime (Windows: delay-loaded DLL)
 // ─────────────────────────────────────────────────────
+#ifndef _WIN32
+#include <dlfcn.h>
+#include <cstdlib>
+#endif
+
 #ifdef _WIN32
 static std::string DirOfThisModule() {
     HMODULE self = nullptr;
@@ -60,8 +65,37 @@ bool NdiPassthroughHandler::RuntimeAvailable(std::string* where) {
     if (where) *where = detail;
     return state == 1;
 #else
-    if (where) *where = "linked";
-    return true;
+    // macOS: libndi.dylib is linked weakly (see CMakeLists.txt), so the addon loads
+    // even when the library is absent and every NDIlib_* symbol is then NULL. Decide
+    // once, before any NDI call, whether the runtime is really there:
+    //   1. NDI_RUNTIME_DIR_V6 / V5 (how NDI tells apps where its runtime lives) — dlopen
+    //      it so the weak import binds to that copy;
+    //   2. otherwise rely on the rpaths (bundled Contents/Frameworks, next to the addon,
+    //      /usr/local/lib from NDI Tools, the SDK) and check that the import resolved.
+    // The check goes through dlsym on purpose: the header does not declare the
+    // functions weak_import, so `&NDIlib_initialize == nullptr` may be folded away.
+    static int state = -1;  // -1 not tried, 0 missing, 1 loaded
+    static std::string detail;
+    if (state < 0) {
+        state = 0;
+        detail = "libndi.dylib not found: install NDI Tools for Mac (ndi.video) or use the bundled copy";
+        for (const char* var : { "NDI_RUNTIME_DIR_V6", "NDI_RUNTIME_DIR_V5" }) {
+            const char* dir = getenv(var);
+            if (dir && *dir) {
+                std::string candidate = std::string(dir) + "/libndi.dylib";
+                if (dlopen(candidate.c_str(), RTLD_NOW | RTLD_GLOBAL)) break;
+            }
+        }
+        void* sym = dlsym(RTLD_DEFAULT, "NDIlib_initialize");
+        if (sym) {
+            state = 1;
+            Dl_info info;
+            detail = (dladdr(sym, &info) && info.dli_fname) ? std::string(info.dli_fname) : std::string("libndi.dylib (path unknown)");
+        }
+        fprintf(stderr, "[NDI] Runtime %s: %s\n", state == 1 ? "loaded" : "unavailable", detail.c_str());
+    }
+    if (where) *where = detail;
+    return state == 1;
 #endif
 }
 
