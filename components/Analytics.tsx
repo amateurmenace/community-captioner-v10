@@ -14,6 +14,7 @@ interface AnalyticsProps {
   onBack: () => void;
   apiKey?: string;
   localLlmUrl?: string;
+  localLlmModel?: string;
   onAddToCart: (clip: HighlightClip) => void;
   cartCount: number;
   onOpenStudio: () => void;
@@ -57,7 +58,7 @@ const WordCloud = ({ text, onWordClick }: { text: string, onWordClick: (word: st
     );
 };
 
-const Analytics: React.FC<AnalyticsProps> = ({ currentCaptions, currentStats, pastSessions, onBack, apiKey, onAddToCart, cartCount, onOpenStudio, localLlmUrl, isLocalMode }) => {
+const Analytics: React.FC<AnalyticsProps> = ({ currentCaptions, currentStats, pastSessions, onBack, apiKey, onAddToCart, cartCount, onOpenStudio, localLlmUrl, localLlmModel, isLocalMode }) => {
   const [activeSessionId, setActiveSessionId] = useState<string | 'current'>('current');
   const [searchTerm, setSearchTerm] = useState('');
   const [historyOpen, setHistoryOpen] = useState(false);
@@ -112,7 +113,7 @@ const Analytics: React.FC<AnalyticsProps> = ({ currentCaptions, currentStats, pa
       if (isLocalMode) {
           setIsAnalyzing(true);
           try {
-              const result = await generateLocalHighlightAnalysis(activeData!.captions, localLlmUrl);
+              const result = await generateLocalHighlightAnalysis(activeData!.captions, localLlmUrl, localLlmModel);
               setAnalysis(result);
           } catch(e) {
               alert("Local AI Error. Is Ollama running?");

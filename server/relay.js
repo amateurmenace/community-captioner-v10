@@ -13,6 +13,10 @@ import { translateCaption, setApiKey as setTranslationApiKey, getSupportedLangua
 import { fetchPage, htmlToText, extractPdfText, extractUploadedText, pdfSupportAvailable, discoverLinks, locateMunicipalitySources, researchMunicipality, extractDictionaryFromUrl, itemsToEntries, getResearchGroups, GEMINI_TEXT_MODEL } from './context-sources.js';
 import { listProfiles, getProfile, saveProfile, deleteProfile } from './profiles.js';
 import { buildCorrectionIndex, applyCorrections } from '../shared/corrections.js';
+import { probeSystem, invalidateProbe, startWhisper, stopWhisper, getWhisperStatus, subscribeLogs, readScript, readHello, ollamaModels, ollamaPull, ollamaTest, ollamaStart, WHISPER_MODELS, OLLAMA_MODELS } from './local-stack.js';
+import { createRequire as _pkgRequire } from 'module';
+// Version: injected by esbuild in packaged builds (package.json isn't in the pkg snapshot), read from disk in dev
+const APP_VERSION = process.env.CC_APP_VERSION || (() => { try { return _pkgRequire(import.meta.url)('../package.json').version; } catch { return 'dev'; } })();
 // Static import so esbuild bundles multer into the standalone binary. A runtime
 // createRequire('multer') cannot be resolved inside the pkg snapshot, which left
 // file uploads silently disabled in every packaged .app/.exe build.
@@ -964,6 +968,127 @@ app.post('/api/youtube/caption-url', (req, res) => {
         console.log('[YouTube CC] Ingestion URL cleared');
     }
     res.json({ ok: true, url: youtubeCaptionState.url });
+});
+
+// =====================================================================
+// App info + Local AI stack (speech server launcher, Ollama)
+// =====================================================================
+
+// Where this relay runs. The UI uses it to stop nagging about "the desktop
+// app" when the operator is already running the standalone .app/.exe or a
+// local dev server, and to decide whether the guided local setup can act.
+app.get('/api/app/info', (req, res) => {
+    res.json({
+        version: APP_VERSION,
+        desktopApp: !!process.env.DIST_PATH || typeof process.pkg !== 'undefined',
+        platform: process.platform,
+        arch: process.arch,
+        addonLoaded: !!decklink,
+        port: PORT,
+        hostname: os.hostname(),
+    });
+});
+
+app.get('/api/local/info', async (req, res) => {
+    try {
+        if (req.query.refresh === '1') invalidateProbe();
+        const info = await probeSystem({ ollamaUrl: typeof req.query.ollamaUrl === 'string' ? req.query.ollamaUrl : undefined, whisperPort: parseInt(req.query.port) || undefined });
+        res.json({ ok: true, ...info, whisperModels: WHISPER_MODELS, ollamaModels: OLLAMA_MODELS, managed: getWhisperStatus() });
+    } catch (e) {
+        res.status(500).json({ ok: false, error: e.message });
+    }
+});
+
+// The bundled speech server script, for people who prefer to run it by hand
+app.get('/api/local/whisper-server.py', (req, res) => {
+    try {
+        res.setHeader('Content-Type', 'text/x-python; charset=utf-8');
+        res.setHeader('Content-Disposition', 'attachment; filename="whisper_server.py"');
+        res.send(readScript());
+    } catch (e) {
+        res.status(404).json({ ok: false, error: e.message });
+    }
+});
+
+app.post('/api/local/whisper/start', async (req, res) => {
+    try {
+        const r = await startWhisper(req.body || {});
+        res.json({ ok: true, ...r, status: getWhisperStatus() });
+    } catch (e) {
+        res.status(400).json({ ok: false, error: e.message, status: getWhisperStatus() });
+    }
+});
+
+app.post('/api/local/whisper/stop', async (req, res) => {
+    const r = await stopWhisper();
+    res.json({ ...r, status: getWhisperStatus() });
+});
+
+app.get('/api/local/whisper/status', (req, res) => {
+    res.json({ ok: true, ...getWhisperStatus() });
+});
+
+// Live log + status stream for the setup wizard (SSE)
+app.get('/api/local/whisper/logs', (req, res) => {
+    res.setHeader('Content-Type', 'text/event-stream');
+    res.setHeader('Cache-Control', 'no-cache, no-transform');
+    res.setHeader('Connection', 'keep-alive');
+    res.setHeader('X-Accel-Buffering', 'no');
+    res.flushHeaders?.();
+    const send = (ev) => { try { res.write(`data: ${JSON.stringify(ev)}\n\n`); } catch {} };
+    const snapshot = getWhisperStatus();
+    for (const l of snapshot.logs) send({ type: 'log', ...l });
+    send({ type: 'status', ...snapshot, logs: undefined });
+    const unsub = subscribeLogs(send);
+    const keepAlive = setInterval(() => { try { res.write(': ping\n\n'); } catch {} }, 15000);
+    req.on('close', () => { unsub(); clearInterval(keepAlive); });
+});
+
+// Ask any speech server (ours or a third-party one) for its hello message
+app.post('/api/local/whisper/hello', async (req, res) => {
+    const url = req.body?.url;
+    if (!url || typeof url !== 'string' || !/^wss?:\/\//.test(url)) return res.status(400).json({ ok: false, error: 'ws:// url required' });
+    try {
+        const hello = await readHello(url);
+        res.json({ ok: true, reachable: true, hello });
+    } catch (e) {
+        res.json({ ok: true, reachable: false, error: e.message });
+    }
+});
+
+app.get('/api/local/ollama/models', async (req, res) => {
+    res.json({ ok: true, ...(await ollamaModels(typeof req.query.url === 'string' ? req.query.url : undefined)), catalog: OLLAMA_MODELS });
+});
+
+app.post('/api/local/ollama/start', async (req, res) => {
+    res.json(await ollamaStart(req.body?.url));
+});
+
+app.post('/api/local/ollama/test', async (req, res) => {
+    const { model, url } = req.body || {};
+    if (!model) return res.status(400).json({ ok: false, error: 'model required' });
+    try { res.json(await ollamaTest(model, url)); }
+    catch (e) { res.status(502).json({ ok: false, error: e.message }); }
+});
+
+// Pull a model with progress (SSE): {status, completed, total, digest} as Ollama reports it
+app.post('/api/local/ollama/pull', async (req, res) => {
+    const { model, url } = req.body || {};
+    if (!model) return res.status(400).json({ ok: false, error: 'model required' });
+    res.setHeader('Content-Type', 'text/event-stream');
+    res.setHeader('Cache-Control', 'no-cache, no-transform');
+    res.setHeader('Connection', 'keep-alive');
+    res.flushHeaders?.();
+    const send = (ev) => { try { res.write(`data: ${JSON.stringify(ev)}\n\n`); } catch {} };
+    const controller = new AbortController();
+    req.on('close', () => controller.abort());
+    try {
+        await ollamaPull(model, send, url, controller.signal);
+        send({ status: 'done', model });
+    } catch (e) {
+        send({ status: 'error', error: e.message });
+    }
+    try { res.end(); } catch {}
 });
 
 // Public Gemini key status — used by the Context Engine UI to show a clear banner

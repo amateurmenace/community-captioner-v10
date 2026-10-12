@@ -50,6 +50,17 @@ export interface SessionStats {
 /** Which Gemini Live model Cloud mode uses */
 export type CloudModel = 'transcribe-live' | 'native-audio';
 
+/** Live status of the local speech server connection (Local / Fully Local modes) */
+export interface LocalEngineInfo {
+    connected: boolean;
+    backend?: string;   // "mlx-whisper" | "faster-whisper" | legacy
+    model?: string;
+    device?: string;
+    compute?: string;
+    url?: string;
+    error?: string;
+}
+
 export interface Session {
   id: string;
   date: number;
@@ -120,6 +131,7 @@ export interface AppState {
   apiKey?: string;
   localServerUrl?: string; // Whisper
   localLlmUrl?: string; // Ollama (new)
+  localLlmModel?: string; // Ollama model for the Context Engine (default: qwen3:4b)
   cloudModel?: CloudModel; // Cloud mode recognizer (default: transcribe-live)
   
   // Video Studio

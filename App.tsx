@@ -11,7 +11,7 @@ import GlobalSettings from './components/GlobalSettings';
 import LocalSetup from './components/LocalSetup';
 import HighlightStudio from './components/HighlightStudio';
 import CaptionInjection from './components/CaptionInjection';
-import { AppState, Caption, DictionaryEntry, UILanguage, SessionStats, Session, ContextSettings, HighlightClip } from './types';
+import { AppState, Caption, DictionaryEntry, UILanguage, SessionStats, Session, ContextSettings, HighlightClip, LocalEngineInfo } from './types';
 import { Mic, FileVideo, Settings, Loader2, Server, Globe, Download, Monitor, CheckCircle, ArrowRight, ShieldCheck, Terminal, ExternalLink, Github, Zap } from 'lucide-react';
 import { GITHUB_REPO_URL, GITHUB_CLONE_URL, RELEASES_URL, MAC_DOWNLOAD_URL, WINDOWS_DOWNLOAD_URL } from './utils/appLinks';
 import { GoogleGenAI, LiveServerMessage, Modality } from "@google/genai";
@@ -156,7 +156,8 @@ function App() {
         // Load config
         apiKey: localStorage.getItem('cc_api_key') || process.env.API_KEY || '',
         localServerUrl: localStorage.getItem('cc_local_url') || 'ws://localhost:9000',
-        localLlmUrl: 'http://localhost:11434',
+        localLlmUrl: localStorage.getItem('cc_llm_url') || 'http://localhost:11434',
+        localLlmModel: localStorage.getItem('cc_llm_model') || 'qwen3:4b',
         cloudModel: (localStorage.getItem('cc_cloud_model') as any) || 'transcribe-live',
         
         // Video Studio
@@ -212,6 +213,9 @@ function App() {
   // Proposed rules from operator edits (shown as toasts on the Dashboard)
   const [editSuggestions, setEditSuggestions] = useState<{ id: string; original: string; replacement: string }[]>([]);
 
+  // Local speech server status (Local / Fully Local modes) — shown on the Dashboard
+  const [localEngine, setLocalEngine] = useState<LocalEngineInfo>({ connected: false });
+
   const [currentStream, setCurrentStream] = useState<MediaStream | null>(null);
   const dictionaryRef = useRef(appState.dictionary);
   const correctionIndexRef = useRef(buildCorrectionIndex(appState.dictionary));
@@ -228,6 +232,11 @@ function App() {
   useEffect(() => { dictionaryRef.current = appState.dictionary; correctionIndexRef.current = buildCorrectionIndex(appState.dictionary); }, [appState.dictionary]);
   useEffect(() => { contextSettingsRef.current = appState.contextSettings; }, [appState.contextSettings]);
   useEffect(() => { if (appState.cloudModel) localStorage.setItem('cc_cloud_model', appState.cloudModel); }, [appState.cloudModel]);
+  useEffect(() => {
+      if (appState.localServerUrl) localStorage.setItem('cc_local_url', appState.localServerUrl);
+      if (appState.localLlmUrl) localStorage.setItem('cc_llm_url', appState.localLlmUrl);
+      if (appState.localLlmModel) localStorage.setItem('cc_llm_model', appState.localLlmModel);
+  }, [appState.localServerUrl, appState.localLlmUrl, appState.localLlmModel]);
   useEffect(() => { targetLanguageRef.current = appState.targetLanguage; }, [appState.targetLanguage]);
   useEffect(() => { profanityRef.current = appState.profanityFilter; }, [appState.profanityFilter]);
   useEffect(() => { activeModeRef.current = appState.mode; }, [appState.mode]);
@@ -667,9 +676,10 @@ function App() {
                     const ws = new WebSocket(appState.localServerUrl!);
                     ws.binaryType = 'arraybuffer';
                     localWs = ws;
-                    
+
                     ws.onopen = async () => {
-                        console.log("Local Whisper Connected");
+                        console.log("Local speech server connected");
+                        setLocalEngine(prev => ({ ...prev, connected: true, url: appState.localServerUrl, error: undefined }));
                         const ctx = new AudioContext({ sampleRate: 16000 });
                         // CRITICAL: Force resume in case browser policy suspended it
                         if (ctx.state === 'suspended') await ctx.resume();
@@ -691,11 +701,27 @@ function App() {
                     ws.onmessage = (e) => {
                         try {
                             const data = JSON.parse(e.data);
-                            if (data.text) finalizeCaption(data.text);
+                            if (data.type === 'hello') {
+                                // Our bundled server announces what it runs; legacy servers never send this
+                                setLocalEngine({ connected: true, backend: data.backend, model: data.model, device: data.device, compute: data.compute, url: appState.localServerUrl });
+                                return;
+                            }
+                            if (data.type === 'status') {
+                                if (data.state === 'error') setLocalEngine(prev => ({ ...prev, error: data.message }));
+                                return;
+                            }
+                            if (typeof data.text !== 'string') return;
+                            if (data.isFinal === false) {
+                                setAppState(p => ({ ...p, interimText: data.text }));
+                            } else if (data.text.trim()) {
+                                finalizeCaption(data.text);
+                                setAppState(p => ({ ...p, interimText: '' }));
+                            }
                         } catch (err) {}
                     };
-                    ws.onerror = (e) => console.error("Local Server Error", e);
+                    ws.onerror = (e) => { console.error("Local Server Error", e); setLocalEngine(prev => ({ ...prev, connected: false, error: 'Cannot reach the local speech server' })); };
                     ws.onclose = () => {
+                        setLocalEngine(prev => ({ ...prev, connected: false }));
                         // Reconnect strategy
                         if (mounted) setTimeout(initLocal, 1000);
                     };
@@ -952,11 +978,21 @@ function App() {
 
   if (appState.view === 'local_setup') {
       return (
-          <LocalSetup 
+          <LocalSetup
             onBack={() => setAppState(p => ({...p, view: 'choice'}))}
-            onComplete={(llm, whisper) => {
-                setAppState(p => ({...p, localLlmUrl: llm, localServerUrl: whisper, mode: 'fully_local', view: 'dashboard'}));
+            onComplete={(whisperUrl, llm) => {
+                setAppState(p => ({
+                    ...p,
+                    localServerUrl: whisperUrl,
+                    localLlmUrl: llm?.url || p.localLlmUrl,
+                    localLlmModel: llm?.model || p.localLlmModel,
+                    mode: llm ? 'fully_local' : 'local',
+                    view: 'dashboard',
+                }));
             }}
+            initialWhisperUrl={appState.localServerUrl}
+            initialLlmUrl={appState.localLlmUrl}
+            initialLlmModel={appState.localLlmModel}
           />
       );
   }
@@ -1226,6 +1262,8 @@ function App() {
             editSuggestions={editSuggestions}
             onAcceptEditSuggestion={acceptEditSuggestion}
             onDismissEditSuggestion={dismissEditSuggestion}
+            localEngine={localEngine}
+            onOpenLocalSetup={() => setAppState(p => ({ ...p, isRecording: false, view: 'local_setup' }))}
         />
       )}
 
@@ -1253,6 +1291,7 @@ function App() {
              onBack={handleExitAnalytics}
              apiKey={appState.apiKey}
              localLlmUrl={appState.localLlmUrl}
+             localLlmModel={appState.localLlmModel}
              isLocalMode={appState.mode === 'fully_local'}
              onAddToCart={(clip) => setAppState(p => ({...p, highlightCart: [...p.highlightCart, clip]}))}
              cartCount={appState.highlightCart.length}

@@ -283,9 +283,10 @@ END_SCRIPT
   fs.writeFileSync(path.join(macosDir, 'CommunityCaptioner'), launchScript);
   fs.chmodSync(path.join(macosDir, 'CommunityCaptioner'), 0o755);
 
-  // Copy dist/ into Resources/
+  // Copy dist/ (frontend) and local/ (speech server script) into Resources/
   const distSrc = path.join(ROOT, 'dist');
   fs.cpSync(distSrc, path.join(resourcesDir, 'dist'), { recursive: true });
+  if (fs.existsSync(path.join(ROOT, 'local'))) fs.cpSync(path.join(ROOT, 'local'), path.join(resourcesDir, 'local'), { recursive: true });
 
   // Bundle the macOS DeckLink addon next to the binary. relay.js falls back to
   // <exe dir>/decklink_addon.node when the in-tree path isn't available (pkg).
@@ -537,6 +538,7 @@ import '../server/relay.js';
     ],
     define: {
       'import.meta.url': '__importMetaUrl',
+      'process.env.CC_APP_VERSION': JSON.stringify(version),
     },
     banner: {
       js: [
@@ -553,17 +555,18 @@ import '../server/relay.js';
   console.log('\n=== Writing launcher ===');
   fs.writeFileSync(path.join(BUILD, 'launcher.cjs'), getLauncherCode());
 
-  // 4. Copy dist/ into build/ so pkg can snapshot it
-  console.log('\n=== Copying dist/ into build/ ===');
+  // 4. Copy dist/ and local/ (speech server script) into build/ so pkg can snapshot them
+  console.log('\n=== Copying dist/ and local/ into build/ ===');
   fs.cpSync(path.join(ROOT, 'dist'), path.join(BUILD, 'dist'), { recursive: true });
+  if (fs.existsSync(path.join(ROOT, 'local'))) fs.cpSync(path.join(ROOT, 'local'), path.join(BUILD, 'local'), { recursive: true });
 
-  // 5. Write pkg config (shared) — dist included as snapshot asset
+  // 5. Write pkg config (shared) — dist + local included as snapshot assets
   const pkgConfigBase = {
     name: 'community-captioner',
     version,
     main: 'launcher.cjs',
     pkg: {
-      assets: ['server.cjs', 'dist/**/*'],
+      assets: ['server.cjs', 'dist/**/*', 'local/**/*'],
     },
   };
   fs.writeFileSync(
@@ -576,10 +579,10 @@ import '../server/relay.js';
     console.log('\n=== Packaging macOS binary (pkg) ===');
     const macBin = path.join(BUILD, 'CommunityCaptioner-mac');
     run(
-      `npx @yao-pkg/pkg ${path.join(BUILD, 'launcher.cjs')} ` +
+      `npx @yao-pkg/pkg "${path.join(BUILD, 'launcher.cjs')}" ` +
       `--target node20-macos-arm64 ` +
-      `--output ${macBin} ` +
-      `--config ${path.join(BUILD, 'package.json')}`,
+      `--output "${macBin}" ` +
+      `--config "${path.join(BUILD, 'package.json')}"`,
       'pkg → macOS arm64'
     );
 
@@ -705,9 +708,11 @@ import '../server/relay.js';
     const p = path.join(BUILD, f);
     if (fs.existsSync(p)) fs.unlinkSync(p);
   }
-  // Remove dist/ from build dir — it's embedded in the binaries
-  const buildDist = path.join(BUILD, 'dist');
-  if (fs.existsSync(buildDist)) fs.rmSync(buildDist, { recursive: true });
+  // Remove dist/ and local/ from build dir — they're embedded in the binaries
+  for (const d of ['dist', 'local']) {
+    const p = path.join(BUILD, d);
+    if (fs.existsSync(p)) fs.rmSync(p, { recursive: true });
+  }
 
   console.log('\n=== Build complete ===\n');
 }

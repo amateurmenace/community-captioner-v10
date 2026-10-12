@@ -17,6 +17,24 @@ const GlobalSettings: React.FC<GlobalSettingsProps> = ({ isOpen, onClose, appSta
   const [activeTab, setActiveTab] = useState<'general' | 'cloud' | 'local' | 'guide'>(initialTab);
   const [apiKeyInput, setApiKeyInput] = useState(appState.apiKey || '');
   const [localUrlInput, setLocalUrlInput] = useState(appState.localServerUrl || 'ws://localhost:9000');
+  const [llmUrlInput, setLlmUrlInput] = useState(appState.localLlmUrl || 'http://localhost:11434');
+  const [llmModelInput, setLlmModelInput] = useState(appState.localLlmModel || 'qwen3:4b');
+  const [ollamaModels, setOllamaModels] = useState<string[] | null>(null);
+
+  const relayHttp = () => {
+      const port = window.location.port;
+      const p = parseInt(port || '0');
+      if (p >= 5170 && p <= 5199) return `${window.location.protocol}//${window.location.hostname}:8080`;
+      return `${window.location.protocol}//${window.location.hostname}${port ? `:${port}` : ''}`;
+  };
+
+  useEffect(() => {
+      if (!isOpen || activeTab !== 'local') return;
+      fetch(`${relayHttp()}/api/local/ollama/models?url=${encodeURIComponent(llmUrlInput)}`)
+          .then(r => r.json())
+          .then(d => setOllamaModels(d.running ? (d.models || []).map((m: any) => m.name) : []))
+          .catch(() => setOllamaModels([]));
+  }, [isOpen, activeTab, llmUrlInput]);
   
   // Connection States
   const [cloudStatus, setCloudStatus] = useState<ConnectionStatus>('idle');
@@ -80,10 +98,19 @@ const GlobalSettings: React.FC<GlobalSettingsProps> = ({ isOpen, onClose, appSta
       setAppState(prev => ({
           ...prev,
           apiKey: apiKeyInput,
-          localServerUrl: localUrlInput
+          localServerUrl: localUrlInput,
+          localLlmUrl: llmUrlInput,
+          localLlmModel: llmModelInput,
       }));
       localStorage.setItem('cc_api_key', apiKeyInput);
       localStorage.setItem('cc_local_url', localUrlInput);
+      localStorage.setItem('cc_llm_url', llmUrlInput);
+      localStorage.setItem('cc_llm_model', llmModelInput);
+      onClose();
+  };
+
+  const openLocalWizard = () => {
+      setAppState(prev => ({ ...prev, isRecording: false, view: 'local_setup' }));
       onClose();
   };
 
@@ -265,9 +292,36 @@ const GlobalSettings: React.FC<GlobalSettingsProps> = ({ isOpen, onClose, appSta
 
                 {activeTab === 'local' && (
                     <div className="space-y-8">
+                        <div className="p-4 rounded-xl border border-sage-200 bg-sage-50 flex items-center justify-between gap-4">
+                            <div>
+                                <p className="text-sm font-bold text-forest-dark">Guided local setup</p>
+                                <p className="text-xs text-stone-500 mt-0.5">Checks your machine, installs and starts the speech server with a recommended model, and tests your microphone. Use it instead of editing URLs by hand.</p>
+                            </div>
+                            <button onClick={openLocalWizard} className="shrink-0 bg-forest-dark text-white px-4 py-2 rounded-lg font-bold text-sm hover:bg-forest-light">Open setup wizard</button>
+                        </div>
+
                         <div>
-                            <h3 className="text-lg font-bold text-forest-dark mb-2">Local Whisper Server</h3>
-                            <p className="text-sm text-stone-500 mb-4">Connect to a Whisper ASR WebSocket server running on your machine.</p>
+                            <h3 className="text-lg font-bold text-forest-dark mb-2">Local AI brain (Ollama)</h3>
+                            <p className="text-sm text-stone-500 mb-4">Used by the Context Engine and session analysis in Fully Local mode. Pick an installed model; the wizard can download one.</p>
+                            <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                                <div>
+                                    <label className="text-xs font-bold text-stone-400 uppercase tracking-wider mb-2 block">Ollama URL</label>
+                                    <input type="text" value={llmUrlInput} onChange={e => setLlmUrlInput(e.target.value)} className="w-full p-3 border border-stone-200 rounded-xl bg-white font-mono text-sm text-stone-800" placeholder="http://localhost:11434" />
+                                </div>
+                                <div>
+                                    <label className="text-xs font-bold text-stone-400 uppercase tracking-wider mb-2 block">Model {ollamaModels === null ? '' : ollamaModels.length ? `(${ollamaModels.length} installed)` : '(Ollama not running)'}</label>
+                                    <input list="ollama-models" type="text" value={llmModelInput} onChange={e => setLlmModelInput(e.target.value)} className="w-full p-3 border border-stone-200 rounded-xl bg-white font-mono text-sm text-stone-800" placeholder="qwen3:4b" />
+                                    <datalist id="ollama-models">
+                                        {(ollamaModels || []).map(m => <option key={m} value={m} />)}
+                                        {['qwen3:4b', 'qwen3:8b', 'gemma3:4b', 'gemma3:12b', 'llama3.1:8b'].filter(m => !(ollamaModels || []).includes(m)).map(m => <option key={m} value={m}>{`${m} (not installed)`}</option>)}
+                                    </datalist>
+                                </div>
+                            </div>
+                        </div>
+
+                        <div>
+                            <h3 className="text-lg font-bold text-forest-dark mb-2">Local speech server</h3>
+                            <p className="text-sm text-stone-500 mb-4">WebSocket address of the speech server (ours or any compatible one). Audio is sent here as 16 kHz PCM; captions come back as JSON.</p>
                             
                             <label className="text-xs font-bold text-stone-400 uppercase tracking-wider mb-2 block">Server URL</label>
                             <div className="flex gap-2">

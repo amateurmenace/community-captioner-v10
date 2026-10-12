@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { Mic, StopCircle, Home, Activity, Play, Globe, Layout, ShieldCheck, Zap, Lock, CloudLightning, Wifi, Info, Captions, ExternalLink, Link as LinkIcon, Copy, Monitor, Network, Check, Pause, X, Download, ShieldAlert, Edit2, Clock, Signal, AlertTriangle, Server, Video, QrCode, Eye, Terminal, ChevronRight, ChevronDown, WifiOff, Cloud } from 'lucide-react';
-import { Caption, DictionaryEntry, OperationMode, SessionStats, Notification, AudioDevice, UILanguage, OverlaySettings } from '../types';
+import { Caption, DictionaryEntry, OperationMode, SessionStats, Notification, AudioDevice, UILanguage, OverlaySettings, LocalEngineInfo } from '../types';
 import { useTranslation } from '../utils/i18n';
 import { LANGUAGES } from '../utils/languages';
 import GlobalSettings from './GlobalSettings';
@@ -38,7 +38,19 @@ interface DashboardProps {
   editSuggestions?: { id: string; original: string; replacement: string }[];
   onAcceptEditSuggestion?: (id: string) => void;
   onDismissEditSuggestion?: (id: string) => void;
+  /** Local speech server status (Local / Fully Local modes) */
+  localEngine?: LocalEngineInfo;
+  onOpenLocalSetup?: () => void;
 }
+
+// What each capture mode does — shown as tooltips on the mode switcher
+const MODE_INFO: Record<OperationMode, { label: string; desc: string }> = {
+    balanced:    { label: 'Browser',       desc: 'Web Speech API — Chrome/Edge send audio to Google\'s speech service. Free, zero setup.' },
+    cloud:       { label: 'Cloud',         desc: 'Gemini Transcribe Live. Best accuracy on names; needs a Gemini API key.' },
+    local:       { label: 'Local speech',  desc: 'Whisper running on this machine. Audio never leaves the computer. Context Engine still uses Gemini if a key is set.' },
+    fully_local: { label: 'Fully local',   desc: 'Local speech + Ollama for the Context Engine. Works with no internet at all.' },
+    resilience:  { label: 'Resilience',    desc: 'Browser speech with aggressive automatic retry when the network drops.' },
+};
 
 // Relay URL (WebSocket). Vite dev ports 5170-5199 map to the relay on 8080;
 // a tunnel/cloud host with no explicit port keeps the default port.
@@ -344,7 +356,9 @@ const Dashboard: React.FC<DashboardProps> = ({
   cea708Enabled,
   editSuggestions = [],
   onAcceptEditSuggestion,
-  onDismissEditSuggestion
+  onDismissEditSuggestion,
+  localEngine,
+  onOpenLocalSetup
 }) => {
   const t = useTranslation(uiLanguage);
   const scrollRef = useRef<HTMLDivElement>(null);
@@ -706,6 +720,22 @@ const Dashboard: React.FC<DashboardProps> = ({
         </div>
 
         <div className="flex items-center gap-8">
+           {/* Local speech server status (Local / Fully Local modes) */}
+           {(mode === 'local' || mode === 'fully_local') && (
+                <Tooltip text={isRecording
+                    ? (localEngine?.connected ? `Connected to the local speech server${localEngine.model ? ` (${localEngine.model}${localEngine.device ? ` on ${localEngine.device}` : ''})` : ''}` : (localEngine?.error || 'The local speech server is not answering. Click to open the setup wizard.'))
+                    : 'Local mode: audio stays on this machine. Click to check or change the speech server.'}>
+                    <button onClick={onOpenLocalSetup} className={`hidden md:flex items-center gap-2 px-3 py-1.5 rounded-lg border text-xs font-bold transition-colors ${
+                        !isRecording ? 'bg-white text-stone-600 border-stone-200 hover:bg-stone-50'
+                        : localEngine?.connected ? 'bg-green-50 text-green-700 border-green-200'
+                        : 'bg-red-50 text-red-600 border-red-200 animate-pulse'}`}>
+                        <Server size={14} />
+                        <span>{!isRecording ? `${MODE_INFO[mode].label} · setup` : localEngine?.connected ? `Local: ${localEngine.model ? localEngine.model.replace(/^mlx-community\//, '') : 'connected'}` : 'Local server offline'}</span>
+                        {isRecording && localEngine?.connected && <span className="w-1.5 h-1.5 rounded-full bg-green-500 animate-pulse" />}
+                    </button>
+                </Tooltip>
+           )}
+
            {/* Relay Error Indicator */}
            {!relayConnected && (
                 <div className="hidden md:flex items-center gap-2 bg-red-50 text-red-600 px-3 py-1.5 rounded-lg border border-red-200 text-xs font-bold animate-pulse">
@@ -880,9 +910,9 @@ const Dashboard: React.FC<DashboardProps> = ({
                     <label className="text-[10px] font-bold text-stone-400 uppercase tracking-wider px-2">Mode</label>
                     <div className="flex items-center gap-1">
                         {(['balanced', 'local', 'fully_local', 'resilience', 'cloud'] as OperationMode[]).map((m) => (
-                            <Tooltip 
-                                key={m} 
-                                text={m.replace('_', ' ').toUpperCase()}
+                            <Tooltip
+                                key={m}
+                                text={`${MODE_INFO[m].label}: ${MODE_INFO[m].desc}`}
                             >
                                 <button 
                                     onClick={() => handleModeSwitch(m)}

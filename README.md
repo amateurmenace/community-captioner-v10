@@ -73,21 +73,22 @@ When you launch the app, you will be presented with two choices:
 *   **Setup**: Enter your API Key in `Settings > Cloud Access`.
 
 ### Local Mode (Privacy First)
-*   **Engine**: Whisper.cpp (Speech) + Ollama (Context)
-*   **Latency**: Low to Medium (Hardware dependent)
-*   **Accuracy**: High (95%)
-*   **Cost**: Free (Runs on your GPU/CPU).
+*   **Engine**: Whisper on your own machine — `mlx-whisper` on Apple Silicon (GPU) or `faster-whisper` (CPU / NVIDIA) — plus optional Ollama for the Context Engine ("Fully Local").
+*   **Latency**: About 1 second after each pause (hardware dependent)
+*   **Accuracy**: High with `large-v3-turbo` or `distil-large-v3`; `small.en` for light machines
+*   **Cost**: Free (runs on your GPU/CPU). Audio never leaves the computer.
 *   **Setup**: 
-    1. Click "Connect Local AI" on the dashboard.
-    2. Follow the wizard to install `Ollama` and the Python `server.py` script.
-    3. Run the Python script to bridge the audio to the web app.
+    1. Click **Connect Local AI** on the workflow picker.
+    2. The wizard checks your machine, recommends a model, installs and starts the bundled speech server (`local/whisper_server.py`) for you, and lets you test it with your microphone.
+    3. Optionally install Ollama and download a small model (Qwen3 4B recommended) for a fully offline Context Engine.
+    The only prerequisite is Python 3.10–3.13 or [uv](https://docs.astral.sh/uv/) (one-line install; the wizard shows the command).
 
 ### Balanced Mode
-*   **Engine**: Web Speech API (Chrome/Edge built-in)
+*   **Engine**: Web Speech API (Chrome/Edge built-in — audio is processed by Google's speech service)
 *   **Latency**: Instant
 *   **Accuracy**: Good (90%)
 *   **Cost**: Free.
-*   **Note**: Only works in Chrome/Edge browsers, not in the Desktop App.
+*   **Note**: Works in Chrome/Edge, including the browser window the desktop app opens.
 
 ---
 
