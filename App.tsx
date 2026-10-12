@@ -13,6 +13,7 @@ import HighlightStudio from './components/HighlightStudio';
 import CaptionInjection from './components/CaptionInjection';
 import { AppState, Caption, DictionaryEntry, UILanguage, SessionStats, Session, ContextSettings, HighlightClip, LocalEngineInfo } from './types';
 import type { BrowserEngineInfo } from './types';
+import { diagLog } from './utils/diagnostics';
 import { Mic, FileVideo, Settings, Loader2, Server, Globe, Download, Monitor, CheckCircle, ArrowRight, ShieldCheck, Terminal, ExternalLink, Github, Zap } from 'lucide-react';
 import { GITHUB_REPO_URL, GITHUB_CLONE_URL, RELEASES_URL, MAC_DOWNLOAD_URL, WINDOWS_DOWNLOAD_URL } from './utils/appLinks';
 import { GoogleGenAI, LiveServerMessage, Modality } from "@google/genai";
@@ -118,6 +119,18 @@ function App() {
   // Detect Electron Environment
   const isElectron = /Electron/.test(navigator.userAgent);
 
+  // Recent errors for Help & Settings → Diagnostics (window errors, rejected promises,
+  // console.error) so a user can copy one report instead of opening the dev tools.
+  useEffect(() => {
+      const onError = (ev: ErrorEvent) => diagLog('error', `${ev.message} (${ev.filename?.split('/').pop() || ''}:${ev.lineno || ''})`);
+      const onRejection = (ev: PromiseRejectionEvent) => diagLog('error', `Unhandled promise: ${ev.reason?.message || String(ev.reason)}`);
+      window.addEventListener('error', onError);
+      window.addEventListener('unhandledrejection', onRejection);
+      const origError = console.error;
+      console.error = (...args: any[]) => { try { diagLog('console', args.map(a => (a instanceof Error ? `${a.name}: ${a.message}` : typeof a === 'string' ? a : JSON.stringify(a))).join(' ').slice(0, 300)); } catch {} origError.apply(console, args); };
+      return () => { window.removeEventListener('error', onError); window.removeEventListener('unhandledrejection', onRejection); console.error = origError; };
+  }, []);
+
   // Initialize state with keys from localStorage if available
   const [appState, setAppState] = useState<AppState>(() => {
     const savedOverlay = localStorage.getItem('cc_overlay_settings');
@@ -177,7 +190,7 @@ function App() {
   const [showContextModal, setShowContextModal] = useState(false);
   const [showOutputModal, setShowOutputModal] = useState(false);
   const [showGlobalSettings, setShowGlobalSettings] = useState(false);
-  const [globalSettingsTab, setGlobalSettingsTab] = useState<'general'|'cloud'|'local'|'guide'|'help'>('general');
+  const [globalSettingsTab, setGlobalSettingsTab] = useState<'general'|'cloud'|'local'|'guide'|'help'|'diagnostics'>('general');
   const [relayStatus, setRelayStatus] = useState<'connected'|'disconnected'>('disconnected');
 
   // Detect platform + DeckLink addon status so the workflow picker can
@@ -219,7 +232,7 @@ function App() {
   // Browser speech (Balanced / Resilience): did the recognizer actually return text?
   const [browserEngine, setBrowserEngine] = useState<BrowserEngineInfo>({ state: 'idle' });
   const browserEngineRef = useRef<BrowserEngineInfo>({ state: 'idle' });
-  const setBrowserEngineBoth = (v: BrowserEngineInfo) => { browserEngineRef.current = v; setBrowserEngine(v); };
+  const setBrowserEngineBoth = (v: BrowserEngineInfo) => { browserEngineRef.current = v; setBrowserEngine(v); diagLog('engine', `browser speech: ${v.state}${v.detail ? ' — ' + v.detail : ''}`); };
   const browserWatchdogRef = useRef<any>(null);
   const browserStartedAtRef = useRef<number>(0);
 
@@ -674,15 +687,22 @@ function App() {
             // 1. Get Audio Stream
             // CLOUD FIX: Remove sampleRate: 16000 constraint to avoid "OverconstrainedError" on consumer hardware
             // Let the browser pick the native rate, and AudioContext will handle resampling.
-            stream = await navigator.mediaDevices.getUserMedia({ 
-                audio: { 
-                    deviceId: appState.audioSourceId ? { exact: appState.audioSourceId } : undefined,
-                    echoCancellation: true,
-                    autoGainControl: true,
-                    noiseSuppression: true,
-                    channelCount: 1
-                } 
-            });
+            const baseAudio = { echoCancellation: true, autoGainControl: true, noiseSuppression: true, channelCount: 1 };
+            try {
+                stream = await navigator.mediaDevices.getUserMedia({
+                    audio: { deviceId: appState.audioSourceId ? { exact: appState.audioSourceId } : undefined, ...baseAudio },
+                });
+            } catch (err: any) {
+                // A remembered device that is no longer plugged in (or a different machine's
+                // device id) makes the exact constraint fail. Fall back to the default input
+                // and say so, instead of silently doing nothing.
+                if (appState.audioSourceId && (err?.name === 'OverconstrainedError' || err?.name === 'NotFoundError')) {
+                    stream = await navigator.mediaDevices.getUserMedia({ audio: baseAudio });
+                    setAppState(p => ({ ...p, audioSourceId: '', notifications: [...p.notifications, { id: Date.now().toString(), message: 'The remembered microphone is not available on this computer; using the default input instead. Pick another device in the bottom bar if needed.', type: 'error', timestamp: Date.now() }] }));
+                } else {
+                    throw err;
+                }
+            }
             if (!mounted) return;
             setCurrentStream(stream);
             startVad(stream);
@@ -975,9 +995,16 @@ function App() {
                 initGeminiLive();
             }
 
-        } catch (e) {
+        } catch (e: any) {
             console.error("Recording init error", e);
-            setAppState(p => ({...p, isRecording: false}));
+            const name = e?.name || '';
+            const message =
+                name === 'NotAllowedError' || name === 'SecurityError' ? 'Microphone access is blocked. Allow the microphone for this site in the browser (the lock or "aA" icon in the address bar) and, on macOS, in System Settings → Privacy & Security → Microphone for the browser you are using.' :
+                name === 'NotFoundError' ? 'No microphone or audio input was found on this computer. Plug one in or pick a loopback device, then press Start again.' :
+                name === 'NotReadableError' || name === 'AbortError' ? 'The microphone is in use by another application or could not be opened. Close other apps using it and press Start again.' :
+                `Could not start the session: ${e?.message || name || 'unknown error'}. Open Help & Settings → Diagnostics and copy the report.`;
+            diagLog('error', `Recording init failed: ${name} ${e?.message || ''}`);
+            setAppState(p => ({ ...p, isRecording: false, notifications: [...p.notifications, { id: Date.now().toString(), message, type: 'error', timestamp: Date.now() }] }));
         }
     };
 

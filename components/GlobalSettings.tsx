@@ -1,6 +1,7 @@
 import React, { useState, useEffect } from 'react';
 import { X, Globe, Key, Cpu, Settings, Cloud, Server, Terminal, ShieldCheck, BookOpen, AlertCircle, Loader2, Check } from 'lucide-react';
 import HelpGuide from './HelpGuide';
+import { collectDiagnostics, DiagReport } from '../utils/diagnostics';
 import { AppState, UILanguage } from '../types';
 import { GoogleGenAI } from "@google/genai";
 
@@ -9,13 +10,22 @@ interface GlobalSettingsProps {
   onClose: () => void;
   appState: AppState;
   setAppState: React.Dispatch<React.SetStateAction<AppState>>;
-  initialTab?: 'general' | 'cloud' | 'local' | 'guide' | 'help';
+  initialTab?: 'general' | 'cloud' | 'local' | 'guide' | 'help' | 'diagnostics';
 }
 
 type ConnectionStatus = 'idle' | 'testing' | 'success' | 'error';
 
 const GlobalSettings: React.FC<GlobalSettingsProps> = ({ isOpen, onClose, appState, setAppState, initialTab = 'general' }) => {
-  const [activeTab, setActiveTab] = useState<'general' | 'cloud' | 'local' | 'guide' | 'help'>(initialTab);
+  const [activeTab, setActiveTab] = useState<'general' | 'cloud' | 'local' | 'guide' | 'help' | 'diagnostics'>(initialTab);
+  const [diag, setDiag] = useState<DiagReport | null>(null);
+  const [diagBusy, setDiagBusy] = useState(false);
+  const [diagCopied, setDiagCopied] = useState(false);
+  const runDiagnostics = async () => {
+      setDiagBusy(true);
+      try { setDiag(await collectDiagnostics({ mode: appState.mode, isRecording: appState.isRecording, audioSourceId: appState.audioSourceId || '', captionsInSession: appState.captions.length, dictionaryRules: appState.dictionary.length, targetLanguage: appState.targetLanguage })); }
+      finally { setDiagBusy(false); }
+  };
+  useEffect(() => { if (isOpen && activeTab === 'diagnostics' && !diag) runDiagnostics(); }, [isOpen, activeTab]);
   const [apiKeyInput, setApiKeyInput] = useState(appState.apiKey || '');
   const [localUrlInput, setLocalUrlInput] = useState(appState.localServerUrl || 'ws://localhost:9000');
   const [llmUrlInput, setLlmUrlInput] = useState(appState.localLlmUrl || 'http://localhost:11434');
@@ -151,6 +161,9 @@ const GlobalSettings: React.FC<GlobalSettingsProps> = ({ isOpen, onClose, appSta
                 <button onClick={() => setActiveTab('help')} className={`text-left px-4 py-2 rounded-lg text-sm font-bold flex items-center gap-2 ${activeTab === 'help' ? 'bg-white shadow-sm text-forest-dark' : 'text-stone-500 hover:bg-stone-100'}`}>
                     <BookOpen size={16} /> Help &amp; Guide
                 </button>
+                <button onClick={() => setActiveTab('diagnostics')} className={`text-left px-4 py-2 rounded-lg text-sm font-bold flex items-center gap-2 ${activeTab === 'diagnostics' ? 'bg-white shadow-sm text-forest-dark' : 'text-stone-500 hover:bg-stone-100'}`}>
+                    <AlertCircle size={16} /> Diagnostics
+                </button>
                 <div className="h-px bg-stone-200 my-2"></div>
                 <button onClick={() => setActiveTab('general')} className={`text-left px-4 py-2 rounded-lg text-sm font-bold flex items-center gap-2 ${activeTab === 'general' ? 'bg-white shadow-sm text-forest-dark' : 'text-stone-500 hover:bg-stone-100'}`}>
                     <Globe size={16} /> General
@@ -214,6 +227,27 @@ const GlobalSettings: React.FC<GlobalSettingsProps> = ({ isOpen, onClose, appSta
                 )}
 
                 {activeTab === 'help' && <HelpGuide />}
+
+                {activeTab === 'diagnostics' && (
+                    <div className="space-y-4 animate-fade-in">
+                        <div>
+                            <h3 className="text-lg font-bold text-forest-dark">Diagnostics</h3>
+                            <p className="text-sm text-stone-500">Checks the things that usually explain "captions are not coming on": microphone permission and devices, the browser's speech API, the relay, the local speech server, and the last errors. Copy the report and paste it when asking for help.</p>
+                        </div>
+                        <div className="flex gap-2">
+                            <button onClick={runDiagnostics} disabled={diagBusy} className="bg-forest-dark text-white px-4 py-2 rounded-lg text-sm font-bold hover:bg-forest-light disabled:opacity-50 flex items-center gap-2">{diagBusy ? <Loader2 size={14} className="animate-spin" /> : null} {diag ? 'Run again' : 'Run checks'}</button>
+                            {diag && <button onClick={async () => { try { await navigator.clipboard.writeText([...(diag.problems.length ? ['PROBLEMS:', ...diag.problems.map(p => '- ' + p), ''] : []), ...diag.lines].join('\n')); setDiagCopied(true); setTimeout(() => setDiagCopied(false), 2000); } catch {} }} className="bg-white border border-stone-200 text-stone-700 px-4 py-2 rounded-lg text-sm font-bold hover:bg-stone-50 flex items-center gap-2">{diagCopied ? <><Check size={14} /> Copied</> : 'Copy report'}</button>}
+                        </div>
+                        {diag && diag.problems.length > 0 && (
+                            <div className="bg-red-50 border border-red-200 rounded-xl p-4 space-y-2">
+                                <p className="text-xs font-bold uppercase tracking-wider text-red-600">Found {diag.problems.length} likely {diag.problems.length === 1 ? 'problem' : 'problems'}</p>
+                                {diag.problems.map((p, i) => <p key={i} className="text-sm text-red-800 flex items-start gap-2"><AlertCircle size={14} className="shrink-0 mt-0.5" /> {p}</p>)}
+                            </div>
+                        )}
+                        {diag && diag.problems.length === 0 && <div className="bg-green-50 border border-green-200 rounded-xl p-4 text-sm text-green-800 flex items-center gap-2"><Check size={16} /> Nothing obviously wrong in these checks. If captions still do not appear, copy the report and send it along with what the header pill says after you press Start.</div>}
+                        {diag && <pre className="bg-stone-900 text-stone-200 text-[11px] font-mono p-4 rounded-xl whitespace-pre-wrap max-h-[50vh] overflow-auto custom-scrollbar">{diag.lines.join('\n')}</pre>}
+                    </div>
+                )}
 
                 {activeTab === 'guide' && (
                     <div className="space-y-8 animate-fade-in">

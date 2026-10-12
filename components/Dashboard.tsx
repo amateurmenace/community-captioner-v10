@@ -999,11 +999,18 @@ const Dashboard: React.FC<DashboardProps> = ({
 
         <div className="flex-1 min-h-0 flex flex-row gap-8 p-8 overflow-hidden relative">
            {/* Notification Banner */}
-           {lastNotification && Date.now() - lastNotification.timestamp < 4000 && (
+           {lastNotification && Date.now() - lastNotification.timestamp < (lastNotification.type === 'error' ? 12000 : 4000) && (
+             lastNotification.type === 'error' ? (
+               <div className="absolute top-4 left-1/2 -translate-x-1/2 z-20 max-w-[min(90%,720px)] bg-red-50 border border-red-200 text-red-800 px-5 py-3 rounded-2xl shadow-2xl flex items-start gap-3 animate-slide-up">
+                   <AlertTriangle size={18} className="text-red-500 shrink-0 mt-0.5" />
+                   <div><span className="text-[10px] font-bold text-red-500 block uppercase tracking-wider">Problem</span><span className="text-sm font-medium leading-snug">{lastNotification.message}</span></div>
+               </div>
+             ) : (
              <div onClick={() => setShowCorrections(true)} className="absolute top-4 left-1/2 -translate-x-1/2 z-20 bg-forest-dark text-white px-6 py-3 rounded-full shadow-2xl flex items-center gap-3 cursor-pointer animate-slide-down hover:scale-105 transition-transform">
                  <ShieldCheck size={18} className="text-sage-300" />
                  <div><span className="text-xs font-bold text-sage-300 block uppercase tracking-wider">Context Active</span><span className="text-sm font-medium">{lastNotification.message}</span></div>
              </div>
+             )
           )}
 
           <div className="flex-1 min-w-0 min-h-0 flex flex-col relative">
