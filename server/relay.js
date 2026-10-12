@@ -942,7 +942,7 @@ app.post('/api/translate', async (req, res) => {
     if (!text || typeof text !== 'string') return res.status(400).json({ ok: false, error: 'text required' });
     if (!lang || typeof lang !== 'string' || lang === 'en') return res.json({ ok: true, translated: text, engine: 'none' });
     try {
-        const translated = await translateCaption(text, lang);
+        const translated = await translateCaption(text, lang, { timeoutMs: 10000 });
         res.json({ ok: true, translated, engine: brainActive() ? `ollama:${getBrainConfig().model}` : geminiKeyActive ? 'gemini' : 'none', changed: translated !== text });
     } catch (e) {
         res.status(500).json({ ok: false, error: e.message });

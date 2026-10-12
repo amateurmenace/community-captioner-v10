@@ -1,7 +1,7 @@
 {
   "name": "community-captioner",
   "private": true,
-  "version": "6.10.3",
+  "version": "6.10.4",
   "type": "module",
   "main": "electron/main.js",
   "description": "AI-powered live captioning for community media.",

@@ -3,6 +3,8 @@ export interface Caption {
   id: string;
   text: string;
   translatedText?: string;
+  /** The translation service did not answer in time; translatedText holds the original */
+  translationFailed?: boolean;
   timestamp: number;
   confidence: number;
   isFinal: boolean;

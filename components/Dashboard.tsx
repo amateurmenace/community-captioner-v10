@@ -364,6 +364,7 @@ const Dashboard: React.FC<DashboardProps> = ({
 }) => {
   const t = useTranslation(uiLanguage);
   const scrollRef = useRef<HTMLDivElement>(null);
+  const transScrollRef = useRef<HTMLDivElement>(null);
   const [audioDevices, setAudioDevices] = useState<AudioDevice[]>([]);
   const [showLinkModal, setShowLinkModal] = useState(false);
   const [showQrModal, setShowQrModal] = useState(false);
@@ -599,6 +600,7 @@ const Dashboard: React.FC<DashboardProps> = ({
 
   useEffect(() => {
     if (scrollRef.current && !editingId) scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
+    if (transScrollRef.current && !editingId) transScrollRef.current.scrollTop = transScrollRef.current.scrollHeight;
   }, [captions, interimText, editingId]);
 
   // --- PiP Monitor Logic ---
@@ -981,7 +983,7 @@ const Dashboard: React.FC<DashboardProps> = ({
         {machineGraphs}
       </div>
 
-      <div className="flex flex-1 overflow-hidden relative">
+      <div className="flex flex-1 min-h-0 overflow-hidden relative">
         {/* ... (Rest of component remains the same) ... */}
         {showCorrections && (
             <div className="w-80 bg-white border-r border-stone-200 absolute left-0 top-0 bottom-0 z-20 shadow-2xl animate-slide-right flex flex-col">
@@ -995,7 +997,7 @@ const Dashboard: React.FC<DashboardProps> = ({
             </div>
         )}
 
-        <div className={`flex-1 flex flex-col p-8 overflow-hidden relative ${targetLanguage !== 'en' ? 'grid grid-cols-2 gap-8' : ''}`}>
+        <div className="flex-1 min-h-0 flex flex-row gap-8 p-8 overflow-hidden relative">
            {/* Notification Banner */}
            {lastNotification && Date.now() - lastNotification.timestamp < 4000 && (
              <div onClick={() => setShowCorrections(true)} className="absolute top-4 left-1/2 -translate-x-1/2 z-20 bg-forest-dark text-white px-6 py-3 rounded-full shadow-2xl flex items-center gap-3 cursor-pointer animate-slide-down hover:scale-105 transition-transform">
@@ -1004,8 +1006,8 @@ const Dashboard: React.FC<DashboardProps> = ({
              </div>
           )}
 
-          <div className="flex flex-col h-full relative">
-               <div ref={scrollRef} className="flex-1 overflow-y-auto space-y-4 pr-4 pb-32 custom-scrollbar">
+          <div className="flex-1 min-w-0 min-h-0 flex flex-col relative">
+               <div ref={scrollRef} className="flex-1 min-h-0 overflow-y-auto space-y-4 pr-4 pb-32 custom-scrollbar">
                     {captions.length === 0 && !interimText && (
                         <div className="h-full flex flex-col items-center justify-center text-stone-400 select-none">
                             <div className={`w-24 h-24 rounded-full flex items-center justify-center mb-6 transition-all duration-500 ${isRecording ? 'bg-red-50 scale-110 shadow-red-100 shadow-xl' : 'bg-white shadow-sm'}`}>
@@ -1033,12 +1035,14 @@ const Dashboard: React.FC<DashboardProps> = ({
                </div>
           </div>
           {targetLanguage !== 'en' && (
-              <div className="flex flex-col h-full border-l border-stone-200 pl-8">
+              <div className="flex-1 min-w-0 min-h-0 flex flex-col border-l border-stone-200 pl-8">
                   <h3 className="text-sm font-bold text-stone-400 uppercase tracking-wider mb-2">Translated ({targetLanguage.toUpperCase()})</h3>
-                  <div className="flex-1 overflow-y-auto space-y-4 pr-4 pb-32 custom-scrollbar">
+                  <div ref={transScrollRef} className="flex-1 min-h-0 overflow-y-auto space-y-4 pr-4 pb-32 custom-scrollbar">
                        {captions.map((cap) => (
                            <div key={`trans-${cap.id}`} className="p-4 rounded-2xl hover:bg-sage-50 transition-all">
-                               <p className="text-2xl leading-relaxed font-medium text-forest-dark">{cap.translatedText || <span className="opacity-30 animate-pulse">...</span>}</p>
+                               {cap.translationFailed
+                                   ? <p className="text-2xl leading-relaxed font-medium text-stone-400" title="The translation service did not answer in time; showing the original line.">{cap.text} <span className="text-[10px] font-bold uppercase tracking-wider align-middle text-amber-600">not translated</span></p>
+                                   : <p className="text-2xl leading-relaxed font-medium text-forest-dark">{cap.translatedText || <span className="opacity-30 animate-pulse">...</span>}</p>}
                            </div>
                        ))}
                   </div>

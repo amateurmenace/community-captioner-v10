@@ -82,7 +82,7 @@ export function getCacheStats() {
  * Translate caption text to target language.
  * Returns translated string, or original text on failure.
  */
-export async function translateCaption(text, targetLang) {
+export async function translateCaption(text, targetLang, { timeoutMs = 4000 } = {}) {
     if (!text || targetLang === 'en') return text;
     if (!geminiApiKey && !(await translationAvailable())) {
         console.warn('[Translation] No translation engine (no Gemini key, local brain off) — returning original text');
@@ -113,7 +113,7 @@ export async function translateCaption(text, targetLang) {
     stats.misses++;
 
     // Create the translation promise
-    const translationPromise = doTranslate(text, targetLang, langName, cacheKey);
+    const translationPromise = doTranslate(text, targetLang, langName, cacheKey, timeoutMs);
     inFlight.set(cacheKey, translationPromise);
 
     try {
@@ -123,7 +123,7 @@ export async function translateCaption(text, targetLang) {
     }
 }
 
-async function doTranslate(text, targetLang, langName, cacheKey) {
+async function doTranslate(text, targetLang, langName, cacheKey, timeoutMs = 4000) {
     // Local AI brain first (Fully Local mode): the caption never leaves the machine
     let useLocal = false;
     try { useLocal = (await localLlm()).brainActive(); } catch {}
@@ -146,8 +146,9 @@ async function doTranslate(text, targetLang, langName, cacheKey) {
         const { GoogleGenAI } = await import('@google/genai');
         const ai = new GoogleGenAI({ apiKey: geminiApiKey });
 
-        // Race against 1500ms timeout — Gemini SDK doesn't support AbortController,
-        // so we use Promise.race to enforce the timeout
+        // Race against a timeout — the Gemini SDK doesn't support AbortController, so
+        // Promise.race enforces it. 4 s for the audience path (a caption that arrives
+        // 3 s late is still useful; one in English is not), 10 s for the Dashboard.
         const response = await Promise.race([
             ai.models.generateContent({
                 model: 'gemini-2.5-flash',
@@ -157,7 +158,7 @@ async function doTranslate(text, targetLang, langName, cacheKey) {
                     temperature: 0.1,
                 },
             }),
-            new Promise((_, reject) => setTimeout(() => reject(new Error('timeout')), 1500))
+            new Promise((_, reject) => setTimeout(() => reject(new Error('timeout')), timeoutMs))
         ]);
 
         const translated = response?.text?.trim();
@@ -179,7 +180,7 @@ async function doTranslate(text, targetLang, langName, cacheKey) {
     } catch (e) {
         stats.errors++;
         if (e.message === 'timeout') {
-            console.warn(`[Translation] Timeout (1500ms) for ${targetLang}: "${text.slice(0, 30)}..."`);
+            console.warn(`[Translation] Timeout (${timeoutMs}ms) for ${targetLang}: "${text.slice(0, 30)}..." — returning the original`);
         } else {
             console.warn(`[Translation] Error for ${targetLang}: ${e.message}`);
         }

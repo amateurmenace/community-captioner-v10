@@ -588,7 +588,7 @@ function App() {
                 method: 'POST', headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ text: final, lang }),
             }).then(r => r.json()).then(d => {
-                if (d?.ok && d.translated) setCaptions(prev => prev.map(c => c.id === newCaption.id ? { ...c, translatedText: d.translated } : c));
+                if (d?.ok && d.translated) setCaptions(prev => prev.map(c => c.id === newCaption.id ? { ...c, translatedText: d.translated, translationFailed: d.changed === false && lang !== 'en' } : c));
             }).catch(async () => {
                 // Relay unreachable: fall back to the browser's own Gemini call if a key exists
                 const key = apiKeyRef.current;
