@@ -172,6 +172,13 @@ const GlobalSettings: React.FC<GlobalSettingsProps> = ({ isOpen, onClose, appSta
                 {activeTab === 'general' && (
                     <div className="space-y-6">
                         <div>
+                            <label className="text-xs font-bold text-stone-400 uppercase tracking-wider mb-2 block">Spoken language (browser speech)</label>
+                            <select defaultValue={localStorage.getItem('cc_speech_lang') || 'en-US'} onChange={e => localStorage.setItem('cc_speech_lang', e.target.value)} className="w-full p-3 border border-stone-200 rounded-xl bg-white text-sm text-stone-800">
+                                {[['en-US', 'English (US)'], ['en-GB', 'English (UK)'], ['en-AU', 'English (Australia)'], ['es-US', 'Spanish (US)'], ['es-ES', 'Spanish (Spain)'], ['pt-BR', 'Portuguese (Brazil)'], ['fr-FR', 'French'], ['zh-CN', 'Chinese (Mandarin)'], ['ht-HT', 'Haitian Creole'], ['ru-RU', 'Russian'], ['vi-VN', 'Vietnamese'], ['ko-KR', 'Korean'], ['ja-JP', 'Japanese'], ['de-DE', 'German'], ['it-IT', 'Italian'], ['pl-PL', 'Polish'], ['fil-PH', 'Filipino']].map(([v, l]) => <option key={v} value={v}>{l}</option>)}
+                            </select>
+                            <p className="text-xs text-stone-400 mt-2">The language people are speaking into the microphone, used by Balanced and Resilience modes. The translation picker in the Dashboard only changes what the audience reads; it never changes this. Takes effect the next time you press Start.</p>
+                        </div>
+                        <div>
                             <label className="text-xs font-bold text-stone-400 uppercase tracking-wider mb-2 block">Interface Language</label>
                             <div className="flex items-center gap-3 p-3 border border-stone-200 rounded-xl bg-white">
                                 <Globe size={20} className="text-forest-dark" />

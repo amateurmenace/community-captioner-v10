@@ -51,6 +51,12 @@ export interface SessionStats {
 export type CloudModel = 'transcribe-live' | 'native-audio';
 
 /** Live status of the local speech server connection (Local / Fully Local modes) */
+/** Status of the browser's own speech recognizer (Balanced / Resilience modes) */
+export interface BrowserEngineInfo {
+    state: 'idle' | 'waiting' | 'listening' | 'error';
+    detail?: string;
+}
+
 export interface LocalEngineInfo {
     connected: boolean;
     /** Set while the app is bringing the speech server up ("Starting the speech server…") */

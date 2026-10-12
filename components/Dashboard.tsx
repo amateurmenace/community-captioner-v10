@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { Cpu, Mic, StopCircle, Home, Activity, Play, Globe, Layout, ShieldCheck, Zap, Lock, CloudLightning, Wifi, Info, Captions, ExternalLink, Link as LinkIcon, Copy, Monitor, Network, Check, Pause, X, Download, ShieldAlert, Edit2, Clock, Signal, AlertTriangle, Server, Video, QrCode, Eye, Terminal, ChevronRight, ChevronDown, WifiOff, Cloud } from 'lucide-react';
-import { Caption, DictionaryEntry, OperationMode, SessionStats, Notification, AudioDevice, UILanguage, OverlaySettings, LocalEngineInfo } from '../types';
+import { Caption, DictionaryEntry, OperationMode, SessionStats, Notification, AudioDevice, UILanguage, OverlaySettings, LocalEngineInfo, BrowserEngineInfo } from '../types';
 import { useTranslation } from '../utils/i18n';
 import { LANGUAGES } from '../utils/languages';
 import GlobalSettings from './GlobalSettings';
@@ -40,6 +40,7 @@ interface DashboardProps {
   onDismissEditSuggestion?: (id: string) => void;
   /** Local speech server status (Local / Fully Local modes) */
   localEngine?: LocalEngineInfo;
+  browserEngine?: BrowserEngineInfo;
   onOpenLocalSetup?: () => void;
 }
 
@@ -358,6 +359,7 @@ const Dashboard: React.FC<DashboardProps> = ({
   onAcceptEditSuggestion,
   onDismissEditSuggestion,
   localEngine,
+  browserEngine,
   onOpenLocalSetup
 }) => {
   const t = useTranslation(uiLanguage);
@@ -895,6 +897,17 @@ const Dashboard: React.FC<DashboardProps> = ({
                   <button onClick={() => setShowCorrections(!showCorrections)} className={`hidden xl:flex h-9 px-3 rounded-lg border text-xs font-bold flex items-center gap-1.5 shrink-0 transition-colors bg-white border-stone-200 text-stone-600 hover:bg-stone-50`}>
                       <span className="w-1.5 h-1.5 rounded-full bg-green-500 animate-pulse" /><span className="max-w-[160px] truncate">{activeContextName}</span>
                   </button>
+              </Tooltip>
+          )}
+
+          {/* Browser speech status (Balanced / Resilience): is the recognizer returning text? */}
+          {(mode === 'balanced' || mode === 'resilience') && isRecording && browserEngine && browserEngine.state !== 'idle' && (
+              <Tooltip text={browserEngine.detail || 'Browser speech recognition'}>
+                  <div className={`h-9 px-3 rounded-lg border text-xs font-bold flex items-center gap-1.5 shrink-0 transition-colors ${browserEngine.state === 'listening' ? 'bg-green-50 text-green-700 border-green-200' : browserEngine.state === 'waiting' ? 'bg-amber-50 text-amber-700 border-amber-200' : 'bg-red-50 text-red-600 border-red-200'}`}>
+                      <Globe size={13} />
+                      <span className="max-w-[220px] truncate">{browserEngine.state === 'listening' ? 'Browser speech · listening' : browserEngine.state === 'waiting' ? 'Browser speech · waiting for text…' : 'Browser speech · no text'}</span>
+                      {browserEngine.state === 'listening' && <span className="w-1.5 h-1.5 rounded-full bg-green-500 animate-pulse" />}
+                  </div>
               </Tooltip>
           )}
 

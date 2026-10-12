@@ -12,6 +12,7 @@ import LocalSetup from './components/LocalSetup';
 import HighlightStudio from './components/HighlightStudio';
 import CaptionInjection from './components/CaptionInjection';
 import { AppState, Caption, DictionaryEntry, UILanguage, SessionStats, Session, ContextSettings, HighlightClip, LocalEngineInfo } from './types';
+import type { BrowserEngineInfo } from './types';
 import { Mic, FileVideo, Settings, Loader2, Server, Globe, Download, Monitor, CheckCircle, ArrowRight, ShieldCheck, Terminal, ExternalLink, Github, Zap } from 'lucide-react';
 import { GITHUB_REPO_URL, GITHUB_CLONE_URL, RELEASES_URL, MAC_DOWNLOAD_URL, WINDOWS_DOWNLOAD_URL } from './utils/appLinks';
 import { GoogleGenAI, LiveServerMessage, Modality } from "@google/genai";
@@ -215,6 +216,12 @@ function App() {
 
   // Local speech server status (Local / Fully Local modes) — shown on the Dashboard
   const [localEngine, setLocalEngine] = useState<LocalEngineInfo>({ connected: false });
+  // Browser speech (Balanced / Resilience): did the recognizer actually return text?
+  const [browserEngine, setBrowserEngine] = useState<BrowserEngineInfo>({ state: 'idle' });
+  const browserEngineRef = useRef<BrowserEngineInfo>({ state: 'idle' });
+  const setBrowserEngineBoth = (v: BrowserEngineInfo) => { browserEngineRef.current = v; setBrowserEngine(v); };
+  const browserWatchdogRef = useRef<any>(null);
+  const browserStartedAtRef = useRef<number>(0);
 
   const [currentStream, setCurrentStream] = useState<MediaStream | null>(null);
   const dictionaryRef = useRef(appState.dictionary);
@@ -619,6 +626,8 @@ function App() {
         if (source) source.disconnect();
         if (geminiContextRef.current) geminiContextRef.current.close();
         if (recognitionRef.current) try { recognitionRef.current.stop(); } catch(e) {}
+        if (browserWatchdogRef.current) { clearInterval(browserWatchdogRef.current); browserWatchdogRef.current = null; }
+        setBrowserEngineBoth({ state: 'idle' });
         if (localWs) localWs.close();
         if (geminiSession) try { geminiSession.close(); } catch(e) {}
         if (vadIntervalRef.current) { clearInterval(vadIntervalRef.current); vadIntervalRef.current = null; }
@@ -791,9 +800,25 @@ function App() {
                 const recognition = new SpeechRecognition();
                 recognition.continuous = true;
                 recognition.interimResults = true;
-                recognition.lang = appState.targetLanguage === 'en' ? 'en-US' : appState.targetLanguage;
-                
+                // The spoken language is its own setting. It used to follow the translation
+                // target, so picking "Español" for the audience silently made the recognizer
+                // listen for Spanish and English speech produced no text at all.
+                recognition.lang = localStorage.getItem('cc_speech_lang') || 'en-US';
+                setBrowserEngineBoth({ state: 'waiting', detail: 'Waiting for the first words from the browser speech service…' });
+                browserStartedAtRef.current = Date.now();
+                // Watchdog: speech is being heard (VAD) but the recognizer never answers.
+                if (browserWatchdogRef.current) clearInterval(browserWatchdogRef.current);
+                browserWatchdogRef.current = setInterval(() => {
+                    if (!mounted || browserEngineRef.current.state !== 'waiting') return;
+                    const heardRecently = Date.now() - lastVoiceTsRef.current < 10000;
+                    if (heardRecently && Date.now() - browserStartedAtRef.current > 12000) {
+                        setBrowserEngineBoth({ state: 'error', detail: 'Audio is coming in, but the browser speech service is not returning text.' });
+                        setAppState(prev => ({ ...prev, notifications: [...prev.notifications, { id: Date.now().toString(), message: "No text from the browser's speech service although audio is coming in. Chrome and Edge need internet access to Google's speech servers (Safari uses Apple's); check the spoken-language setting in Help & Settings → General, or switch to Local mode.", type: 'error', timestamp: Date.now() }] }));
+                    }
+                }, 2000);
+
                 recognition.onresult = (event: any) => {
+                    if (browserEngineRef.current.state !== 'listening') setBrowserEngineBoth({ state: 'listening', detail: `Browser speech · ${recognition.lang}` });
                     let interim = '';
                     for (let i = event.resultIndex; i < event.results.length; ++i) {
                         if (event.results[i].isFinal) {
@@ -808,6 +833,18 @@ function App() {
                 
                 recognition.onerror = (event: any) => {
                     console.error("Speech Rec Error", event);
+                    const explain: Record<string, string> = {
+                        'network': "No connection to the browser's speech service. Chrome and Edge send audio to Google's speech servers; check the internet connection, or switch to Local mode (Whisper on this machine).",
+                        'not-allowed': 'The browser blocked speech recognition for this page. Allow microphone access for this site and try again.',
+                        'service-not-allowed': "This browser is not allowing its speech service here. Use Google Chrome or Microsoft Edge, or switch to Local mode.",
+                        'audio-capture': "The browser's speech recognizer could not open a microphone. Pick the input device in the bottom bar and try again, or switch to Local mode.",
+                        'language-not-supported': `The browser does not support speech recognition in "${recognition.lang}". Set the spoken language to English in Help & Settings → General.`,
+                        'bad-grammar': 'The browser rejected the recognition request. Try again, or switch to Local mode.',
+                    };
+                    if (event.error && event.error !== 'no-speech' && event.error !== 'aborted') {
+                        setBrowserEngineBoth({ state: 'error', detail: explain[event.error] || `Browser speech error: ${event.error}` });
+                        if (event.error !== 'network') setAppState(prev => ({ ...prev, notifications: [...prev.notifications, { id: Date.now().toString(), message: explain[event.error] || `Browser speech error: ${event.error}`, type: 'error', timestamp: Date.now() }] }));
+                    }
                     if (event.error === 'network') {
                         // Add notification so user sees it in UI
                         setAppState(prev => ({
@@ -1307,6 +1344,7 @@ function App() {
             onAcceptEditSuggestion={acceptEditSuggestion}
             onDismissEditSuggestion={dismissEditSuggestion}
             localEngine={localEngine}
+            browserEngine={browserEngine}
             onOpenLocalSetup={() => setAppState(p => ({ ...p, isRecording: false, view: 'local_setup' }))}
         />
       )}

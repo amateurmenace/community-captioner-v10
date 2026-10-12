@@ -121,6 +121,7 @@ const SECTIONS: Section[] = [
         id: 'trouble', icon: Wrench, title: 'When something is wrong',
         lead: 'The usual causes, in the order they come up.',
         bullets: [
+            'Balanced mode shows the audio meter but no text: the browser speech service is not answering. The header pill says "waiting for text" and then "no text" with the reason. Chrome and Edge need internet access to Google\'s speech servers; Safari uses Apple\'s. Check the spoken language in Help & Settings → General (the audience translation picker never changes it), or switch to Local mode.',
             '"Local server offline" or a file stuck while "starting the speech server": on a first run the engine and model are downloading; the card shows the log. If Local AI was never set up, open the wizard.',
             'Port 8080 already in use: another copy of the app (or the development server) is running. Close it and launch again.',
             'Captions fall behind on SDI: CEA-608 is limited to about 60 characters per second. Switch the strategy to truncate with a lower line length, use summarise, or switch to DTVCC if your decoder supports it.',
