@@ -383,6 +383,11 @@ void NdiPassthroughHandler::OutputAudio(const NDIlib_audio_frame_v2_t& audioFram
     interleaved.no_channels = srcChannels;
     interleaved.no_samples = srcSamples;
     interleaved.timecode = audioFrame.timecode;
+    // NDI float audio has its +4 dBu reference level at 1.0. The SDK's guidance for a
+    // receiver is +20 dB: full scale = reference + 20 dB, i.e. reference level lands at
+    // -20 dBFS (SMPTE RP 155 nominal for SDI) with 20 dB of headroom. The default (0)
+    // put reference level at 0 dBFS, 20 dB hot, and clipped anything louder.
+    interleaved.reference_level = 20;
 
     std::vector<int16_t> interleavedBuf(srcSamples * srcChannels);
     interleaved.p_data = interleavedBuf.data();
