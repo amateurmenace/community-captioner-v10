@@ -2,6 +2,7 @@
 import React, { useState, useEffect } from 'react';
 import { Users, ArrowRight, Database, Layers, Lock, Github, ShieldCheck, Cpu, Mic, Radio, Captions, Zap, Brain, Layout, BarChart3, ChevronDown, HelpCircle, CheckCircle, XCircle, Heart, Globe, MessageSquare, Feather, Code, Download, CloudLightning, FileVideo } from 'lucide-react';
 import { GITHUB_REPO_URL, RELEASES_URL } from '../utils/appLinks';
+import { phoneticKey } from '../shared/corrections.js';
 
 interface LandingPageProps {
   /** Jump straight into a live browser captioning session */
@@ -209,9 +210,9 @@ const ComparisonSection = () => (
         
         <div className="max-w-6xl mx-auto px-6 relative z-10">
             <div className="text-center mb-16">
-                <h2 className="text-3xl md:text-5xl font-display font-bold mb-4">Context is Everything</h2>
+                <h2 className="text-3xl md:text-5xl font-display font-bold mb-4">Context Matters in a Democracy</h2>
                 <p className="text-stone-400 max-w-2xl mx-auto text-lg">
-                    Generic AI models don't know your local politicians, street names, or acronyms. We fix that.
+                    Public meetings are made of proper nouns: the people who govern, the streets they argue about, the acronyms that carry the budget. Generic recognisers get them wrong, and a resident reading captions deserves better than "Mr. Low from Need Ham".
                 </p>
             </div>
 
@@ -269,6 +270,226 @@ const FaqItem = ({ q, a }: { q: string, a: string }) => (
     </div>
 );
 
+// ---------------------------------------------------------------------------
+// Animated explanations. Each one is driven by a small step counter so the
+// motion is deterministic, cheap and readable; the keyframes live in index.css.
+// ---------------------------------------------------------------------------
+
+const Eyebrow = ({ children }: { children: React.ReactNode }) => (
+    <p className="text-[11px] font-bold uppercase tracking-[0.22em] text-sage-600 mb-3">{children}</p>
+);
+
+/** 1. The caption pipeline: one line, five stages, the text changing at each one. */
+const PipelineFlow = () => {
+    const stages = [
+        { key: 'audio', label: 'Audio', note: 'Microphone, mixer feed, loopback from Zoom, or a file.' },
+        { key: 'recognise', label: 'Recognise', note: 'Browser speech, Gemini live transcription, or Whisper on your GPU.' },
+        { key: 'context', label: 'Context Engine', note: 'Exact rules, then a phonetic pass over one to six words.' },
+        { key: 'polish', label: 'Polish', note: 'Capitalisation, punctuation, contractions. A few milliseconds.' },
+        { key: 'deliver', label: 'Deliver', note: 'Overlay, phones, SDI and YouTube, all from the same line.' },
+    ];
+    const [step, setStep] = useState(0);
+    useEffect(() => { const id = setInterval(() => setStep(st => (st + 1) % (stages.length + 1)), 1500); return () => clearInterval(id); }, []);
+    const texts: React.ReactNode[] = [
+        <span className="flex items-end gap-[3px] h-6">{Array.from({ length: 28 }, (_, i) => <span key={i} className="w-[3px] rounded-full bg-sage-500 cc-bar" style={{ height: `${8 + ((i * 7) % 16)}px`, animationDelay: `${(i % 7) * 0.12}s` }} />)}</span>,
+        <span className="font-mono text-stone-500">the select board chair bernard grene called the meeting to order</span>,
+        <span className="font-mono text-stone-700">the select board chair <span className="bg-sage-100 text-forest-dark font-bold px-1 rounded">Bernard Greene</span> called the meeting to order</span>,
+        <span className="font-mono text-stone-900"><span className="bg-sage-100 px-1 rounded">The</span> Select Board chair Bernard Greene called the meeting to order<span className="bg-sage-100 px-1 rounded">.</span></span>,
+        <span className="flex flex-wrap gap-2">{['OBS / vMix overlay', 'Phones · 15 languages', 'SDI · CEA-608/708', 'YouTube captions'].map((o, i) => <span key={o} className="text-xs font-bold px-2.5 py-1 rounded-full bg-forest-dark text-white cc-rise" style={{ animationDelay: `${i * 0.12}s` }}>{o}</span>)}</span>,
+    ];
+    const active = Math.min(step, stages.length - 1);
+    return (
+        <div className="bg-white rounded-3xl border border-stone-200 shadow-xl p-8 md:p-10">
+            <div className="relative">
+                <div className="absolute left-[10%] right-[10%] top-5 h-px bg-stone-200" />
+                <div className="absolute top-5 h-px bg-sage-500 transition-all duration-700 ease-out" style={{ left: '10%', width: `${(active / (stages.length - 1)) * 80}%` }} />
+                <div className="absolute top-5 w-3 h-3 -mt-1.5 -ml-1.5 rounded-full bg-sage-500 cc-pulse-ring transition-all duration-700 ease-out" style={{ left: `${10 + (active / (stages.length - 1)) * 80}%` }} />
+                <div className="grid grid-cols-5 relative">
+                    {stages.map((st, i) => (
+                        <div key={st.key} className="text-center px-1">
+                            <div className={`w-10 h-10 mx-auto rounded-full border-2 flex items-center justify-center text-xs font-bold transition-all duration-500 ${i <= active ? 'bg-forest-dark border-forest-dark text-white' : 'bg-white border-stone-200 text-stone-400'}`}>{i + 1}</div>
+                            <p className={`mt-3 text-sm font-bold transition-colors ${i === active ? 'text-forest-dark' : 'text-stone-400'}`}>{st.label}</p>
+                            <p className={`mt-1 text-[11px] leading-snug hidden md:block transition-opacity duration-500 ${i === active ? 'text-stone-600 opacity-100' : 'text-stone-400 opacity-60'}`}>{st.note}</p>
+                        </div>
+                    ))}
+                </div>
+            </div>
+            <div className="mt-8 min-h-[64px] bg-stone-50 border border-stone-100 rounded-2xl px-5 py-4 flex items-center text-base md:text-lg leading-relaxed">
+                <div key={active} className="cc-rise w-full">{texts[active]}</div>
+            </div>
+            <p className="mt-3 text-[11px] text-stone-400 text-right">Stage {active + 1} of 5 · {stages[active].label}</p>
+        </div>
+    );
+};
+
+/** 2. Where the audio goes in each mode. The arrows animate outward, or stay inside the laptop. */
+const AudioRouting = () => {
+    const Laptop = ({ children, lock }: { children?: React.ReactNode; lock?: boolean }) => (
+        <div className="relative mx-auto w-44">
+            <div className="rounded-xl border-2 border-stone-300 bg-white h-28 p-3 flex flex-col items-center justify-center gap-1.5 text-[11px] font-bold text-stone-600">{children}</div>
+            <div className="h-2 rounded-b-lg bg-stone-300 mx-[-10px]" />
+            {lock && <div className="absolute -top-3 -right-3 w-7 h-7 rounded-full bg-forest-dark text-white flex items-center justify-center shadow"><Lock size={13} /></div>}
+        </div>
+    );
+    const Outbound = ({ to }: { to: string }) => (
+        <div className="flex flex-col items-center mt-3">
+            <svg width="120" height="34" viewBox="0 0 120 34" className="text-stone-400">
+                <path d="M4 17 H104" stroke="currentColor" strokeWidth="2" fill="none" className="cc-dash" />
+                <path d="M100 11 L110 17 L100 23" stroke="currentColor" strokeWidth="2" fill="none" />
+            </svg>
+            <span className="text-[11px] font-bold text-stone-500 bg-stone-100 px-2.5 py-1 rounded-full">{to}</span>
+        </div>
+    );
+    return (
+        <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
+            <div className="bg-white rounded-2xl border border-stone-200 p-6 text-center">
+                <p className="font-bold text-forest-dark mb-1">Browser mode</p>
+                <p className="text-xs text-stone-500 mb-5 min-h-[32px]">Instant and free. The browser's own speech service.</p>
+                <Laptop><Mic size={16} /> microphone</Laptop>
+                <Outbound to="Google or Apple speech servers" />
+                <p className="mt-4 text-[11px] text-stone-500">Audio leaves the machine; text comes back. Captions, dictionary and outputs stay local.</p>
+            </div>
+            <div className="bg-white rounded-2xl border border-stone-200 p-6 text-center">
+                <p className="font-bold text-forest-dark mb-1">Cloud mode</p>
+                <p className="text-xs text-stone-500 mb-5 min-h-[32px]">Most accurate on hard audio. Needs a Gemini key.</p>
+                <Laptop><Mic size={16} /> microphone</Laptop>
+                <Outbound to="Gemini live transcription" />
+                <p className="mt-4 text-[11px] text-stone-500">Audio streams to Google's purpose-built transcription model; finished sentences return about 1.7 s after a pause.</p>
+            </div>
+            <div className="bg-sage-50 rounded-2xl border-2 border-sage-300 p-6 text-center">
+                <p className="font-bold text-forest-dark mb-1">Local-only mode</p>
+                <p className="text-xs text-stone-600 mb-5 min-h-[32px]">Nothing leaves the room. Works with no internet.</p>
+                <Laptop lock>
+                    <span className="flex items-center gap-1"><Mic size={14} /> microphone</span>
+                    <span className="text-stone-300">↓</span>
+                    <span className="flex items-center gap-1"><Cpu size={14} /> Whisper on the GPU</span>
+                    <span className="flex items-center gap-1"><Brain size={14} /> Ollama brain</span>
+                </Laptop>
+                <div className="mt-3 h-[34px] flex items-center justify-center"><span className="text-[11px] font-bold text-forest-dark bg-white border border-sage-300 px-2.5 py-1 rounded-full">no outbound audio or text</span></div>
+                <p className="mt-4 text-[11px] text-stone-600">Speech, names, the Municipality Wizard's web reading and translations all run as processes on this computer.</p>
+            </div>
+        </div>
+    );
+};
+
+/** 3. How speech is cut into captions: a live waveform, the live line every 0.3 s, the final line after the pause. */
+const UtteranceDemo = () => {
+    const words = ['The', 'Transportation', 'Board', 'will', 'present', 'the', 'Coolidge', 'Corner', 'parking', 'study.'];
+    const TOTAL = words.length + 6; // speaking, then a pause, then the final
+    const [t, setT] = useState(0);
+    useEffect(() => { const id = setInterval(() => setT(x => (x + 1) % TOTAL), 340); return () => clearInterval(id); }, []);
+    const speaking = t < words.length;
+    const finalised = t >= words.length + 2;
+    const live = words.slice(0, Math.min(words.length, t + 1)).join(' ');
+    return (
+        <div className="bg-white rounded-2xl border border-stone-200 p-6">
+            <p className="font-bold text-forest-dark">From sound to sentence</p>
+            <p className="text-xs text-stone-500 mt-1 mb-5">An energy-based voice detector listens in 20 ms hops. While you speak, the growing utterance is transcribed every 0.3 s for the live line. 550 ms after you pause, it is transcribed once more as the final line.</p>
+            <div className="flex items-end gap-[3px] h-10 mb-3">
+                {Array.from({ length: 44 }, (_, i) => {
+                    const inSpeech = speaking || i < 30;
+                    return <span key={i} className={`flex-1 rounded-full ${inSpeech && speaking ? 'bg-sage-500 cc-bar' : 'bg-stone-200'}`} style={{ height: `${speaking ? 10 + ((i * 11) % 26) : 6}px`, animationDelay: `${(i % 9) * 0.1}s` }} />;
+                })}
+            </div>
+            <div className="space-y-2 text-sm">
+                <div className="flex items-start gap-3">
+                    <span className="text-[10px] font-bold uppercase tracking-wider text-stone-400 w-16 pt-1 shrink-0">Live</span>
+                    <span className={`flex-1 font-mono ${finalised ? 'text-stone-300' : 'text-stone-500'}`}>{live}{speaking && <span className="inline-block w-1.5 h-4 bg-stone-400 ml-1 align-middle animate-pulse" />}</span>
+                    <span className="text-[10px] text-stone-400 font-mono shrink-0">every 0.3 s</span>
+                </div>
+                <div className="flex items-start gap-3 min-h-[24px]">
+                    <span className="text-[10px] font-bold uppercase tracking-wider text-stone-400 w-16 pt-1 shrink-0">Final</span>
+                    {finalised ? <span className="flex-1 font-mono text-forest-dark font-bold cc-rise">{words.join(' ')}</span> : <span className="flex-1 text-stone-300 text-xs pt-1">{speaking ? 'waiting for a pause…' : 'pause detected · transcribing once more…'}</span>}
+                    <span className="text-[10px] text-stone-400 font-mono shrink-0">≈0.9 s after the pause</span>
+                </div>
+            </div>
+        </div>
+    );
+};
+
+/** 4. Phonetic matching, computed with the app's real key function. */
+const PhoneticDemo = () => {
+    const pairs = [
+        { heard: 'bernard grene', meant: 'Bernard Greene' },
+        { heard: 'coolage corner', meant: 'Coolidge Corner' },
+        { heard: 'perlman', meant: 'Pearlman' },
+        { heard: 'wine troub', meant: 'Weintraub' },
+    ];
+    const [i, setI] = useState(0);
+    useEffect(() => { const id = setInterval(() => setI(x => (x + 1) % pairs.length), 2600); return () => clearInterval(id); }, []);
+    const key = (s: string) => s.split(' ').map(w => phoneticKey(w)).join(' ');
+    const pair = pairs[i];
+    return (
+        <div className="bg-white rounded-2xl border border-stone-200 p-6">
+            <p className="font-bold text-forest-dark">Names it has never seen spelled</p>
+            <p className="text-xs text-stone-500 mt-1 mb-5">Every word is reduced to how it sounds. A misheard name and the right one share a key, so one rule covers every misspelling. The keys below are computed by the app's own function.</p>
+            <div key={i} className="grid grid-cols-[1fr_auto_1fr] items-center gap-3 cc-rise">
+                <div className="text-center">
+                    <p className="text-[10px] font-bold uppercase tracking-wider text-stone-400 mb-1">Heard</p>
+                    <p className="font-mono text-red-500 line-through">{pair.heard}</p>
+                    <p className="mt-2 inline-block font-mono text-xs bg-stone-100 text-stone-600 px-2 py-1 rounded">{key(pair.heard)}</p>
+                </div>
+                <div className="text-sage-500 text-2xl">=</div>
+                <div className="text-center">
+                    <p className="text-[10px] font-bold uppercase tracking-wider text-stone-400 mb-1">In the dictionary</p>
+                    <p className="font-mono text-forest-dark font-bold">{pair.meant}</p>
+                    <p className="mt-2 inline-block font-mono text-xs bg-sage-100 text-forest-dark px-2 py-1 rounded">{key(pair.meant)}</p>
+                </div>
+            </div>
+            <p className="mt-4 text-[11px] text-stone-400">Windows of one to six words are compared, so split names ("wine troub") still match. Common English words are never touched, and a sensitivity slider decides how bold the pass is.</p>
+        </div>
+    );
+};
+
+/** 5. Caption packets riding on video frames: one per frame, consumed once. */
+const CdpConveyor = () => {
+    const frames = Array.from({ length: 16 }, (_, i) => i);
+    return (
+        <div className="bg-white rounded-2xl border border-stone-200 p-6 overflow-hidden">
+            <p className="font-bold text-forest-dark">Captions on the SDI signal</p>
+            <p className="text-xs text-stone-500 mt-1 mb-5">Each final line is encoded as CEA-608 pairs (and CEA-708 service blocks in DTVCC mode), wrapped in a SMPTE 334 caption packet and queued inside the native DeckLink addon. The output loop takes exactly one packet per video frame, so text is never repeated and never lost.</p>
+            <div className="relative">
+                <div className="flex gap-2 w-[200%] cc-conveyor">
+                    {[...frames, ...frames].map((f, i) => (
+                        <div key={i} className="flex-1 min-w-0">
+                            <div className={`h-12 rounded-md border flex items-center justify-center text-[10px] font-mono ${f % 5 === 0 ? 'border-sage-400 bg-sage-50 text-forest-dark' : 'border-stone-200 bg-stone-50 text-stone-400'}`}>{f % 5 === 0 ? 'CDP' : 'frame'}</div>
+                        </div>
+                    ))}
+                </div>
+                <div className="absolute inset-y-0 left-0 w-10 bg-gradient-to-r from-white to-transparent" />
+                <div className="absolute inset-y-0 right-0 w-10 bg-gradient-to-l from-white to-transparent" />
+            </div>
+            <div className="mt-4 grid grid-cols-3 gap-3 text-center">
+                <div className="bg-stone-50 rounded-lg p-2"><p className="text-sm font-bold text-forest-dark">≈60</p><p className="text-[10px] text-stone-500">chars/s · CEA-608 roll-up</p></div>
+                <div className="bg-stone-50 rounded-lg p-2"><p className="text-sm font-bold text-forest-dark">200+</p><p className="text-[10px] text-stone-500">chars/s · CEA-708 DTVCC</p></div>
+                <div className="bg-stone-50 rounded-lg p-2"><p className="text-sm font-bold text-forest-dark">1 / frame</p><p className="text-[10px] text-stone-500">packets, consumed once</p></div>
+            </div>
+        </div>
+    );
+};
+
+/** 6. Measured on the development machine; the wizard lets you run the same tests. */
+const FactsStrip = () => {
+    const facts = [
+        { n: '0.3 s', d: 'between live-caption updates on an Apple GPU' },
+        { n: '0.9 s', d: 'from a pause to the final line' },
+        { n: '11×', d: 'faster than real time for prerecorded files (M1 Max)' },
+        { n: '100 %', d: 'of known names found by Gemma 4 E2B on the agenda test' },
+        { n: '15', d: 'languages on the audience phone view' },
+        { n: '0', d: 'bytes of audio leave the room in local-only mode' },
+    ];
+    return (
+        <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-6 gap-px bg-stone-200 rounded-2xl overflow-hidden border border-stone-200">
+            {facts.map(f => (
+                <div key={f.d} className="bg-white p-5 text-center">
+                    <p className="text-2xl font-display font-bold text-forest-dark tabular-nums">{f.n}</p>
+                    <p className="text-[11px] text-stone-500 mt-1 leading-snug">{f.d}</p>
+                </div>
+            ))}
+        </div>
+    );
+};
+
 const LandingPage: React.FC<LandingPageProps> = ({ onStart, onChooseMode }) => {
   const scrollToSection = (id: string) => {
     const element = document.getElementById(id);
@@ -290,6 +511,7 @@ const LandingPage: React.FC<LandingPageProps> = ({ onStart, onChooseMode }) => {
             </div>
             <div className="hidden md:flex items-center gap-6 text-sm font-medium text-stone-600">
                  <button onClick={() => scrollToSection('features')} className="hover:text-forest-dark transition-colors">Features</button>
+                 <button onClick={() => scrollToSection('modes')} className="hover:text-forest-dark transition-colors">Modes</button>
                  <button onClick={() => scrollToSection('how-it-works')} className="hover:text-forest-dark transition-colors">How It Works</button>
                  <button onClick={() => scrollToSection('values')} className="hover:text-forest-dark transition-colors">Our Values</button>
                  <button onClick={onChooseMode} className="bg-stone-900 text-white px-4 py-2 rounded-lg hover:bg-forest-light transition-colors shadow-lg hover:shadow-xl transform hover:-translate-y-0.5">Launch App</button>
@@ -367,61 +589,45 @@ const LandingPage: React.FC<LandingPageProps> = ({ onStart, onChooseMode }) => {
           </div>
       </div>
 
+      {/* Modes: where the audio goes */}
+      <div id="modes" className="py-24 bg-cream relative z-10 scroll-mt-20">
+          <div className="max-w-6xl mx-auto px-6">
+              <div className="text-center mb-12">
+                  <Eyebrow>Modes</Eyebrow>
+                  <h2 className="text-4xl font-display font-bold text-forest-dark mb-4">Where your audio goes</h2>
+                  <p className="text-stone-500 max-w-2xl mx-auto">Privacy is a routing decision. Each mode sends audio somewhere different, and the app says so in the interface, not in a policy page.</p>
+              </div>
+              <AudioRouting />
+          </div>
+      </div>
+
       <ComparisonSection />
 
       <div id="how-it-works" className="py-24 bg-white border-y border-stone-100 relative z-10 scroll-mt-20">
         <div className="max-w-6xl mx-auto px-6">
-            <h2 className="text-4xl font-display font-bold text-forest-dark mb-4 text-center">How it works</h2>
-            <p className="text-stone-500 text-center max-w-2xl mx-auto mb-16">Every caption takes the same path, whichever engine produced it.</p>
+            <div className="text-center mb-10">
+                <Eyebrow>How it works</Eyebrow>
+                <h2 className="text-4xl font-display font-bold text-forest-dark mb-4">One pipeline, whichever engine you choose</h2>
+                <p className="text-stone-500 max-w-2xl mx-auto">Follow a single caption from the microphone to the screen. The recogniser can change; everything after it stays the same.</p>
+            </div>
+            <PipelineFlow />
 
-            <div className="grid grid-cols-1 md:grid-cols-3 gap-12 text-center">
-                <div className="relative group">
-                    <div className="w-20 h-20 bg-stone-100 rounded-full flex items-center justify-center mx-auto mb-6 group-hover:bg-sage-100 transition-colors">
-                        <Mic size={32} className="text-stone-600 group-hover:text-sage-600" />
-                    </div>
-                    <div className="absolute top-10 right-[-50%] w-full h-0.5 bg-stone-100 hidden md:block -z-10"></div>
-                    <h3 className="text-xl font-bold mb-3">1. Recognise</h3>
-                    <p className="text-stone-500 leading-relaxed text-sm">
-                        Choose the engine: the browser's speech service, Google's live transcription model, or Whisper on your own GPU. Locally, an energy-based voice detector cuts speech into utterances, the live line updates every 0.3 seconds, and each sentence is finalised half a second after you pause.
-                    </p>
-                </div>
-
-                <div className="relative group">
-                    <div className="w-20 h-20 bg-stone-100 rounded-full flex items-center justify-center mx-auto mb-6 group-hover:bg-sage-100 transition-colors">
-                        <Database size={32} className="text-stone-600 group-hover:text-sage-600" />
-                    </div>
-                    <div className="absolute top-10 right-[-50%] w-full h-0.5 bg-stone-100 hidden md:block -z-10"></div>
-                    <h3 className="text-xl font-bold mb-3">2. Correct</h3>
-                    <p className="text-stone-500 leading-relaxed text-sm">
-                        Each final line passes through your dictionary: exact matches first, then a phonetic pass that compares how words sound, so "bernard grene" becomes Bernard Greene without a rule for every misspelling. Then capitalisation, punctuation and contractions are tidied in a few milliseconds.
-                    </p>
-                </div>
-
-                <div className="relative group">
-                    <div className="w-20 h-20 bg-stone-100 rounded-full flex items-center justify-center mx-auto mb-6 group-hover:bg-sage-100 transition-colors">
-                        <Radio size={32} className="text-stone-600 group-hover:text-sage-600" />
-                    </div>
-                    <h3 className="text-xl font-bold mb-3">3. Deliver</h3>
-                    <p className="text-stone-500 leading-relaxed text-sm">
-                        The same line goes everywhere at once: the OBS or vMix overlay, the phones in the room in their own languages, YouTube's caption ingestion, and the SDI encoder, where it becomes SMPTE 334 caption packets queued one per video frame so nothing is ever repeated or dropped.
-                    </p>
-                </div>
+            <div className="mt-20 text-center mb-10">
+                <Eyebrow>Under the hood</Eyebrow>
+                <h2 className="text-3xl font-display font-bold text-forest-dark mb-3">The parts worth understanding</h2>
+                <p className="text-stone-500 max-w-2xl mx-auto">Three mechanisms do most of the work. They are small, and they are the reason the captions feel immediate, read correctly, and survive a broadcast chain.</p>
+            </div>
+            <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+                <UtteranceDemo />
+                <PhoneticDemo />
+                <div className="lg:col-span-2"><CdpConveyor /></div>
             </div>
 
-            <div className="mt-16 grid grid-cols-1 md:grid-cols-3 gap-6 text-left">
-                <div className="bg-stone-50 border border-stone-200 rounded-2xl p-6">
-                    <h4 className="font-bold text-forest-dark mb-2">Private by construction</h4>
-                    <p className="text-stone-600 text-sm leading-relaxed">Local-only mode is not a setting that hides a cloud call. The speech server, the language model, the wizard's web reading and the translations all run as processes on your machine, and the app tells you plainly which mode sends audio where.</p>
-                </div>
-                <div className="bg-stone-50 border border-stone-200 rounded-2xl p-6">
-                    <h4 className="font-bold text-forest-dark mb-2">Tested, not guessed</h4>
-                    <p className="text-stone-600 text-sm leading-relaxed">Every local model we recommend was run through the app's own agenda-extraction test and graded on real names. The wizard shows the scores and lets you run the same test on your machine before you rely on it.</p>
-                </div>
-                <div className="bg-stone-50 border border-stone-200 rounded-2xl p-6">
-                    <h4 className="font-bold text-forest-dark mb-2">Standards at the output</h4>
-                    <p className="text-stone-600 text-sm leading-relaxed">CEA-608 roll-up for every decoder, CEA-708 for modern ones with three times the throughput, and sensible strategies when speech outruns the standard: truncate at a word, summarise, or keep it verbatim.</p>
-                </div>
+            <div className="mt-16 text-center mb-6">
+                <Eyebrow>Measured, not guessed</Eyebrow>
+                <p className="text-stone-500 max-w-2xl mx-auto text-sm">Numbers from the development machine. Every local model in the catalogue was run through the app's own agenda-extraction test, and the setup wizard lets you run the same test on yours before you trust it.</p>
             </div>
+            <FactsStrip />
         </div>
       </div>
 
@@ -514,10 +720,14 @@ const LandingPage: React.FC<LandingPageProps> = ({ onStart, onChooseMode }) => {
 
              <div className="space-y-4">
                  <p className="text-xl md:text-2xl font-display font-bold text-white leading-relaxed">
-                    <a href="https://community.weirdmachine.org" target="_blank" rel="noopener noreferrer" className="hover:text-sage-300 transition-colors border-b border-transparent hover:border-sage-300">A Community AI Project from Brookline Interactive Group and Weird Machine.</a> from <a href="https://brooklineinteractive.org" target="_blank" rel="noopener noreferrer" className="hover:text-sage-300 transition-colors border-b border-transparent hover:border-sage-300">Brookline Interactive Group</a> in partnership with <a href="https://neighborhoodai.org" target="_blank" rel="noopener noreferrer" className="hover:text-sage-300 transition-colors border-b border-transparent hover:border-sage-300">Neighborhood AI</a>
+                    <a href="https://communityai.studio" target="_blank" rel="noopener noreferrer" className="hover:text-sage-300 transition-colors border-b border-white/30 hover:border-sage-300">A Community AI Project</a>
+                    {' '}from{' '}
+                    <a href="https://brooklineinteractive.org" target="_blank" rel="noopener noreferrer" className="hover:text-sage-300 transition-colors border-b border-white/30 hover:border-sage-300">Brookline Interactive Group</a>
+                    {' '}and{' '}
+                    <a href="https://weirdmachine.org" target="_blank" rel="noopener noreferrer" className="hover:text-sage-300 transition-colors border-b border-white/30 hover:border-sage-300">Weird Machine</a>.
                  </p>
-                 <p className="text-stone-400">
-                    Designed and developed by <a href="https://weirdmachine.org" target="_blank" rel="noopener noreferrer" className="text-stone-300 hover:text-white transition-colors underline decoration-stone-500 hover:decoration-white underline-offset-4">Stephen Walter</a> + AI
+                 <p className="text-stone-400 text-sm max-w-2xl mx-auto">
+                    Built in Brookline, Massachusetts for community media centers, town meetings and the people who watch them. Open source, so the next town can start where this one left off.
                  </p>
              </div>
 
