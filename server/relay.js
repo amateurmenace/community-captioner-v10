@@ -11,6 +11,38 @@ import { polish, localPolish, summarize, truncateAtWord, setApiKey as setPolishe
 import { feedText as learnerFeedText, setApiKey as setLearnerApiKey, setEnabled as setLearnerEnabled, getSuggestions, acceptSuggestion, dismissSuggestion, setDictionary as setLearnerDictionary, getDictionary as getLearnerDictionary, extractDictionary, generateMishearings, getStatus as getLearnerStatus } from './context-learner.js';
 import { translateCaption, setApiKey as setTranslationApiKey, getSupportedLanguages, getCacheStats as getTranslationStats, translationAvailable } from './translation-service.js';
 import { getSystemMetrics } from './system-metrics.js';
+import { appendFileSync as fsAppendFileSync, statSync as fsStatSync, truncateSync as fsTruncateSync, readFileSync as fsReadFileSync } from 'fs';
+
+// ---------------------------------------------------------------------------
+// Relay log: everything the relay prints also goes to a ring buffer (for
+// GET /api/logs and the Diagnostics report) and to DATA_DIR/logs/relay.log
+// (capped at 5 MB) so there is something to read after the Terminal is gone.
+// ---------------------------------------------------------------------------
+const RELAY_LOG_DIR = join(LOCAL_DIR, '..', 'logs');
+const RELAY_LOG_FILE = join(RELAY_LOG_DIR, 'relay.log');
+const relayLogRing = [];
+const RELAY_LOG_MAX = 500;
+function relayLogWrite(level, args) {
+    let text;
+    try { text = args.map(a => (a instanceof Error ? `${a.name}: ${a.message}` : typeof a === 'string' ? a : JSON.stringify(a))).join(' '); } catch { text = String(args); }
+    text = text.replace(/\x1b\[[0-9;]*m/g, '').replace(/\s+$/, '');
+    if (!text.trim()) return;
+    const line = `${new Date().toISOString()} ${level.padEnd(5)} ${text}`;
+    relayLogRing.push(line);
+    if (relayLogRing.length > RELAY_LOG_MAX) relayLogRing.splice(0, relayLogRing.length - RELAY_LOG_MAX);
+    try {
+        fsMkdirSync(RELAY_LOG_DIR, { recursive: true });
+        try { if (fsStatSync(RELAY_LOG_FILE).size > 5 * 1024 * 1024) fsTruncateSync(RELAY_LOG_FILE, 0); } catch {}
+        fsAppendFileSync(RELAY_LOG_FILE, line + '\n');
+    } catch {}
+}
+for (const level of ['log', 'info', 'warn', 'error']) {
+    const orig = console[level].bind(console);
+    console[level] = (...args) => { relayLogWrite(level === 'log' ? 'info' : level, args); orig(...args); };
+}
+process.on('uncaughtException', (e) => { relayLogWrite('error', [`uncaughtException: ${e?.stack || e}`]); });
+process.on('unhandledRejection', (e) => { relayLogWrite('error', [`unhandledRejection: ${e?.stack || e}`]); });
+
 import { fetchPage, htmlToText, extractPdfText, extractUploadedText, pdfSupportAvailable, discoverLinks, locateMunicipalitySources, researchMunicipality, extractDictionaryFromUrl, itemsToEntries, getResearchGroups, GEMINI_TEXT_MODEL } from './context-sources.js';
 import { listProfiles, getProfile, saveProfile, deleteProfile } from './profiles.js';
 import { buildCorrectionIndex, applyCorrections } from '../shared/corrections.js';
@@ -923,6 +955,22 @@ app.get('/api/checklist', async (req, res) => {
 // --- Caption Polisher API ---
 // Live machine stats for the Dashboard: CPU, RAM, GPU, network and what the local
 // models cost. Sampling starts on first request and idles out 20 s after the last.
+// Recent relay log lines (ring buffer) and the full file, for Diagnostics and support.
+app.get('/api/logs', (req, res) => {
+    const n = Math.max(1, Math.min(RELAY_LOG_MAX, Number(req.query.n) || 100));
+    res.json({ ok: true, lines: relayLogRing.slice(-n), file: RELAY_LOG_FILE });
+});
+app.get('/api/logs/download', (req, res) => {
+    try {
+        const text = fsReadFileSync(RELAY_LOG_FILE, 'utf-8');
+        res.setHeader('Content-Type', 'text/plain; charset=utf-8');
+        res.setHeader('Content-Disposition', `attachment; filename="community-captioner-relay-${new Date().toISOString().slice(0, 10)}.log"`);
+        res.send(text);
+    } catch (e) {
+        res.status(404).send(`No relay log yet (${e.message})`);
+    }
+});
+
 app.get('/api/system/metrics', async (req, res) => {
     try {
         res.json({ ok: true, ...(await getSystemMetrics()) });

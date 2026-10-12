@@ -2,6 +2,7 @@ import React, { useState, useEffect, useRef } from 'react';
 import { Cpu, Mic, StopCircle, Home, Activity, Play, Globe, Layout, ShieldCheck, Zap, Lock, CloudLightning, Wifi, Info, Captions, ExternalLink, Link as LinkIcon, Copy, Monitor, Network, Check, Pause, X, Download, ShieldAlert, Edit2, Clock, Signal, AlertTriangle, Server, Video, QrCode, Eye, Terminal, ChevronRight, ChevronDown, WifiOff, Cloud } from 'lucide-react';
 import { Caption, DictionaryEntry, OperationMode, SessionStats, Notification, AudioDevice, UILanguage, OverlaySettings, LocalEngineInfo, BrowserEngineInfo } from '../types';
 import { useTranslation } from '../utils/i18n';
+import { diagLog, diagEntries, clearDiagLog, onDiagChange, diagText, relayLogDownloadUrl, DiagEntry } from '../utils/diagnostics';
 import { LANGUAGES } from '../utils/languages';
 import GlobalSettings from './GlobalSettings';
 
@@ -400,7 +401,7 @@ const Dashboard: React.FC<DashboardProps> = ({
           
           ws.onopen = () => {
               if (active) {
-                  setRelayConnected(true);
+                  setRelayConnected(true); diagLog('info', 'Relay connected');
                   console.log("Dashboard connected to Relay");
                   ws.send(JSON.stringify({ type: 'join', sessionId: 'demo', role: 'broadcaster' }));
               }
@@ -408,7 +409,7 @@ const Dashboard: React.FC<DashboardProps> = ({
           
           ws.onclose = () => {
               if (active) {
-                  setRelayConnected(false);
+                  setRelayConnected(false); diagLog('warn', 'Relay connection closed');
                   // console.log("Relay closed, retrying in 3s...");
                   retryTimeout = setTimeout(connectRelay, 3000);
               }
@@ -687,6 +688,13 @@ const Dashboard: React.FC<DashboardProps> = ({
   const [sys, setSys] = useState<SysMetrics | null>(null);
   const [sysHistory, setSysHistory] = useState<{ cpu: number; gpu: number; mem: number; down: number; up: number }[]>([]);
   const [showSys, setShowSys] = useState(false);
+  // Session log panel (events from utils/diagnostics: engines, relay, errors)
+  const [showLog, setShowLog] = useState(false);
+  const [logOnlyProblems, setLogOnlyProblems] = useState(false);
+  const [logEntries, setLogEntries] = useState<DiagEntry[]>(() => diagEntries());
+  const [logCopied, setLogCopied] = useState(false);
+  useEffect(() => onDiagChange(() => setLogEntries(diagEntries())), []);
+  const recentProblems = logEntries.filter(e => e.kind === 'error' && Date.now() - e.t < 10 * 60 * 1000).length;
   const [sysError, setSysError] = useState(false);
   useEffect(() => {
       let stopped = false;
@@ -802,7 +810,41 @@ const Dashboard: React.FC<DashboardProps> = ({
                   <span className="flex items-center gap-1 text-[10px] font-bold text-amber-700 shrink-0 cursor-help"><AlertTriangle size={11} /> {sysWarnings.length === 1 ? 'Watch this' : `${sysWarnings.length} warnings`}</span>
               </Tooltip>
           )}
-          <button onClick={() => setShowSys(v => !v)} className="text-[10px] font-bold text-stone-400 hover:text-forest-dark shrink-0 flex items-center gap-1 transition-colors">
+          <button onClick={() => { setShowLog(v => !v); setShowSys(false); }} className={`text-[10px] font-bold shrink-0 flex items-center gap-1 transition-colors ${recentProblems ? 'text-red-600 hover:text-red-700' : 'text-stone-400 hover:text-forest-dark'}`} title="Session log: engines, relay, errors">
+              <Terminal size={11} /> Log{recentProblems ? <span className="ml-0.5 px-1.5 rounded-full bg-red-100 text-red-700 text-[9px] font-bold">{recentProblems}</span> : null}
+          </button>
+          {showLog && (
+              <>
+                  <div className="fixed inset-0 z-40" onClick={() => setShowLog(false)} />
+                  <div className="fixed top-[104px] right-4 w-[560px] max-w-[calc(100vw-2rem)] bg-white rounded-2xl shadow-2xl border border-stone-200 p-4 z-50 text-left whitespace-normal">
+                      <div className="flex items-center justify-between mb-2">
+                          <div>
+                              <p className="text-sm font-bold text-forest-dark">Session log</p>
+                              <p className="text-[10px] text-stone-400">What the app saw: session starts, microphone, speech engines, relay, errors. Kept across reloads. The relay's own log is in Help &amp; Settings → Diagnostics.</p>
+                          </div>
+                          <button onClick={() => setShowLog(false)} className="p-1 text-stone-400 hover:text-stone-700"><X size={14} /></button>
+                      </div>
+                      <div className="flex items-center gap-2 mb-2">
+                          <button onClick={() => setLogOnlyProblems(v => !v)} className={`text-[10px] font-bold px-2 py-1 rounded-md border ${logOnlyProblems ? 'bg-red-50 border-red-200 text-red-700' : 'bg-white border-stone-200 text-stone-500'}`}>{logOnlyProblems ? 'Showing problems only' : 'Problems only'}</button>
+                          <button onClick={async () => { try { await navigator.clipboard.writeText(diagText(logEntries)); setLogCopied(true); setTimeout(() => setLogCopied(false), 1500); } catch {} }} className="text-[10px] font-bold px-2 py-1 rounded-md border bg-white border-stone-200 text-stone-600 hover:bg-stone-50">{logCopied ? 'Copied' : 'Copy'}</button>
+                          <a href={`data:text/plain;charset=utf-8,${encodeURIComponent(diagText(logEntries))}`} download={`community-captioner-session-${new Date().toISOString().slice(0, 10)}.txt`} className="text-[10px] font-bold px-2 py-1 rounded-md border bg-white border-stone-200 text-stone-600 hover:bg-stone-50">Download</a>
+                          <a href={relayLogDownloadUrl()} target="_blank" rel="noopener" className="text-[10px] font-bold px-2 py-1 rounded-md border bg-white border-stone-200 text-stone-600 hover:bg-stone-50">Relay log</a>
+                          <span className="flex-1" />
+                          <button onClick={() => { clearDiagLog(); }} className="text-[10px] font-bold px-2 py-1 rounded-md text-stone-400 hover:text-red-600">Clear</button>
+                      </div>
+                      <div className="max-h-[50vh] overflow-y-auto custom-scrollbar bg-stone-50 border border-stone-100 rounded-lg p-2 font-mono text-[11px] leading-relaxed">
+                          {logEntries.filter(e => !logOnlyProblems || e.kind === 'error' || e.kind === 'warn').length === 0 && <p className="text-stone-400 p-2">Nothing logged yet.</p>}
+                          {logEntries.filter(e => !logOnlyProblems || e.kind === 'error' || e.kind === 'warn').slice(-200).map((e, i) => (
+                              <div key={`${e.t}-${i}`} className={`flex gap-2 px-1 py-0.5 rounded ${e.kind === 'error' ? 'text-red-700 bg-red-50' : e.kind === 'warn' ? 'text-amber-700' : e.kind === 'engine' ? 'text-forest-dark' : 'text-stone-600'}`}>
+                                  <span className="text-stone-400 shrink-0 tabular-nums">{new Date(e.t).toLocaleTimeString()}</span>
+                                  <span className="break-words">{e.text}</span>
+                              </div>
+                          ))}
+                      </div>
+                  </div>
+              </>
+          )}
+          <button onClick={() => { setShowSys(v => !v); setShowLog(false); }} className="text-[10px] font-bold text-stone-400 hover:text-forest-dark shrink-0 flex items-center gap-1 transition-colors">
               <span className={`w-1.5 h-1.5 rounded-full ${sys ? 'bg-green-500' : 'bg-stone-300'} ${sys && isRecording ? 'animate-pulse' : ''}`} /> {sys ? `${sys.cpu.model.replace(/^Apple /, '')} · ${sys.cpu.cores} cores · ${sys.memory.totalGB} GB` : sysError ? 'Relay offline' : 'Measuring…'} {showSys ? <ChevronDown size={11} /> : <ChevronRight size={11} />}
           </button>
           {showSys && (

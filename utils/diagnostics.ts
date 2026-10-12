@@ -4,17 +4,39 @@
  * that usually explain "captions are not coming on".
  */
 
-export type DiagEntry = { t: number; kind: 'error' | 'console' | 'engine' | 'info'; text: string };
+export type DiagEntry = { t: number; kind: 'error' | 'warn' | 'console' | 'engine' | 'info'; text: string };
 
-const LOG_MAX = 60;
-const log: DiagEntry[] = [];
+const LOG_MAX = 300;
+const STORAGE_KEY = 'cc_diag_log';
+let log: DiagEntry[] = (() => {
+    try { const raw = localStorage.getItem(STORAGE_KEY); const parsed = raw ? JSON.parse(raw) : []; return Array.isArray(parsed) ? parsed.slice(-LOG_MAX) : []; } catch { return []; }
+})();
+if (log.length) log.push({ t: Date.now(), kind: 'info', text: `— page loaded (${log.length} earlier events kept from previous sessions) —` });
+const listeners = new Set<() => void>();
+let saveTimer: any = null;
 
+function persist() {
+    if (saveTimer) return;
+    saveTimer = setTimeout(() => { saveTimer = null; try { localStorage.setItem(STORAGE_KEY, JSON.stringify(log.slice(-LOG_MAX))); } catch {} }, 300);
+}
+
+/** Append one event. Survives reloads (localStorage) so a report can show what happened before a browser restart. */
 export function diagLog(kind: DiagEntry['kind'], text: string) {
-    log.push({ t: Date.now(), kind, text });
+    const last = log[log.length - 1];
+    if (last && last.kind === kind && last.text === text && Date.now() - last.t < 2000) return; // collapse tight repeats
+    log.push({ t: Date.now(), kind, text: String(text).slice(0, 400) });
     if (log.length > LOG_MAX) log.splice(0, log.length - LOG_MAX);
+    persist();
+    for (const fn of listeners) { try { fn(); } catch {} }
 }
 
 export function diagEntries(): DiagEntry[] { return [...log]; }
+export function clearDiagLog() { log = []; try { localStorage.removeItem(STORAGE_KEY); } catch {} for (const fn of listeners) { try { fn(); } catch {} } }
+export function onDiagChange(fn: () => void) { listeners.add(fn); return () => { listeners.delete(fn); }; }
+export function diagText(entries = log): string {
+    return entries.map(e => `${new Date(e.t).toISOString()} [${e.kind}] ${e.text}`).join('\n');
+}
+export function relayLogDownloadUrl() { return `${relayHttp()}/api/logs/download`; }
 
 const relayHttp = () => {
     const manual = localStorage.getItem('cc_relay_url');
@@ -89,10 +111,19 @@ export async function collectDiagnostics(extra: Record<string, unknown> = {}): P
 
     for (const [k, v] of Object.entries(extra)) if (k !== 'audioSourceId') add(k, v);
 
-    const recent = diagEntries().slice(-25);
+    const recent = diagEntries().slice(-40);
     lines.push('');
-    lines.push(`recent events (${recent.length}):`);
+    lines.push(`app events, newest last (${recent.length}):`);
     for (const e of recent) lines.push(`  ${new Date(e.t).toLocaleTimeString()} [${e.kind}] ${e.text}`);
+
+    try {
+        const rl = await withTimeout(fetch(`${relayHttp()}/api/logs?n=40`).then(x => x.json()).catch(() => null), 3000, null as any);
+        if (rl?.lines) {
+            lines.push('');
+            lines.push(`relay log, newest last (${rl.lines.length}; full file: ${rl.file}):`);
+            for (const l of rl.lines) lines.push(`  ${l}`);
+        }
+    } catch {}
 
     return { lines, problems };
 }

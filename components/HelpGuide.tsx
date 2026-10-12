@@ -121,6 +121,8 @@ const SECTIONS: Section[] = [
         id: 'trouble', icon: Wrench, title: 'When something is wrong',
         lead: 'The usual causes, in the order they come up.',
         bullets: [
+            'Captions stop in Balanced mode even though the audio meter moves, and the pill says "no text": the browser\'s own speech service has wedged. Quit and reopen the browser; that has fixed every case so far. The app logs the silent restarts so you can see it happening.',
+            'Where to look: the Log button in the session line keeps a timeline of session starts, microphone, speech engines, relay and errors (kept across reloads, with Copy and Download). Help & Settings → Diagnostics runs the checks and includes the relay\'s own log; the full relay log file is in ~/.community-captioner/data/logs/relay.log.',
             'Nothing happens when you press Start, in any mode: the microphone could not be opened. The app now says why (permission blocked, no input device, a remembered device that is not on this computer, in use by another app) in a red banner, and Help & Settings → Diagnostics runs the checks and gives you a report to copy.',
             'Balanced mode shows the audio meter but no text: the browser speech service is not answering. The header pill says "waiting for text" and then "no text" with the reason. Chrome and Edge need internet access to Google\'s speech servers; Safari uses Apple\'s. Check the spoken language in Help & Settings → General (the audience translation picker never changes it), or switch to Local mode.',
             '"Local server offline" or a file stuck while "starting the speech server": on a first run the engine and model are downloading; the card shows the log. If Local AI was never set up, open the wizard.',

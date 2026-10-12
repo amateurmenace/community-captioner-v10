@@ -232,7 +232,7 @@ function App() {
   // Browser speech (Balanced / Resilience): did the recognizer actually return text?
   const [browserEngine, setBrowserEngine] = useState<BrowserEngineInfo>({ state: 'idle' });
   const browserEngineRef = useRef<BrowserEngineInfo>({ state: 'idle' });
-  const setBrowserEngineBoth = (v: BrowserEngineInfo) => { browserEngineRef.current = v; setBrowserEngine(v); diagLog('engine', `browser speech: ${v.state}${v.detail ? ' — ' + v.detail : ''}`); };
+  const setBrowserEngineBoth = (v: BrowserEngineInfo) => { browserEngineRef.current = v; setBrowserEngine(v); if (v.state !== 'idle') diagLog('engine', `browser speech: ${v.state}${v.detail ? ' — ' + v.detail : ''}`); };
   const browserWatchdogRef = useRef<any>(null);
   const browserStartedAtRef = useRef<number>(0);
 
@@ -681,6 +681,7 @@ function App() {
     }
 
     let strategy = appState.mode === 'cloud' ? 'cloud' : appState.mode === 'local' || appState.mode === 'fully_local' ? 'local' : 'browser';
+    diagLog('info', `Session start: mode ${appState.mode} (${strategy}), device ${appState.audioSourceId || 'default'}`);
 
     const startRecording = async () => {
         try {
@@ -706,6 +707,7 @@ function App() {
             if (!mounted) return;
             setCurrentStream(stream);
             startVad(stream);
+            try { const tr = stream.getAudioTracks()[0]; const st: any = tr?.getSettings?.() || {}; diagLog('info', `Microphone open: ${tr?.label || 'unnamed input'}${st.sampleRate ? ` · ${st.sampleRate} Hz` : ''}${st.channelCount ? ` · ${st.channelCount} ch` : ''}`); } catch {}
 
             // 2. Initialize Strategy
             
@@ -752,6 +754,7 @@ function App() {
 
                     ws.onopen = async () => {
                         console.log("Local speech server connected");
+                        diagLog('engine', `Local speech server connected at ${appState.localServerUrl}`);
                         setLocalEngine(prev => ({ ...prev, connected: true, url: appState.localServerUrl, error: undefined }));
                         const ctx = new AudioContext({ sampleRate: 16000 });
                         // CRITICAL: Force resume in case browser policy suspended it
@@ -777,6 +780,7 @@ function App() {
                             if (data.type === 'hello') {
                                 // Our bundled server announces what it runs; legacy servers never send this
                                 setLocalEngine({ connected: true, backend: data.backend, model: data.model, device: data.device, compute: data.compute, url: appState.localServerUrl });
+                                diagLog('engine', `Local speech server: ${data.backend} / ${data.model} on ${data.device} (script v${data.scriptVersion ?? 1}, interim every ${data.interimSeconds ?? '?'} s)`);
                                 return;
                             }
                             if (data.type === 'status') {
@@ -792,9 +796,10 @@ function App() {
                             }
                         } catch (err) {}
                     };
-                    ws.onerror = (e) => { console.error("Local Server Error", e); setLocalEngine(prev => ({ ...prev, connected: false, error: 'Cannot reach the local speech server' })); };
+                    ws.onerror = (e) => { console.error("Local Server Error", e); diagLog('error', `Local speech server socket error (${appState.localServerUrl})`); setLocalEngine(prev => ({ ...prev, connected: false, error: 'Cannot reach the local speech server' })); };
                     ws.onclose = () => {
                         setLocalEngine(prev => ({ ...prev, connected: false }));
+                        if (mounted) diagLog('warn', 'Local speech server socket closed; reconnecting in 1 s');
                         // Reconnect strategy
                         if (mounted) setTimeout(initLocal, 1000);
                     };
@@ -826,18 +831,22 @@ function App() {
                 recognition.lang = localStorage.getItem('cc_speech_lang') || 'en-US';
                 setBrowserEngineBoth({ state: 'waiting', detail: 'Waiting for the first words from the browser speech service…' });
                 browserStartedAtRef.current = Date.now();
+                let browserRestarts = 0;
+                let browserResults = 0;
                 // Watchdog: speech is being heard (VAD) but the recognizer never answers.
                 if (browserWatchdogRef.current) clearInterval(browserWatchdogRef.current);
                 browserWatchdogRef.current = setInterval(() => {
                     if (!mounted || browserEngineRef.current.state !== 'waiting') return;
                     const heardRecently = Date.now() - lastVoiceTsRef.current < 10000;
                     if (heardRecently && Date.now() - browserStartedAtRef.current > 12000) {
-                        setBrowserEngineBoth({ state: 'error', detail: 'Audio is coming in, but the browser speech service is not returning text.' });
-                        setAppState(prev => ({ ...prev, notifications: [...prev.notifications, { id: Date.now().toString(), message: "No text from the browser's speech service although audio is coming in. Chrome and Edge need internet access to Google's speech servers (Safari uses Apple's); check the spoken-language setting in Help & Settings → General, or switch to Local mode.", type: 'error', timestamp: Date.now() }] }));
+                        setBrowserEngineBoth({ state: 'error', detail: `Audio is coming in, but the browser speech service is not returning text (${browserRestarts} silent restarts). Quitting and reopening the browser usually clears this.` });
+                        diagLog('error', `Browser speech watchdog: audio heard for 12 s, no results, ${browserRestarts} restarts`);
+                        setAppState(prev => ({ ...prev, notifications: [...prev.notifications, { id: Date.now().toString(), message: "No text from the browser's speech service although audio is coming in. This usually clears if you quit and reopen the browser. Otherwise: Chrome and Edge need internet access to Google's speech servers (Safari uses Apple's); check the spoken language in Help & Settings → General; or switch to Local mode.", type: 'error', timestamp: Date.now() }] }));
                     }
                 }, 2000);
 
                 recognition.onresult = (event: any) => {
+                    browserResults++;
                     if (browserEngineRef.current.state !== 'listening') setBrowserEngineBoth({ state: 'listening', detail: `Browser speech · ${recognition.lang}` });
                     let interim = '';
                     for (let i = event.resultIndex; i < event.results.length; ++i) {
@@ -852,12 +861,13 @@ function App() {
                 };
                 
                 recognition.onerror = (event: any) => {
-                    console.error("Speech Rec Error", event);
+                    console.warn("Speech Rec Error", event);
+                    if (event.error !== 'no-speech') diagLog(event.error === 'aborted' ? 'warn' : 'error', `Browser speech error: ${event.error}${event.message ? ' — ' + event.message : ''}`);
                     const explain: Record<string, string> = {
-                        'network': "No connection to the browser's speech service. Chrome and Edge send audio to Google's speech servers; check the internet connection, or switch to Local mode (Whisper on this machine).",
+                        'network': "No connection to the browser's speech service. Chrome and Edge send audio to Google's speech servers; check the internet connection, quit and reopen the browser, or switch to Local mode (Whisper on this machine).",
                         'not-allowed': 'The browser blocked speech recognition for this page. Allow microphone access for this site and try again.',
-                        'service-not-allowed': "This browser is not allowing its speech service here. Use Google Chrome or Microsoft Edge, or switch to Local mode.",
-                        'audio-capture': "The browser's speech recognizer could not open a microphone. Pick the input device in the bottom bar and try again, or switch to Local mode.",
+                        'service-not-allowed': "This browser is not allowing its speech service here. Quit and reopen the browser; if it persists use Google Chrome or Microsoft Edge, or switch to Local mode.",
+                        'audio-capture': "The browser's speech recognizer could not open a microphone. Pick the input device in the bottom bar and try again; if it persists, quit and reopen the browser, or switch to Local mode.",
                         'language-not-supported': `The browser does not support speech recognition in "${recognition.lang}". Set the spoken language to English in Help & Settings → General.`,
                         'bad-grammar': 'The browser rejected the recognition request. Try again, or switch to Local mode.',
                     };
@@ -880,8 +890,12 @@ function App() {
                 };
                 
                 recognition.onend = () => {
-                    // Auto-restart
+                    // Auto-restart. The browser ends recognition on silence, on errors and on
+                    // its own schedule; restarting is normal, but many restarts with no results
+                    // means the service is wedged, which only a browser restart has fixed so far.
                     if (mounted) {
+                        browserRestarts++;
+                        if (browserRestarts % 10 === 0 && browserResults === 0) diagLog('warn', `Browser speech restarted ${browserRestarts} times without returning any text`);
                         try { recognition.start(); } catch(e) {}
                     }
                 };
@@ -889,8 +903,10 @@ function App() {
                 recognitionRef.current = recognition;
                 try {
                     recognition.start();
-                } catch(e) {
+                    diagLog('engine', `Browser speech started (${recognition.lang})`);
+                } catch(e: any) {
                     console.warn("Recognition start failed", e);
+                    diagLog('error', `Browser speech start failed: ${e?.message || e}`);
                 }
             }
             
@@ -986,8 +1002,9 @@ function App() {
                         processor.connect(ctx.destination);
                         geminiContextRef.current = ctx;
 
-                    } catch (e) {
+                    } catch (e: any) {
                         console.error("Gemini Init Failed", e);
+                        diagLog('error', `Cloud (Gemini Live) init failed: ${e?.message || e}; retrying in 2 s`);
                         if(mounted) setTimeout(initGeminiLive, 2000);
                     }
                 };
@@ -1020,6 +1037,7 @@ function App() {
   };
 
   const handleEndSession = () => {
+      diagLog('info', `Session ended with ${appState.captions.length} captions`);
       setAppState(prev => ({
           ...prev,
           isRecording: false,
