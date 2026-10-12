@@ -10,11 +10,13 @@ import { spawn } from 'child_process';
 import { polish, localPolish, summarize, truncateAtWord, setApiKey as setPolisherApiKey, toggleGemini as togglePolisherGemini, getStatus as getPolisherStatus } from './caption-polisher.js';
 import { feedText as learnerFeedText, setApiKey as setLearnerApiKey, setEnabled as setLearnerEnabled, getSuggestions, acceptSuggestion, dismissSuggestion, setDictionary as setLearnerDictionary, getDictionary as getLearnerDictionary, extractDictionary, generateMishearings, getStatus as getLearnerStatus } from './context-learner.js';
 import { translateCaption, setApiKey as setTranslationApiKey, getSupportedLanguages, getCacheStats as getTranslationStats } from './translation-service.js';
-import { createRequire as _cr } from 'module';
-const _require = _cr(import.meta.url);
-let multer, pdfParse;
-try { multer = _require('multer'); } catch { multer = null; }
-try { pdfParse = _require('pdf-parse'); } catch { pdfParse = null; }
+import { fetchPage, htmlToText, extractPdfText, extractUploadedText, pdfSupportAvailable, discoverLinks, locateMunicipalitySources, researchMunicipality, extractDictionaryFromUrl, itemsToEntries, getResearchGroups, GEMINI_TEXT_MODEL } from './context-sources.js';
+import { listProfiles, getProfile, saveProfile, deleteProfile } from './profiles.js';
+import { buildCorrectionIndex, applyCorrections } from '../shared/corrections.js';
+// Static import so esbuild bundles multer into the standalone binary. A runtime
+// createRequire('multer') cannot be resolved inside the pkg snapshot, which left
+// file uploads silently disabled in every packaged .app/.exe build.
+import multer from 'multer';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -64,7 +66,7 @@ app.set('trust proxy', true);
 app.use((req, res, next) => {
     res.header("Access-Control-Allow-Origin", "*");
     res.header("Access-Control-Allow-Headers", "Origin, X-Requested-With, Content-Type, Accept, X-Api-Key");
-    res.header("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+    res.header("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS");
     if (req.method === 'OPTIONS') return res.sendStatus(200);
     next();
 });
@@ -245,9 +247,11 @@ function loadGeminiApiKey() {
         geminiKeySource = 'env';
         return process.env.GEMINI_API_KEY.trim();
     }
-    // 2. .env.local file — check both project root and process cwd
+    // 2. .env.local file — project root / next to the executable (Windows bundle),
+    //    the macOS .app Resources folder (parent of DIST_PATH), or the process cwd
     const candidatePaths = [
         path.join(baseDir, '.env.local'),
+        path.join(path.dirname(distPath), '.env.local'),
         path.join(process.cwd(), '.env.local'),
     ];
     for (const envPath of candidatePaths) {
@@ -464,8 +468,6 @@ function feedCaptionToEncoder(captionData) {
                     if (cea608Encoder) cea608Encoder.enqueueText(processed);
                 }
                 console.log(`[CEA-708 ENCODE] [${captionConfig.encodingMode}/${strategy}] "${processed.slice(0,80)}"`);
-                // Feed to background learner (non-blocking)
-                learnerFeedText(processed);
             }
         })();
     } else if (captionData.type === 'cea708_clear') {
@@ -788,11 +790,32 @@ app.get('/api/inject/status', (req, res) => {
 
 // Direct caption push into the encoder (so the injection panel can send
 // captions without going through the main session WebSocket).
+// Server-side correction index — rebuilt whenever the mirrored dictionary changes.
+// Captions from the Dashboard arrive already corrected; this covers captions
+// injected over REST from other tools.
+let correctionIndex = buildCorrectionIndex(getLearnerDictionary());
+let correctionSensitivity = 80;
+function refreshCorrectionIndex() { correctionIndex = buildCorrectionIndex(getLearnerDictionary()); }
+
 app.post('/api/inject/caption', (req, res) => {
-    const { text, isFinal = true } = req.body || {};
+    const { text, isFinal = true, applyDictionary = true } = req.body || {};
     if (!text || typeof text !== 'string') return res.status(400).json({ ok: false, error: 'text required' });
-    feedCaptionToEncoder({ type: 'caption', isFinal: !!isFinal, payload: { text } });
-    res.json({ ok: true });
+    let processed = text;
+    let applied = [];
+    if (applyDictionary && isFinal) {
+        const r = applyCorrections(text, correctionIndex, { sensitivity: correctionSensitivity });
+        processed = r.text; applied = r.applied;
+    }
+    feedCaptionToEncoder({ type: 'caption', isFinal: !!isFinal, payload: { text: processed } });
+    res.json({ ok: true, text: processed, applied });
+});
+
+// Preview what the dictionary would do to a piece of text (used by the UI "test a sentence" box)
+app.post('/api/context/apply', (req, res) => {
+    const { text, sensitivity } = req.body || {};
+    if (!text || typeof text !== 'string') return res.status(400).json({ ok: false, error: 'text required' });
+    const r = applyCorrections(text, correctionIndex, { sensitivity: typeof sensitivity === 'number' ? sensitivity : correctionSensitivity });
+    res.json({ ok: true, ...r });
 });
 
 // --- Caption Encoding Config API ---
@@ -1052,13 +1075,46 @@ app.get('/api/context/dictionary', (req, res) => {
 });
 
 app.post('/api/context/dictionary', (req, res) => {
-    const { dictionary } = req.body;
+    const { dictionary, sensitivity } = req.body;
     if (Array.isArray(dictionary)) {
         setLearnerDictionary(dictionary);
+        if (typeof sensitivity === 'number') correctionSensitivity = Math.max(0, Math.min(100, sensitivity));
+        refreshCorrectionIndex();
         res.json({ ok: true, size: dictionary.length });
     } else {
         res.status(400).json({ ok: false, error: 'dictionary must be an array' });
     }
+});
+
+// --- Named profiles (server-side, shared by every operator machine) ---
+app.get('/api/context/profiles', (req, res) => {
+    res.json({ ok: true, profiles: listProfiles() });
+});
+
+app.get('/api/context/profiles/:id', (req, res) => {
+    const p = getProfile(req.params.id);
+    if (!p) return res.status(404).json({ ok: false, error: 'Profile not found' });
+    res.json({ ok: true, profile: p });
+});
+
+app.post('/api/context/profiles', (req, res) => {
+    const { name, entries, municipality, notes, merge } = req.body || {};
+    if (!name || typeof name !== 'string' || !name.trim()) return res.status(400).json({ ok: false, error: 'name required' });
+    if (!Array.isArray(entries)) return res.status(400).json({ ok: false, error: 'entries must be an array' });
+    try {
+        const profile = saveProfile({ name: name.trim(), entries, municipality, notes, merge: !!merge });
+        console.log(`[Profiles] Saved "${profile.name}" (${profile.entries.length} entries)`);
+        res.json({ ok: true, profile: { ...profile, entries: undefined, entryCount: profile.entries.length } });
+    } catch (e) {
+        res.status(500).json({ ok: false, error: e.message });
+    }
+});
+
+app.delete('/api/context/profiles/:id', (req, res) => {
+    const removed = deleteProfile(req.params.id);
+    if (!removed) return res.status(404).json({ ok: false, error: 'Profile not found' });
+    console.log(`[Profiles] Deleted "${req.params.id}"`);
+    res.json({ ok: true });
 });
 
 // Dictionary export as downloadable file
@@ -1109,355 +1165,306 @@ app.post('/api/context/dictionary/delete', (req, res) => {
     res.json({ ok: true, removed: dict.length - newDict.length, total: newDict.length });
 });
 
-// Server-side URL scraping with SPA fallback
-// For static pages: fetch HTML, strip tags, extract.
-// For SPA/dynamic pages (like CivicClerk): if HTML has little text content,
-// use Gemini to extract content directly from the URL.
-app.post('/api/context/scrape', async (req, res) => {
-    const { url, apiKey: bodyKey } = req.body;
-    if (!url) return res.status(400).json({ ok: false, error: 'url required' });
-    const apiKey = bodyKey || req.headers['x-api-key'] || null;
-    if (apiKey) applyRuntimeApiKey(apiKey);
+// =====================================================================
+// Context Engine — document / web ingestion + Municipality Wizard
+//
+// All AI calls go through server/context-sources.js and
+// server/context-learner.js. Endpoints that take a while stream progress
+// over Server-Sent Events so the UI can show what is happening.
+// =====================================================================
 
+/** Pick the Gemini key for this request (body/header override, else server key). */
+function resolveRequestKey(req) {
+    const candidates = [req.body?.apiKey, req.headers['x-api-key']];
+    const k = candidates.find(v => typeof v === 'string' && v.trim().length >= 10 && v.trim() !== 'PLACEHOLDER_API_KEY');
+    if (k) applyRuntimeApiKey(k.trim());
+    return geminiKeyActive || null;
+}
+
+/** Server-Sent Events helper. */
+function sseInit(res) {
+    res.setHeader('Content-Type', 'text/event-stream');
+    res.setHeader('Cache-Control', 'no-cache, no-transform');
+    res.setHeader('Connection', 'keep-alive');
+    res.setHeader('X-Accel-Buffering', 'no');
+    res.flushHeaders?.();
+    let closed = false;
+    res.on('close', () => { closed = true; });
+    return {
+        emit(phase, data = {}) {
+            if (closed) return;
+            try { res.write(`data: ${JSON.stringify({ phase, t: Date.now(), ...data })}\n\n`); } catch {}
+        },
+        end() { if (!closed) { closed = true; try { res.end(); } catch {} } },
+        get closed() { return closed; },
+    };
+}
+
+/**
+ * Fetch a URL and turn it into dictionary entries. Shared by /scrape and
+ * /scrape-stream. Falls back to Gemini's own page reader when the site
+ * blocks server-side fetches (Cloudflare 403) or is a JavaScript-only app.
+ */
+async function scrapeUrlToEntries(url, apiKey, emit = () => {}) {
+    const start = Date.now();
+    emit('fetching', { url });
+    const page = await fetchPage(url);
+
+    if (!page.ok) {
+        if (page.blocked && apiKey) {
+            emit('ai_fetch', { message: `Site blocks automated visitors (HTTP ${page.status}) — asking Gemini to read the page…`, status: page.status });
+            const r = await extractDictionaryFromUrl(url, apiKey);
+            if (r.ok) return { ok: true, entries: r.entries, textLength: 0, source: 'gemini_url', totalMs: Date.now() - start };
+            return { ok: false, error: `HTTP ${page.status}, and Gemini could not read the page (${r.error})`, entries: [] };
+        }
+        return { ok: false, error: page.error || `HTTP ${page.status}`, entries: [] };
+    }
+
+    emit('fetched', { contentType: page.contentType, status: page.status, elapsedMs: Date.now() - start });
+    const isPdf = page.contentType.includes('pdf') || page.buffer.subarray(0, 5).toString() === '%PDF-';
+    let text = '';
+    let sourceType = 'html';
+    if (isPdf) {
+        emit('parsing', { sourceType: 'pdf', bytes: page.buffer.length });
+        try {
+            text = (await extractPdfText(page.buffer)).text;
+            sourceType = 'pdf';
+        } catch (e) {
+            return { ok: false, error: `PDF parse failed: ${e.message}`, entries: [] };
+        }
+    } else {
+        emit('parsing', { sourceType: 'html', bytes: page.buffer.length });
+        text = htmlToText(page.buffer.toString('utf8'));
+    }
+    emit('parsed', { textLength: text.length, sourceType });
+
+    if (!isPdf && text.length < 200) {
+        if (apiKey) {
+            emit('ai_fetch', { message: 'Page is a JavaScript app with no static text — asking Gemini to read it…' });
+            const r = await extractDictionaryFromUrl(url, apiKey);
+            if (r.ok && r.entries.length) return { ok: true, entries: r.entries, textLength: 0, source: 'gemini_url', totalMs: Date.now() - start };
+        }
+        return { ok: true, entries: [], textLength: text.length, source: sourceType, warning: 'Page has little readable text (dynamic page). Upload the agenda PDF instead.', totalMs: Date.now() - start };
+    }
+
+    if (!apiKey) {
+        const local = extractProperNounsLocally(text);
+        return { ok: true, entries: local, textLength: text.length, source: sourceType, warning: 'No Gemini API key — used basic pattern extraction. Add a key for far better results.', totalMs: Date.now() - start };
+    }
+
+    emit('extracting', { textLength: text.length, model: GEMINI_TEXT_MODEL });
+    const entries = await extractDictionary(text, apiKey);
+    return { ok: true, entries, textLength: text.length, source: sourceType, totalMs: Date.now() - start };
+}
+
+// What this server can do — lets the UI explain missing pieces instead of failing silently
+app.get('/api/context/capabilities', (req, res) => {
+    res.json({
+        pdf: pdfSupportAvailable(),
+        docx: true,
+        upload: !!multer,
+        geminiKey: !!geminiKeyActive,
+        geminiKeySource,
+        model: GEMINI_TEXT_MODEL,
+        researchGroups: getResearchGroups(),
+    });
+});
+
+// Scrape a single URL (non-streaming)
+app.post('/api/context/scrape', async (req, res) => {
+    const { url } = req.body || {};
+    if (!url || typeof url !== 'string') return res.status(400).json({ ok: false, error: 'url required' });
+    const apiKey = resolveRequestKey(req);
     try {
         console.log(`[Context] Scraping URL: ${url}`);
-
-        // First, try fetching and checking if it's a PDF
-        const response = await fetch(url, {
-            headers: { 'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Community Captioner' },
-            signal: AbortSignal.timeout(15000),
-            redirect: 'follow',
-        });
-
-        if (!response.ok) {
-            return res.status(502).json({ ok: false, error: `HTTP ${response.status} from ${url}` });
-        }
-
-        const contentType = response.headers.get('content-type') || '';
-
-        // Handle PDF responses directly
-        if (contentType.includes('application/pdf') && pdfParse) {
-            const buffer = Buffer.from(await response.arrayBuffer());
-            const pdf = await pdfParse(buffer);
-            const text = pdf.text?.trim();
-            if (text && text.length > 20) {
-                const entries = await extractDictionary(text, apiKey);
-                console.log(`[Context] Scraped PDF from ${url}: ${text.length} chars → ${entries.length} entries`);
-                return res.json({ ok: true, entries, textLength: text.length, source: 'pdf' });
-            }
-        }
-
-        const html = await response.text();
-        // Strip HTML to text
-        let text = html.replace(/<script[^>]*>[\s\S]*?<\/script>/gi, '')
-                       .replace(/<style[^>]*>[\s\S]*?<\/style>/gi, '')
-                       .replace(/<[^>]+>/g, ' ')
-                       .replace(/&nbsp;/g, ' ')
-                       .replace(/&amp;/g, '&')
-                       .replace(/&lt;/g, '<')
-                       .replace(/&gt;/g, '>')
-                       .replace(/\s+/g, ' ')
-                       .trim();
-
-        // If we got meaningful text from HTML, use it
-        if (text.length > 200) {
-            const entries = await extractDictionary(text, apiKey);
-            console.log(`[Context] Scraped HTML from ${url}: ${text.length} chars → ${entries.length} entries`);
-            return res.json({ ok: true, entries, textLength: text.length, source: 'html' });
-        }
-
-        // SPA/dynamic page fallback: ask Gemini to visit the URL and extract content
-        console.log(`[Context] Page has little static content (${text.length} chars), using Gemini URL extraction`);
-        const geminiKey = getLearnerStatus().geminiKeySet ? null : null; // Key is in the learner module
-        // Use extractDictionary with a prompt that includes the URL
-        const urlContext = `This is a meeting agenda page at ${url}. The page is dynamically rendered. Based on the URL pattern (CivicClerk municipal portal), this likely contains a government meeting agenda with names of officials, committee members, and agenda items. Extract proper nouns, names, places, and acronyms that a speech-to-text engine might misspell during a live broadcast of this meeting.`;
-        const entries = await extractDictionary(urlContext, apiKey);
-        if (entries.length > 0) {
-            console.log(`[Context] Gemini URL extraction for ${url}: ${entries.length} entries`);
-            return res.json({ ok: true, entries, textLength: 0, source: 'gemini_url', warning: 'Dynamic page — used AI to infer context from URL pattern' });
-        }
-
-        res.json({ ok: true, entries: [], warning: 'Could not extract content from this page. Try uploading the agenda as a PDF instead.' });
+        const result = await scrapeUrlToEntries(url, apiKey);
+        console.log(`[Context] Scrape ${url}: ${result.ok ? `${result.entries.length} entries (${result.source})` : `failed: ${result.error}`}`);
+        res.status(result.ok ? 200 : 502).json(result);
     } catch (e) {
         console.warn(`[Context] Scrape error: ${e.message}`);
         res.status(500).json({ ok: false, error: e.message });
     }
 });
 
-// Server-side municipality search — used when the browser has no API key
-// but the server has one loaded (e.g. from .env.local). Mirrors the shape
-// returned by services/geminiService.ts: [{title, url, type, why}].
-app.post('/api/context/search-municipality', async (req, res) => {
-    const { query, apiKey: bodyKey } = req.body || {};
-    if (!query || typeof query !== 'string') return res.status(400).json({ ok: false, error: 'query required' });
-    const apiKey = (bodyKey && bodyKey.length > 10) ? bodyKey : geminiKeyActive;
-    if (!apiKey) return res.status(400).json({ ok: false, error: 'No Gemini API key loaded on the server' });
-
+// Scrape a single URL with live progress (SSE)
+app.post('/api/context/scrape-stream', async (req, res) => {
+    const { url } = req.body || {};
+    if (!url || typeof url !== 'string') return res.status(400).json({ ok: false, error: 'url required' });
+    const apiKey = resolveRequestKey(req);
+    const sse = sseInit(res);
+    const start = Date.now();
     try {
-        const { GoogleGenAI } = await import('@google/genai');
-        const ai = new GoogleGenAI({ apiKey });
-        const response = await ai.models.generateContent({
-            model: 'gemini-2.5-flash',
-            contents: `Find the official municipal website for "${query}" and list the most useful pages for learning proper nouns (elected officials, department staff, boards/commissions, meeting agendas/minutes). For each page found, give the title, full URL, a category, and why it's useful for live captioning.`,
-            config: { tools: [{ googleSearch: {} }] },
-        });
-
-        const chunks = response?.candidates?.[0]?.groundingMetadata?.groundingChunks || [];
-        const out = [];
-        const seen = new Set();
-        for (const chunk of chunks) {
-            const url = chunk?.web?.uri;
-            const title = chunk?.web?.title;
-            if (!url || !title || seen.has(url)) continue;
-            seen.add(url);
-            const lower = (url + ' ' + title).toLowerCase();
-            let type = 'General';
-            if (/official|elected|mayor|council|select.*board|government|alderm/i.test(lower)) type = 'Officials';
-            else if (/meeting|agenda|minute|calendar/i.test(lower)) type = 'Meetings';
-            else if (/department|staff|directory|contact/i.test(lower)) type = 'Departments';
-            else if (/commission|committee|advisory/i.test(lower)) type = 'Committees';
-            out.push({ title, url, type, why: `Found via Google Search for ${query}` });
+        const result = await scrapeUrlToEntries(url, apiKey, sse.emit);
+        if (!result.ok) {
+            sse.emit('error', { error: result.error });
+            return sse.end();
         }
-
-        // Fallback: parse URLs out of the raw text if grounding returned nothing
-        if (out.length === 0) {
-            const text = response.text || '';
-            const matches = text.match(/https?:\/\/[^\s)<>"]+/g) || [];
-            for (const u of matches) {
-                const clean = u.replace(/[.,;:!?)]+$/, '');
-                if (seen.has(clean)) continue;
-                seen.add(clean);
-                out.push({ title: clean.split('/').pop()?.replace(/-/g, ' ') || 'Web Page', url: clean, type: 'General', why: 'Extracted from search results' });
-            }
+        const CHUNK = 12;
+        for (let i = 0; i < result.entries.length; i += CHUNK) {
+            sse.emit('entries', { batch: result.entries.slice(i, i + CHUNK), total: result.entries.length, sent: Math.min(i + CHUNK, result.entries.length) });
         }
+        sse.emit('done', { totalEntries: result.entries.length, totalMs: Date.now() - start, sourceType: result.source, warning: result.warning });
+        sse.end();
+    } catch (e) {
+        sse.emit('error', { error: e.message });
+        sse.end();
+    }
+});
 
-        res.json({ ok: true, results: out.slice(0, 8) });
+// Municipality Wizard, phase 1 only (find official pages) — non-streaming
+app.post('/api/context/search-municipality', async (req, res) => {
+    const { query } = req.body || {};
+    if (!query || typeof query !== 'string') return res.status(400).json({ ok: false, error: 'query required' });
+    const apiKey = resolveRequestKey(req);
+    if (!apiKey) return res.status(400).json({ ok: false, error: 'No Gemini API key loaded on the server' });
+    try {
+        const r = await locateMunicipalitySources(query.trim(), apiKey);
+        if (!r.ok) return res.status(502).json({ ok: false, error: r.error, results: [] });
+        res.json({ ok: true, results: r.sources, officialHost: r.officialHost, crawlNote: r.crawlNote });
     } catch (e) {
         console.warn('[Wizard] Server search failed:', e.message);
-        res.status(500).json({ ok: false, error: e.message });
+        res.status(500).json({ ok: false, error: e.message, results: [] });
     }
 });
 
-// Streaming scrape endpoint — emits phase events via SSE so the wizard
-// can show real-time progress for ONE URL (fetching → parsed → extracting → done).
-// Body: { url, apiKey? }
-app.post('/api/context/scrape-stream', async (req, res) => {
-    const { url, apiKey: bodyKey } = req.body;
-    if (!url) return res.status(400).json({ ok: false, error: 'url required' });
-    const apiKey = bodyKey || req.headers['x-api-key'] || null;
-    if (apiKey) applyRuntimeApiKey(apiKey);
+/**
+ * Municipality Wizard — full research run with live progress (SSE).
+ * Body: { query, apiKey?, groups?: string[], skipSources?: boolean, domainHint?: string }
+ *
+ * Events:
+ *   status          { step: 'locate'|'research', message }
+ *   sources         { officialHost, sources[], crawlNote }
+ *   research_start  { groups: [{key,label}] }
+ *   group           { key, label, ok, error?, elapsedMs, items: [{name, category, detail, misheard, entries[]}] }
+ *   done            { totalItems, totalEntries, totalMs }
+ *   error           { error }
+ */
+app.post('/api/context/wizard/research', async (req, res) => {
+    const { query, groups, skipSources, domainHint } = req.body || {};
+    if (!query || typeof query !== 'string' || !query.trim()) return res.status(400).json({ ok: false, error: 'query required' });
+    const apiKey = resolveRequestKey(req);
+    if (!apiKey) return res.status(400).json({ ok: false, error: 'No Gemini API key. Add one in the Context Engine settings.' });
 
-    res.setHeader('Content-Type', 'text/event-stream');
-    res.setHeader('Cache-Control', 'no-cache, no-transform');
-    res.setHeader('Connection', 'keep-alive');
-    res.setHeader('X-Accel-Buffering', 'no');
-    res.flushHeaders?.();
-
-    const emit = (phase, data = {}) => {
-        try { res.write(`data: ${JSON.stringify({ phase, t: Date.now(), ...data })}\n\n`); } catch {}
-    };
-
+    const sse = sseInit(res);
     const start = Date.now();
-    emit('fetching', { url });
+    const q = query.trim();
+    console.log(`[Wizard] Research started for "${q}"`);
 
     try {
-        const response = await fetch(url, {
-            headers: { 'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Community Captioner' },
-            signal: AbortSignal.timeout(15000),
-            redirect: 'follow',
+        // Phase 1 — official site + pages (runs concurrently with research)
+        const sourcesPromise = skipSources
+            ? Promise.resolve(null)
+            : locateMunicipalitySources(q, apiKey, (phase, data) => sse.emit('status', { step: 'locate', phase, message: data.message || '' }))
+                .then(r => {
+                    if (r.ok) sse.emit('sources', { officialHost: r.officialHost, sources: r.sources, crawlNote: r.crawlNote, elapsedMs: Date.now() - start });
+                    else sse.emit('sources', { officialHost: null, sources: [], error: r.error, elapsedMs: Date.now() - start });
+                    return r;
+                })
+                .catch(e => { sse.emit('sources', { officialHost: null, sources: [], error: e.message }); return null; });
+
+        // Phase 2 — grounded research, streamed per group
+        const selectedGroups = Array.isArray(groups) && groups.length ? groups : getResearchGroups().map(g => g.key);
+        sse.emit('research_start', { groups: getResearchGroups().filter(g => selectedGroups.includes(g.key)) });
+        sse.emit('status', { step: 'research', message: `Researching ${q} with Google Search (usually 20–45 seconds)…` });
+
+        let totalItems = 0, totalEntries = 0;
+        const research = await researchMunicipality(q, apiKey, {
+            groups: selectedGroups,
+            domainHint: typeof domainHint === 'string' ? domainHint.slice(0, 80) : '',
+            onGroup: (key, result) => {
+                const items = (result.items || []).map(it => ({ ...it, entries: itemsToEntries([it]) }));
+                const entryCount = items.reduce((n, it) => n + it.entries.length, 0);
+                totalItems += items.length;
+                totalEntries += entryCount;
+                sse.emit('group', { key, label: result.label, ok: result.ok, error: result.error, elapsedMs: result.elapsedMs, items });
+                console.log(`[Wizard] ${key}: ${result.ok ? `${items.length} items / ${entryCount} entries` : `failed: ${result.error}`} in ${result.elapsedMs}ms`);
+            },
         });
 
-        if (!response.ok) {
-            emit('error', { error: `HTTP ${response.status}` });
-            return res.end();
+        await sourcesPromise;
+        if (!research.ok && totalItems === 0) {
+            sse.emit('error', { error: research.groups?.find(g => g.error)?.error || research.error || 'Research returned nothing' });
         }
-
-        const contentType = response.headers.get('content-type') || '';
-        emit('fetched', { contentType, status: response.status, elapsedMs: Date.now() - start });
-
-        let text = '';
-        let sourceType = 'html';
-
-        if (contentType.includes('application/pdf') && pdfParse) {
-            const buffer = Buffer.from(await response.arrayBuffer());
-            emit('parsing', { sourceType: 'pdf', bytes: buffer.length });
-            const pdf = await pdfParse(buffer);
-            text = pdf.text?.trim() || '';
-            sourceType = 'pdf';
-        } else {
-            const html = await response.text();
-            emit('parsing', { sourceType: 'html', bytes: html.length });
-            text = html.replace(/<script[^>]*>[\s\S]*?<\/script>/gi, '')
-                       .replace(/<style[^>]*>[\s\S]*?<\/style>/gi, '')
-                       .replace(/<[^>]+>/g, ' ')
-                       .replace(/&nbsp;/g, ' ')
-                       .replace(/&amp;/g, '&')
-                       .replace(/&lt;/g, '<')
-                       .replace(/&gt;/g, '>')
-                       .replace(/\s+/g, ' ')
-                       .trim();
-        }
-
-        emit('parsed', { textLength: text.length, sourceType });
-
-        if (text.length < 50) {
-            emit('done', { entries: [], warning: 'Page has little text content', sourceType });
-            return res.end();
-        }
-
-        emit('extracting', { textLength: text.length, model: 'gemini-2.5-flash' });
-
-        const entries = await extractDictionary(text, geminiKeyActive);
-
-        // Stream entries in chunks so the UI can show them appearing
-        const CHUNK = 10;
-        for (let i = 0; i < entries.length; i += CHUNK) {
-            emit('entries', { batch: entries.slice(i, i + CHUNK), total: entries.length, sent: Math.min(i + CHUNK, entries.length) });
-        }
-
-        emit('done', { totalEntries: entries.length, totalMs: Date.now() - start, sourceType });
-        res.end();
+        sse.emit('done', { totalItems, totalEntries, totalMs: Date.now() - start });
+        console.log(`[Wizard] Research for "${q}" done: ${totalItems} items / ${totalEntries} entries in ${Date.now() - start}ms`);
+        sse.end();
     } catch (e) {
-        emit('error', { error: e.message });
-        res.end();
+        console.warn('[Wizard] Research failed:', e.message);
+        sse.emit('error', { error: e.message });
+        sse.end();
     }
 });
 
-// Discover links from a web page (for municipality wizard)
+// Discover relevant sub-pages on a site (used by the wizard's deep-scan step)
 app.post('/api/context/discover-links', async (req, res) => {
-    const { url } = req.body;
-    if (!url) return res.status(400).json({ ok: false, error: 'url required' });
-
+    const { url } = req.body || {};
+    if (!url || typeof url !== 'string') return res.status(400).json({ ok: false, error: 'url required' });
     try {
-        const response = await fetch(url, {
-            headers: { 'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Community Captioner' },
-            signal: AbortSignal.timeout(10000),
-            redirect: 'follow',
-        });
-        if (!response.ok) return res.json({ ok: false, error: `HTTP ${response.status}` });
-
-        const html = await response.text();
-        const baseUrl = new URL(url);
-
-        // Extract all <a href="..."> links with their text
-        const linkRegex = /<a[^>]+href=["']([^"']+)["'][^>]*>([\s\S]*?)<\/a>/gi;
-        const links = [];
-        const seenUrls = new Set();
-        let match;
-
-        // Keywords that indicate pages with useful proper nouns
-        const usefulPatterns = /official|elected|council|mayor|select.?board|alderm|government|department|staff|directory|agenda|minute|meeting|committee|commission|board|advisory|planning|zoning|finance|police|fire|school|library|park|public.?works/i;
-
-        while ((match = linkRegex.exec(html)) !== null) {
-            let href = match[1].trim();
-            const text = match[2].replace(/<[^>]+>/g, '').trim();
-            if (!text || text.length < 3 || text.length > 100) continue;
-            if (href.startsWith('#') || href.startsWith('javascript:') || href.startsWith('mailto:')) continue;
-
-            // Resolve relative URLs
-            try {
-                const resolved = new URL(href, url);
-                // Only keep same-domain links
-                if (resolved.hostname !== baseUrl.hostname) continue;
-                href = resolved.href;
-            } catch { continue; }
-
-            if (seenUrls.has(href)) continue;
-            seenUrls.add(href);
-
-            // Score relevance
-            const combined = (text + ' ' + href).toLowerCase();
-            if (usefulPatterns.test(combined)) {
-                let type = 'General';
-                if (/official|elected|council|mayor|select.?board|alderm|government/i.test(combined)) type = 'Officials';
-                else if (/agenda|minute|meeting|calendar/i.test(combined)) type = 'Meetings';
-                else if (/department|staff|directory|contact/i.test(combined)) type = 'Departments';
-                else if (/committee|commission|board|advisory|planning|zoning/i.test(combined)) type = 'Committees';
-
-                links.push({ title: text, url: href, type, why: `Link found on ${baseUrl.hostname}` });
-            }
-        }
-
+        const page = await fetchPage(url, { timeoutMs: 10000 });
+        if (!page.ok) return res.json({ ok: false, error: page.error || `HTTP ${page.status}`, blocked: !!page.blocked, links: [] });
+        if (!page.contentType.includes('html')) return res.json({ ok: true, links: [], total: 0 });
+        const links = discoverLinks(page.finalUrl, page.buffer.toString('utf8'));
         console.log(`[Context] Discovered ${links.length} relevant links from ${url}`);
-        res.json({ ok: true, links, total: seenUrls.size });
+        res.json({ ok: true, links, total: links.length });
     } catch (e) {
         res.json({ ok: false, error: e.message, links: [] });
     }
 });
 
-// PDF file upload endpoint
-const upload = multer ? multer({ storage: multer.memoryStorage(), limits: { fileSize: 20 * 1024 * 1024 } }) : null;
+// Document upload: PDF, DOCX, TXT, HTML (multipart field "file")
+const upload = multer ? multer({ storage: multer.memoryStorage(), limits: { fileSize: 40 * 1024 * 1024 } }) : null;
 
 if (upload) {
     app.post('/api/context/upload-pdf', upload.single('file'), async (req, res) => {
         if (!req.file) return res.status(400).json({ ok: false, error: 'No file uploaded' });
-
-        // Accept API key from header for extraction
-        const apiKey = req.headers['x-api-key'] || null;
-        if (apiKey) applyRuntimeApiKey(apiKey);
-
+        const apiKey = resolveRequestKey(req);
+        const filename = req.file.originalname || 'document';
         try {
-            const contentType = req.file.mimetype || '';
-            let text = '';
+            const extracted = await extractUploadedText(req.file.buffer, filename, req.file.mimetype || '');
+            const text = (extracted.text || '').trim();
+            console.log(`[Context] Upload ${filename}: kind=${extracted.kind}${extracted.pages ? ` pages=${extracted.pages}` : ''} chars=${text.length} key=${apiKey ? 'yes' : 'no'}`);
 
-            if (contentType.includes('pdf') && pdfParse) {
-                const pdf = await pdfParse(req.file.buffer);
-                text = pdf.text?.trim() || '';
-            } else {
-                // Treat as plain text
-                text = req.file.buffer.toString('utf-8').trim();
+            if (text.length < 20) {
+                const hint = extracted.kind === 'pdf'
+                    ? 'This PDF has no selectable text (probably a scan). Export a text PDF from the agenda software, or paste the agenda text instead.'
+                    : 'Could not read any text from this file.';
+                return res.json({ ok: true, entries: [], textLength: text.length, filename, kind: extracted.kind, warning: hint });
             }
 
-            if (!text || text.length < 20) {
-                return res.json({ ok: true, entries: [], warning: 'Could not extract text from file' });
-            }
+            const base = { textLength: text.length, filename, kind: extracted.kind, pages: extracted.pages || undefined, preview: text.slice(0, 300) };
 
-            console.log(`[Context] Upload PDF: ${req.file.originalname}, ${text.length} chars, apiKey present: ${!!apiKey}, key length: ${apiKey?.length || 0}`);
-
-            // Check if we have a usable API key
-            if (!apiKey || apiKey === 'PLACEHOLDER_API_KEY' || apiKey.length < 10) {
-                console.warn(`[Context] No valid Gemini API key for extraction`);
-
-                // Fall back to local regex extraction (no AI)
+            if (!apiKey) {
                 const localEntries = extractProperNounsLocally(text);
-                if (localEntries.length > 0) {
-                    console.log(`[Context] Local extraction found ${localEntries.length} entries (no API key)`);
-                    return res.json({ ok: true, entries: localEntries, textLength: text.length, filename: req.file.originalname, warning: 'Using basic extraction (no Gemini API key). Add an API key in Output Settings for better results.' });
-                }
-                return res.json({ ok: true, entries: [], warning: 'No Gemini API key set. Add your key in Output Settings → Caption Processing to enable AI extraction.' });
+                return res.json({ ok: true, entries: localEntries, ...base, warning: 'No Gemini API key — used basic pattern extraction. Add a key in Settings for far better results.' });
             }
 
-            const entries = await extractDictionary(text, apiKey);
-            console.log(`[Context] Uploaded ${req.file.originalname}: ${text.length} chars → ${entries.length} entries`);
-
-            // If Gemini returned nothing, fall back to local extraction
+            const entries = await extractDictionary(text, apiKey, { domainHint: typeof req.body?.domainHint === 'string' ? req.body.domainHint : '' });
+            console.log(`[Context] Uploaded ${filename}: ${text.length} chars → ${entries.length} entries`);
             if (entries.length === 0) {
                 const localEntries = extractProperNounsLocally(text);
                 if (localEntries.length > 0) {
-                    console.log(`[Context] Gemini returned 0, local fallback found ${localEntries.length}`);
-                    return res.json({ ok: true, entries: localEntries, textLength: text.length, filename: req.file.originalname, warning: 'AI extraction returned no results. Using basic extraction instead.' });
+                    return res.json({ ok: true, entries: localEntries, ...base, warning: 'AI extraction returned nothing; used basic pattern extraction instead.' });
                 }
             }
-
-            res.json({ ok: true, entries, textLength: text.length, filename: req.file.originalname });
+            res.json({ ok: true, entries, ...base });
         } catch (e) {
-            console.warn(`[Context] PDF parse error: ${e.message}`);
-            res.status(500).json({ ok: false, error: e.message });
+            console.warn(`[Context] Upload error (${filename}): ${e.message}`);
+            res.status(422).json({ ok: false, error: e.message, filename });
         }
     });
+} else {
+    app.post('/api/context/upload-pdf', (req, res) => res.status(503).json({ ok: false, error: 'File uploads are not available on this server (multer missing)' }));
 }
 
 // Quick Names — generate STT mishearing entries from a list of names/terms
 app.post('/api/context/names', async (req, res) => {
-    const { names, apiKey: bodyKey } = req.body;
+    const { names } = req.body || {};
     if (!names || !Array.isArray(names) || names.length === 0) {
         return res.status(400).json({ ok: false, error: 'names array required' });
     }
-    const extractKey = bodyKey || req.headers['x-api-key'] || null;
-    if (extractKey) applyRuntimeApiKey(extractKey);
-
+    const apiKey = resolveRequestKey(req);
     try {
-        const entries = await generateMishearings(names.slice(0, 50), extractKey || geminiKeyActive);
+        const entries = await generateMishearings(names.slice(0, 50), apiKey);
         console.log(`[Context] Quick Names: ${names.length} names → ${entries.length} entries`);
         res.json({ ok: true, entries });
     } catch (e) {
@@ -1468,13 +1475,19 @@ app.post('/api/context/names', async (req, res) => {
 
 // Plain text / paste extraction
 app.post('/api/context/extract', async (req, res) => {
-    const { text, apiKey: bodyKey } = req.body;
-    if (!text) return res.status(400).json({ ok: false, error: 'text required' });
-    const extractKey = bodyKey || req.headers['x-api-key'] || null;
-    if (extractKey) applyRuntimeApiKey(extractKey);
-
-    const entries = await extractDictionary(text, extractKey || geminiKeyActive);
-    res.json({ ok: true, entries });
+    const { text, domainHint } = req.body || {};
+    if (!text || typeof text !== 'string' || !text.trim()) return res.status(400).json({ ok: false, error: 'text required' });
+    const apiKey = resolveRequestKey(req);
+    if (!apiKey) {
+        const localEntries = extractProperNounsLocally(text);
+        return res.json({ ok: true, entries: localEntries, textLength: text.length, warning: 'No Gemini API key — used basic pattern extraction.' });
+    }
+    try {
+        const entries = await extractDictionary(text, apiKey, { domainHint: typeof domainHint === 'string' ? domainHint : '' });
+        res.json({ ok: true, entries, textLength: text.length });
+    } catch (e) {
+        res.status(500).json({ ok: false, error: e.message });
+    }
 });
 
 // --- Translation API ---
@@ -1652,6 +1665,9 @@ wss.on('connection', (ws, req) => {
                 polish(rawText).then(async (polished) => {
                     // Record for SRT export
                     recordCaption(polished);
+                    // Feed Auto-Learn (non-blocking). This used to happen only inside the
+                    // DeckLink encoder path, so Auto-Learn never saw text in browser mode.
+                    learnerFeedText(polished);
                     const polishedData = { ...data };
                     if (typeof polishedData.payload === 'string') {
                         polishedData.payload = polished;

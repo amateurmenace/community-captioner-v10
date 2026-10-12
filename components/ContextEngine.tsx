@@ -1,7 +1,7 @@
-import React, { useState, useRef, useCallback, useEffect } from 'react';
-import { Upload, Download, Search, CheckCircle, X, Loader2, Database, Plus, Trash2, ArrowRight, MapPin, Globe, FileText, Link, ShieldAlert, Sparkles, Sliders, Code, Zap, Key, Layout, Type } from 'lucide-react';
-import { generateContextDictionary, searchMunicipalitySources } from '../services/geminiService';
+import React, { useState, useRef, useCallback, useEffect, useMemo } from 'react';
+import { Upload, Download, Search, CheckCircle, X, Loader2, Database, Plus, Trash2, ArrowRight, Globe, FileText, Link, ShieldAlert, Sparkles, Sliders, Code, Zap, Key, Layout, Type, ChevronDown, ChevronRight, ExternalLink, AlertTriangle, Users, Building2, MapPin, Hash, RotateCcw, FolderOpen, Save, Wand2 } from 'lucide-react';
 import { DictionaryEntry, ContextSettings } from '../types';
+import { buildCorrectionIndex, applyCorrections } from '../shared/corrections.js';
 
 interface ContextEngineProps {
   dictionary: DictionaryEntry[];
@@ -18,23 +18,80 @@ interface ContextEngineProps {
   speakerLabels?: boolean;
   setSpeakerLabels?: (val: boolean) => void;
   apiKey?: string;
+  /** Correction settings used by the live caption pipeline (sensitivity gates phonetic matching) */
+  contextSettings?: ContextSettings;
+  setContextSettings?: (s: ContextSettings) => void;
 }
 
-const ContextEngine: React.FC<ContextEngineProps> = ({ 
-    dictionary, setDictionary, onClose, 
-    learningEnabled, setLearningEnabled, 
+type ProfileSummary = { id: string; name: string; municipality?: string; notes?: string; entryCount: number; updatedAt: number; createdAt: number };
+
+// --- Wizard types (mirror server/context-sources.js) ---
+type WizardItem = {
+  id: string;
+  name: string;
+  category: string;
+  detail: string;
+  misheard: string[];
+  entries: DictionaryEntry[];
+  group: string;
+};
+type WizardGroup = {
+  key: string;
+  label: string;
+  status: 'pending' | 'running' | 'done' | 'failed';
+  items: WizardItem[];
+  error?: string;
+  elapsedMs?: number;
+};
+type WizardSource = {
+  title: string;
+  url: string;
+  type: string;
+  why?: string;
+  reachable?: boolean;
+  blocked?: boolean;
+  isPdf?: boolean;
+};
+type PreviewEntry = DictionaryEntry & { note?: string };
+
+const GROUP_ICONS: Record<string, React.FC<any>> = { people: Users, bodies: Building2, places: MapPin, acronyms: Hash };
+
+const entryKey = (e: { original: string; replacement: string }) => `${e.original.toLowerCase()}→${e.replacement.toLowerCase()}`;
+
+/** Parse a fetch() SSE body, calling onEvent for each JSON data line. */
+async function readSse(res: Response, onEvent: (ev: any) => void) {
+  if (!res.body) return;
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '';
+  while (true) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    let idx;
+    while ((idx = buffer.indexOf('\n\n')) >= 0) {
+      const raw = buffer.slice(0, idx);
+      buffer = buffer.slice(idx + 2);
+      const dataLine = raw.split('\n').find(l => l.startsWith('data:'));
+      if (!dataLine) continue;
+      try { onEvent(JSON.parse(dataLine.slice(5).trim())); } catch {}
+    }
+  }
+}
+
+const ContextEngine: React.FC<ContextEngineProps> = ({
+    dictionary, setDictionary, onClose,
+    learningEnabled, setLearningEnabled,
     activeContextName, setActiveContextName,
     profanityFilter, setProfanityFilter,
     partialResults, setPartialResults,
     speakerLabels, setSpeakerLabels,
-    apiKey
+    apiKey,
+    contextSettings, setContextSettings
 }) => {
-  const [view, setView] = useState<'main' | 'wizard_search' | 'wizard_select' | 'wizard_analyze' | 'settings' | 'raw'>('main');
+  const [view, setView] = useState<'main' | 'settings' | 'raw'>('main');
   const [engineName, setEngineName] = useState(activeContextName || '');
   const [searchQuery, setSearchQuery] = useState('');
-  const [searchResults, setSearchResults] = useState<any[]>([]);
-  const [selectedSources, setSelectedSources] = useState<number[]>([]);
-  const [isProcessing, setIsProcessing] = useState(false);
   const [dragActive, setDragActive] = useState(false);
   const [showNameError, setShowNameError] = useState(false);
   const [rawJson, setRawJson] = useState('');
@@ -43,54 +100,80 @@ const ContextEngine: React.FC<ContextEngineProps> = ({
   // Server-side API key status — drives the banner and the wizard gating
   const [serverKey, setServerKey] = useState<{loaded: boolean, source: string, masked: string} | null>(null);
   const [showInlineKeyForm, setShowInlineKeyForm] = useState(false);
+  const [capabilities, setCapabilities] = useState<{pdf: boolean, docx: boolean, upload: boolean, model?: string} | null>(null);
 
-  // Streaming wizard state — per-URL live phases + entry stream + ETA
-  type WizardPhase = 'queued' | 'fetching' | 'fetched' | 'parsing' | 'parsed' | 'extracting' | 'done' | 'failed';
-  const [wizardLive, setWizardLive] = useState<{
-    url: string;
-    phase: WizardPhase;
-    detail: string;
-    entries: number;
-    startedAt: number;
-    elapsedMs: number;
-    error?: string;
-    textLength?: number;
-    sourceType?: string;
-  }[]>([]);
-  const [wizardEtaMs, setWizardEtaMs] = useState<number | null>(null);
-  const [recentEntries, setRecentEntries] = useState<{original: string, replacement: string, type: string}[]>([]);
-  
-  // New Settings State
-  const [settings, setSettings] = useState<ContextSettings>({
-      sensitivity: 80,
-      acronymExpansion: true,
-      dialect: 'general'
-  });
-  
+  // --- Municipality Wizard state ---
+  const [wizardState, setWizardState] = useState<'idle' | 'running' | 'done' | 'error'>('idle');
+  const [wizardStatusLine, setWizardStatusLine] = useState('');
+  const [wizardGroups, setWizardGroups] = useState<WizardGroup[]>([]);
+  const [wizardSelected, setWizardSelected] = useState<Set<string>>(new Set());
+  const [wizardCollapsed, setWizardCollapsed] = useState<Set<string>>(new Set());
+  const [wizardSources, setWizardSources] = useState<WizardSource[]>([]);
+  const [wizardHost, setWizardHost] = useState<string | null>(null);
+  const [wizardNote, setWizardNote] = useState<string | null>(null);
+  const [wizardError, setWizardError] = useState<string | null>(null);
+  const [wizardStartedAt, setWizardStartedAt] = useState(0);
+  const [wizardElapsed, setWizardElapsed] = useState(0);
+  const [wizardAdded, setWizardAdded] = useState<number | null>(null);
+  const [showSources, setShowSources] = useState(false);
+  const [locateStatus, setLocateStatus] = useState<'pending' | 'running' | 'done' | 'failed'>('pending');
+  const wizardAbortRef = useRef<AbortController | null>(null);
+
+  // --- Deep scan (per-URL streaming scrape) state ---
+  type ScanPhase = 'queued' | 'fetching' | 'fetched' | 'parsing' | 'parsed' | 'ai_fetch' | 'extracting' | 'done' | 'failed';
+  const [selectedSources, setSelectedSources] = useState<number[]>([]);
+  const [scanLive, setScanLive] = useState<{ url: string; phase: ScanPhase; detail: string; entries: number; startedAt: number; elapsedMs: number; error?: string }[]>([]);
+  const [scanExtracted, setScanExtracted] = useState<DictionaryEntry[]>([]);
+  const [scanRecent, setScanRecent] = useState<DictionaryEntry[]>([]);
+  const [scanRunning, setScanRunning] = useState(false);
+
+  // Correction settings live in App state (the live caption pipeline reads them);
+  // fall back to local state when a parent doesn't provide them.
+  const [localSettings, setLocalSettings] = useState<ContextSettings>({ sensitivity: 80, acronymExpansion: true, dialect: 'general' });
+  const settings = contextSettings || localSettings;
+  const setSettings = (s: ContextSettings) => { setLocalSettings(s); setContextSettings?.(s); };
+
+  // "Try a sentence" — live preview of what the dictionary does at the current sensitivity
+  const [testSentence, setTestSentence] = useState('');
+  const correctionIndex = useMemo(() => buildCorrectionIndex(dictionary), [dictionary]);
+  const testResult = useMemo(() => testSentence.trim() ? applyCorrections(testSentence, correctionIndex, { sensitivity: settings.sensitivity }) : null, [testSentence, correctionIndex, settings.sensitivity]);
+
+  // Named profiles (stored on the relay so every operator machine sees them)
+  const [profiles, setProfiles] = useState<ProfileSummary[]>([]);
+  const [showProfiles, setShowProfiles] = useState(false);
+  const [profilesBusy, setProfilesBusy] = useState(false);
+  const [profilesMsg, setProfilesMsg] = useState<{ text: string; kind: 'ok' | 'error' } | null>(null);
+
   const importInputRef = useRef<HTMLInputElement>(null);
   const fileUploadRef = useRef<HTMLInputElement>(null);
-  
+
   const [manualOriginal, setManualOriginal] = useState('');
   const [manualReplacement, setManualReplacement] = useState('');
-  
-  // API Key Prompt State
-  const [showKeyPrompt, setShowKeyPrompt] = useState(false);
+
   const [tempKey, setTempKey] = useState(apiKey || '');
 
+  // Scrape URL tool
   const [scrapeUrl, setScrapeUrl] = useState('');
-  const [uploading, setUploading] = useState(false);
   const [scraping, setScraping] = useState(false);
-  const [scrapeResult, setScrapeResult] = useState('');
+  const [scrapeResult, setScrapeResult] = useState<{ text: string; kind: 'ok' | 'warn' | 'error' } | null>(null);
+  const [scrapePreview, setScrapePreview] = useState<PreviewEntry[] | null>(null);
+
+  // Upload tool
+  const [uploading, setUploading] = useState(false);
+  const [uploadResult, setUploadResult] = useState<{ text: string; kind: 'ok' | 'warn' | 'error' } | null>(null);
+  const [uploadPreview, setUploadPreview] = useState<{ entries: PreviewEntry[]; filename: string } | null>(null);
+
+  // Paste tool
   const [pasteText, setPasteText] = useState('');
   const [extracting, setExtracting] = useState(false);
   const [pasteResult, setPasteResult] = useState('');
-  const [pastePreview, setPastePreview] = useState<{original: string, replacement: string, type: string}[] | null>(null);
+  const [pastePreview, setPastePreview] = useState<PreviewEntry[] | null>(null);
 
   // Quick Names state
   const [quickNames, setQuickNames] = useState('');
   const [quickNamesProcessing, setQuickNamesProcessing] = useState(false);
   const [quickNamesResult, setQuickNamesResult] = useState('');
-  const [quickNamesPreview, setQuickNamesPreview] = useState<{original: string, replacement: string, type: string}[] | null>(null);
+  const [quickNamesPreview, setQuickNamesPreview] = useState<PreviewEntry[] | null>(null);
 
   // Meeting Body state
   const [bodyName, setBodyName] = useState('');
@@ -102,12 +185,14 @@ const ContextEngine: React.FC<ContextEngineProps> = ({
   const [learnerEnabled, setLearnerEnabled] = useState(false);
   const [dictSearch, setDictSearch] = useState('');
   const [dictTypeFilter, setDictTypeFilter] = useState<string | null>(null);
-  const [learnerStatus, setLearnerStatus] = useState<{bufferLength: number, lastExtraction: number | null, extractionCount: number} | null>(null);
+  const [learnerStatus, setLearnerStatus] = useState<any | null>(null);
 
   const getRelayUrl = () => {
-      const port = window.location.port || '80';
-      const relayPort = (parseInt(port) >= 5170 && parseInt(port) <= 5199) ? '8080' : port;
-      return `${window.location.protocol}//${window.location.hostname}:${relayPort}`;
+      const port = window.location.port || (window.location.protocol === 'https:' ? '443' : '80');
+      const p = parseInt(port);
+      const relayPort = (p >= 5170 && p <= 5199) ? '8080' : port;
+      const isDefault = (window.location.protocol === 'https:' && relayPort === '443') || (window.location.protocol === 'http:' && relayPort === '80');
+      return `${window.location.protocol}//${window.location.hostname}${isDefault ? '' : `:${relayPort}`}`;
   };
 
   const getApiKey = () => localStorage.getItem('cc_api_key') || apiKey || '';
@@ -120,29 +205,59 @@ const ContextEngine: React.FC<ContextEngineProps> = ({
       return !!serverKey?.loaded;
   };
 
+  const apiHeaders = (json = true): Record<string, string> => {
+      const h: Record<string, string> = { 'X-Api-Key': getApiKey() };
+      if (json) h['Content-Type'] = 'application/json';
+      return h;
+  };
+
+  /** Add entries to the dictionary, skipping duplicates. Returns the number added. */
+  const addEntries = (entries: PreviewEntry[], source: string): number => {
+      let added = 0;
+      setDictionary(prev => {
+          const existing = new Set(prev.map(entryKey));
+          const novel: DictionaryEntry[] = [];
+          for (const e of entries) {
+              if (!e.original || !e.replacement) continue;
+              const k = entryKey(e);
+              if (existing.has(k)) continue;
+              existing.add(k);
+              novel.push({ original: e.original, replacement: e.replacement, type: (e.type as any) || 'proper_noun', ...(e.note ? { note: e.note } : {}), source });
+          }
+          added = novel.length;
+          return novel.length ? [...prev, ...novel] : prev;
+      });
+      return added;
+  };
+
+  const normalizeEntries = (list: any[]): PreviewEntry[] => (Array.isArray(list) ? list : [])
+      .filter(e => e && e.original && e.replacement)
+      .map(e => ({ original: String(e.original), replacement: String(e.replacement), type: e.type || 'proper_noun', note: e.note || undefined }));
+
+  // ---------------------------------------------------------------------
+  // Tool handlers
+  // ---------------------------------------------------------------------
+
   const handleScrapeUrl = async () => {
       setScraping(true);
-      setScrapeResult('');
+      setScrapeResult(null);
+      setScrapePreview(null);
       try {
           const res = await fetch(`${getRelayUrl()}/api/context/scrape`, {
               method: 'POST',
-              headers: { 'Content-Type': 'application/json', 'X-Api-Key': getApiKey() },
-              body: JSON.stringify({ url: scrapeUrl, apiKey: getApiKey() }),
+              headers: apiHeaders(),
+              body: JSON.stringify({ url: scrapeUrl.trim(), apiKey: getApiKey() }),
           });
           const data = await res.json();
-          if (data.ok && data.entries?.length > 0) {
-              const newEntries = data.entries.map((e: any) => ({
-                  original: e.original,
-                  replacement: e.replacement,
-                  type: e.type || 'proper_noun',
-              }));
-              setDictionary([...dictionary, ...newEntries]);
-              setScrapeResult(`Extracted ${data.entries.length} entries from ${data.textLength} chars`);
+          const entries = normalizeEntries(data.entries);
+          if (data.ok && entries.length > 0) {
+              setScrapePreview(entries);
+              setScrapeResult({ text: `Found ${entries.length} entries${data.source === 'gemini_url' ? ' (page read by Gemini)' : data.textLength ? ` from ${data.textLength.toLocaleString()} characters` : ''} — review below`, kind: 'ok' });
           } else {
-              setScrapeResult(data.warning || data.error || 'No entries found');
+              setScrapeResult({ text: data.warning || data.error || 'No entries found on that page', kind: data.ok ? 'warn' : 'error' });
           }
       } catch (e) {
-          setScrapeResult('Scrape failed: ' + (e as Error).message);
+          setScrapeResult({ text: 'Scrape failed: ' + (e as Error).message, kind: 'error' });
       }
       setScraping(false);
   };
@@ -154,20 +269,16 @@ const ContextEngine: React.FC<ContextEngineProps> = ({
       try {
           const res = await fetch(`${getRelayUrl()}/api/context/extract`, {
               method: 'POST',
-              headers: { 'Content-Type': 'application/json', 'X-Api-Key': getApiKey() },
+              headers: apiHeaders(),
               body: JSON.stringify({ text: pasteText, apiKey: getApiKey() }),
           });
           const data = await res.json();
-          if (data.ok && data.entries?.length > 0) {
-              const newEntries = data.entries.map((e: any) => ({
-                  original: e.original,
-                  replacement: e.replacement,
-                  type: e.type || 'proper_noun',
-              }));
-              setPastePreview(newEntries);
-              setPasteResult(`Found ${newEntries.length} entries — review below`);
+          const entries = normalizeEntries(data.entries);
+          if (data.ok && entries.length > 0) {
+              setPastePreview(entries);
+              setPasteResult(`Found ${entries.length} entries — review below${data.warning ? ` (${data.warning})` : ''}`);
           } else {
-              setPasteResult('No entries found in text');
+              setPasteResult(data.warning || data.error || 'No entries found in text');
           }
       } catch (e) {
           setPasteResult('Extraction failed: ' + (e as Error).message);
@@ -177,9 +288,9 @@ const ContextEngine: React.FC<ContextEngineProps> = ({
 
   const handleAcceptPastePreview = () => {
       if (pastePreview) {
-          setDictionary(prev => [...prev, ...pastePreview]);
+          const n = addEntries(pastePreview, 'paste');
           setPastePreview(null);
-          setPasteResult(`Added ${pastePreview.length} entries to dictionary`);
+          setPasteResult(`Added ${n} entries to dictionary`);
           setPasteText('');
       }
   };
@@ -193,15 +304,16 @@ const ContextEngine: React.FC<ContextEngineProps> = ({
       try {
           const res = await fetch(`${getRelayUrl()}/api/context/names`, {
               method: 'POST',
-              headers: { 'Content-Type': 'application/json', 'X-Api-Key': getApiKey() },
+              headers: apiHeaders(),
               body: JSON.stringify({ names, apiKey: getApiKey() }),
           });
           const data = await res.json();
-          if (data.ok && data.entries?.length > 0) {
-              setQuickNamesPreview(data.entries);
-              setQuickNamesResult(`Generated ${data.entries.length} correction rules — review below`);
+          const entries = normalizeEntries(data.entries);
+          if (data.ok && entries.length > 0) {
+              setQuickNamesPreview(entries);
+              setQuickNamesResult(`Generated ${entries.length} correction rules — review below`);
           } else {
-              setQuickNamesResult('Could not generate corrections for these names');
+              setQuickNamesResult(data.error || 'Could not generate corrections for these names');
           }
       } catch (e) {
           setQuickNamesResult('Failed: ' + (e as Error).message);
@@ -211,9 +323,9 @@ const ContextEngine: React.FC<ContextEngineProps> = ({
 
   const handleAcceptQuickNames = () => {
       if (quickNamesPreview) {
-          setDictionary(prev => [...prev, ...quickNamesPreview]);
+          const n = addEntries(quickNamesPreview, 'names');
           setQuickNamesPreview(null);
-          setQuickNamesResult(`Added ${quickNamesPreview.length} entries to dictionary`);
+          setQuickNamesResult(`Added ${n} entries to dictionary`);
           setQuickNames('');
       }
   };
@@ -225,32 +337,31 @@ const ContextEngine: React.FC<ContextEngineProps> = ({
       if (bodyName.trim()) allNames.push(bodyName.trim());
       bodyMembers.split(/[\n,]+/).map(n => n.trim()).filter(n => n).forEach(n => allNames.push(n));
       // Parse acronyms: "CIP = Capital Improvement Plan" → two entries
-      const acronymEntries: {original: string, replacement: string, type: string}[] = [];
+      const acronymEntries: PreviewEntry[] = [];
       bodyAcronyms.split(/[\n]+/).forEach(line => {
-          const match = line.match(/^\s*([A-Z]{2,})\s*[=\-–:]\s*(.+)/);
+          const match = line.match(/^\s*([A-Z][A-Z0-9&]{1,})\s*[=\-–:]\s*(.+)/);
           if (match) {
-              acronymEntries.push({ original: match[1].toLowerCase(), replacement: match[1], type: 'acronym' });
-              acronymEntries.push({ original: match[2].trim().toLowerCase(), replacement: match[2].trim(), type: 'acronym' });
-              allNames.push(match[2].trim()); // also generate mishearings for the full form
+              acronymEntries.push({ original: match[1].toLowerCase(), replacement: match[1], type: 'acronym', note: match[2].trim() });
+              acronymEntries.push({ original: match[2].trim().toLowerCase(), replacement: match[2].trim(), type: 'proper_noun', note: `${match[1]} expansion` });
           } else if (line.trim()) {
               allNames.push(line.trim());
           }
       });
       if (allNames.length === 0 && acronymEntries.length === 0) { setBodyProcessing(false); return; }
       try {
-          let entries = [...acronymEntries];
+          const entries: PreviewEntry[] = [...acronymEntries];
           if (allNames.length > 0) {
               const res = await fetch(`${getRelayUrl()}/api/context/names`, {
                   method: 'POST',
-                  headers: { 'Content-Type': 'application/json', 'X-Api-Key': getApiKey() },
+                  headers: apiHeaders(),
                   body: JSON.stringify({ names: allNames, apiKey: getApiKey() }),
               });
               const data = await res.json();
-              if (data.ok && data.entries?.length > 0) entries.push(...data.entries);
+              if (data.ok) entries.push(...normalizeEntries(data.entries));
           }
           if (entries.length > 0) {
-              setDictionary(prev => [...prev, ...entries]);
-              setBodyResult(`Added ${entries.length} entries (${allNames.length} names + ${acronymEntries.length / 2} acronyms)`);
+              const n = addEntries(entries, 'meeting_body');
+              setBodyResult(`Added ${n} entries (${allNames.length} names + ${acronymEntries.length / 2} acronyms)`);
               setBodyName(''); setBodyMembers(''); setBodyAcronyms('');
           } else {
               setBodyResult('No entries generated');
@@ -259,6 +370,42 @@ const ContextEngine: React.FC<ContextEngineProps> = ({
           setBodyResult('Failed: ' + (e as Error).message);
       }
       setBodyProcessing(false);
+  };
+
+  const handleFileUpload = async (file: File) => {
+      setUploading(true);
+      setUploadResult(null);
+      setUploadPreview(null);
+      try {
+          const formData = new FormData();
+          formData.append('file', file);
+          const res = await fetch(`${getRelayUrl()}/api/context/upload-pdf`, {
+              method: 'POST',
+              headers: apiHeaders(false),
+              body: formData,
+          });
+          const data = await res.json();
+          const entries = normalizeEntries(data.entries);
+          if (data.ok && entries.length > 0) {
+              setUploadPreview({ entries, filename: file.name });
+              const meta = [data.pages ? `${data.pages} page${data.pages === 1 ? '' : 's'}` : null, data.textLength ? `${data.textLength.toLocaleString()} characters` : null].filter(Boolean).join(', ');
+              setUploadResult({ text: `Found ${entries.length} entries in ${file.name}${meta ? ` (${meta})` : ''} — review below`, kind: data.warning ? 'warn' : 'ok' });
+              if (data.warning) setUploadResult({ text: `${data.warning} Found ${entries.length} entries — review below`, kind: 'warn' });
+          } else {
+              setUploadResult({ text: data.warning || data.error || `No names or terms found in ${file.name}`, kind: data.ok ? 'warn' : 'error' });
+          }
+      } catch (err) {
+          setUploadResult({ text: 'Upload failed: ' + (err as Error).message, kind: 'error' });
+      }
+      setUploading(false);
+  };
+
+  const handleAcceptUpload = () => {
+      if (uploadPreview) {
+          const n = addEntries(uploadPreview.entries, 'document');
+          setUploadResult({ text: `Added ${n} entries from ${uploadPreview.filename}`, kind: 'ok' });
+          setUploadPreview(null);
+      }
   };
 
   const refreshServerKey = useCallback(async () => {
@@ -271,10 +418,22 @@ const ContextEngine: React.FC<ContextEngineProps> = ({
       } catch {}
   }, []);
 
+  const saveKey = async (key: string) => {
+      if (!key || key.length < 10) return;
+      localStorage.setItem('cc_api_key', key);
+      await fetch(`${getRelayUrl()}/api/polisher/apikey`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ key }),
+      }).catch(() => {});
+      await refreshServerKey();
+  };
+
   useEffect(() => {
       fetch(`${getRelayUrl()}/api/context/status`).then(r => r.json()).then(data => {
           setLearnerEnabled(data.enabled);
       }).catch(() => {});
+      fetch(`${getRelayUrl()}/api/context/capabilities`).then(r => r.json()).then(setCapabilities).catch(() => {});
 
       // Fetch server's view of the active key — this is the source of truth
       refreshServerKey();
@@ -291,13 +450,22 @@ const ContextEngine: React.FC<ContextEngineProps> = ({
 
       // Poll suggestions + learner status every 5 seconds
       const interval = setInterval(() => {
-          fetch(`${getRelayUrl()}/api/context/suggestions`).then(r => r.json()).then(setSuggestions).catch(() => {});
+          fetch(`${getRelayUrl()}/api/context/suggestions`).then(r => r.json()).then(d => Array.isArray(d) && setSuggestions(d)).catch(() => {});
           fetch(`${getRelayUrl()}/api/context/status`).then(r => r.json()).then(data => {
               if (data.bufferLength !== undefined) setLearnerStatus(data);
           }).catch(() => {});
       }, 5000);
       return () => clearInterval(interval);
   }, [refreshServerKey]);
+
+  // Wizard elapsed-time ticker
+  useEffect(() => {
+      if (wizardState !== 'running') return;
+      const t = setInterval(() => setWizardElapsed(Date.now() - wizardStartedAt), 250);
+      return () => clearInterval(t);
+  }, [wizardState, wizardStartedAt]);
+
+  useEffect(() => () => { wizardAbortRef.current?.abort(); }, []);
 
   const handleActivate = () => {
       if (!engineName.trim()) {
@@ -308,322 +476,299 @@ const ContextEngine: React.FC<ContextEngineProps> = ({
       onClose();
   };
 
-  // Wizard Logic
-  // Wizard scraping state
-  const [wizardProgress, setWizardProgress] = useState<{url: string, status: 'pending' | 'scraping' | 'done' | 'failed', entries: number, error?: string}[]>([]);
-  const [wizardExtracted, setWizardExtracted] = useState<DictionaryEntry[]>([]);
+  // ---------------------------------------------------------------------
+  // Profiles
+  // ---------------------------------------------------------------------
+  const refreshProfiles = useCallback(async () => {
+      try {
+          const res = await fetch(`${getRelayUrl()}/api/context/profiles`);
+          const data = await res.json();
+          if (data.ok && Array.isArray(data.profiles)) setProfiles(data.profiles);
+      } catch {}
+  }, []);
 
-  const [wizardPhase, setWizardPhase] = useState<string>('');
-  const [wizardInline, setWizardInline] = useState(false); // true = wizard runs inline on main view
+  useEffect(() => { if (showProfiles) refreshProfiles(); }, [showProfiles, refreshProfiles]);
 
-  const handleMunicipalitySearch = async () => {
-    // Prefer client key (Gemini SDK runs client-side for search grounding),
-    // fall back to server-loaded key by asking the server to run the search.
-    const clientKey = getApiKey();
-    const hasClientKey = clientKey && clientKey.length > 10 && clientKey !== 'PLACEHOLDER_API_KEY';
-
-    if (!hasClientKey && !serverKey?.loaded) {
-        setShowInlineKeyForm(true);
-        return;
-    }
-
-    // Save key if user just entered one inline
-    if (tempKey && tempKey !== clientKey && tempKey.length > 10) {
-        localStorage.setItem('cc_api_key', tempKey);
-        await fetch(`${getRelayUrl()}/api/polisher/apikey`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ key: tempKey }),
-        }).catch(() => {});
-        await refreshServerKey();
-    }
-
-    setIsProcessing(true);
-    setSearchResults([]);
-    const allResults: any[] = [];
-    const seenUrls = new Set<string>();
-
-    // Phase 1: Use Gemini + Google Search grounding to find real URLs.
-    // If client has its own key we call Gemini directly (faster). Otherwise
-    // we route through the server, which holds the .env.local key.
-    setWizardPhase('Searching Google for official sites…');
-    const searchStart = Date.now();
-    try {
-        let geminiResults: any[] = [];
-        if (hasClientKey) {
-            geminiResults = await searchMunicipalitySources(searchQuery, clientKey);
-        } else {
-            const res = await fetch(`${getRelayUrl()}/api/context/search-municipality`, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ query: searchQuery }),
-            });
-            const data = await res.json();
-            if (data.ok && Array.isArray(data.results)) geminiResults = data.results;
-            else if (data.error) console.warn('[Wizard] Server search:', data.error);
-        }
-        for (const r of geminiResults) {
-            if (r.url && !seenUrls.has(r.url)) {
-                seenUrls.add(r.url);
-                allResults.push(r);
-            }
-        }
-        setWizardPhase(`Found ${allResults.length} candidate page${allResults.length === 1 ? '' : 's'} in ${((Date.now() - searchStart) / 1000).toFixed(1)}s`);
-    } catch (e) {
-        console.warn('[Wizard] Gemini search failed:', e);
-        setWizardPhase('Search failed — check API key. Falling back to direct URL crawl.');
-    }
-
-    // Phase 2: If we found any .gov or .org sites, crawl them for internal links
-    const officialSites = allResults.filter(r =>
-        /\.(gov|org)/.test(r.url) && !r.url.includes('wikipedia')
-    );
-
-    if (officialSites.length > 0) {
-        const host = (() => { try { return new URL(officialSites[0].url).hostname; } catch { return officialSites[0].url; } })();
-        setWizardPhase(`Crawling ${host} for sub-pages (officials, agendas, departments)…`);
-        try {
-            const crawlRes = await fetch(`${getRelayUrl()}/api/context/discover-links`, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ url: officialSites[0].url }),
-            });
-            const crawlData = await crawlRes.json();
-            if (crawlData.ok && crawlData.links?.length > 0) {
-                for (const link of crawlData.links) {
-                    if (!seenUrls.has(link.url)) {
-                        seenUrls.add(link.url);
-                        allResults.push(link);
-                    }
-                }
-                setWizardPhase(`Discovered ${crawlData.links.length} sub-page${crawlData.links.length === 1 ? '' : 's'} on ${host}`);
-            }
-        } catch (e) {
-            console.warn('[Wizard] Link discovery failed:', e);
-        }
-    }
-
-    setTimeout(() => setWizardPhase(''), 1200);
-    setIsProcessing(false);
-
-    if (allResults.length === 0) {
-        alert(`No sources found for "${searchQuery}". Try:\n• Include the state (e.g., "Brookline, MA")\n• Use the URL Scraper tool with a direct URL instead`);
-        return;
-    }
-
-    setSearchResults(allResults);
-    setSelectedSources(allResults.map((_: any, i: number) => i));
-    if (!wizardInline) setView('wizard_select');
+  const handleSaveProfile = async () => {
+      const name = engineName.trim();
+      if (!name) { setShowNameError(true); setProfilesMsg({ text: 'Give the engine a name first (top of the window).', kind: 'error' }); return; }
+      setProfilesBusy(true);
+      setProfilesMsg(null);
+      try {
+          const res = await fetch(`${getRelayUrl()}/api/context/profiles`, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ name, entries: dictionary, municipality: searchQuery.trim() || undefined }),
+          });
+          const data = await res.json();
+          if (!data.ok) throw new Error(data.error || `HTTP ${res.status}`);
+          setActiveContextName(name);
+          setProfilesMsg({ text: `Saved "${name}" (${data.profile?.entryCount ?? dictionary.length} rules) on the relay`, kind: 'ok' });
+          refreshProfiles();
+      } catch (e) {
+          setProfilesMsg({ text: 'Save failed: ' + (e as Error).message, kind: 'error' });
+      }
+      setProfilesBusy(false);
   };
 
-  // Stream a single URL's scrape via SSE — yields fine-grained phases plus
-  // entry batches so the UI can show a live feed. Falls back to the
-  // non-streaming endpoint on any error so we never get stuck.
+  const handleLoadProfile = async (id: string, mode: 'replace' | 'merge') => {
+      setProfilesBusy(true);
+      setProfilesMsg(null);
+      try {
+          const res = await fetch(`${getRelayUrl()}/api/context/profiles/${encodeURIComponent(id)}`);
+          const data = await res.json();
+          if (!data.ok || !data.profile) throw new Error(data.error || `HTTP ${res.status}`);
+          const entries = normalizeEntries(data.profile.entries);
+          if (mode === 'replace') {
+              setDictionary(entries.map(e => ({ ...e, source: e.source || 'profile' })) as DictionaryEntry[]);
+              setProfilesMsg({ text: `Loaded "${data.profile.name}" — ${entries.length} rules`, kind: 'ok' });
+          } else {
+              const n = addEntries(entries, 'profile');
+              setProfilesMsg({ text: `Merged "${data.profile.name}" — ${n} new rules added`, kind: 'ok' });
+          }
+          setEngineName(data.profile.name);
+          setActiveContextName(data.profile.name);
+          if (data.profile.municipality && !searchQuery) setSearchQuery(data.profile.municipality);
+      } catch (e) {
+          setProfilesMsg({ text: 'Load failed: ' + (e as Error).message, kind: 'error' });
+      }
+      setProfilesBusy(false);
+  };
+
+  const handleDeleteProfile = async (p: ProfileSummary) => {
+      if (!confirm(`Delete the profile "${p.name}" from the relay? The rules currently loaded stay as they are.`)) return;
+      try {
+          await fetch(`${getRelayUrl()}/api/context/profiles/${encodeURIComponent(p.id)}`, { method: 'DELETE' });
+          setProfilesMsg({ text: `Deleted "${p.name}"`, kind: 'ok' });
+          refreshProfiles();
+      } catch (e) {
+          setProfilesMsg({ text: 'Delete failed: ' + (e as Error).message, kind: 'error' });
+      }
+  };
+
+  // ---------------------------------------------------------------------
+  // Municipality Wizard
+  // ---------------------------------------------------------------------
+
+  const resetWizard = () => {
+      wizardAbortRef.current?.abort();
+      setWizardState('idle');
+      setWizardStatusLine('');
+      setWizardGroups([]);
+      setWizardSelected(new Set());
+      setWizardCollapsed(new Set());
+      setWizardSources([]);
+      setWizardHost(null);
+      setWizardNote(null);
+      setWizardError(null);
+      setWizardAdded(null);
+      setShowSources(false);
+      setLocateStatus('pending');
+      setSelectedSources([]);
+      setScanLive([]);
+      setScanExtracted([]);
+      setScanRecent([]);
+      setScanRunning(false);
+  };
+
+  const handleWizardResearch = async () => {
+      const q = searchQuery.trim();
+      if (!q) return;
+      if (!hasUsableKey()) { setShowInlineKeyForm(true); return; }
+      if (tempKey && tempKey !== getApiKey() && tempKey.length > 10) await saveKey(tempKey);
+
+      resetWizard();
+      const controller = new AbortController();
+      wizardAbortRef.current = controller;
+      const startedAt = Date.now();
+      setWizardStartedAt(startedAt);
+      setWizardElapsed(0);
+      setWizardState('running');
+      setLocateStatus('running');
+      setWizardStatusLine('Starting research…');
+
+      let sawDone = false;
+      try {
+          const res = await fetch(`${getRelayUrl()}/api/context/wizard/research`, {
+              method: 'POST',
+              headers: { ...apiHeaders(), 'Accept': 'text/event-stream' },
+              body: JSON.stringify({ query: q, apiKey: getApiKey(), domainHint: settings.dialect !== 'general' ? settings.dialect : '' }),
+              signal: controller.signal,
+          });
+          if (!res.ok) {
+              let msg = `HTTP ${res.status}`;
+              try { const j = await res.json(); msg = j.error || msg; } catch {}
+              throw new Error(msg);
+          }
+          await readSse(res, (ev) => {
+              switch (ev.phase) {
+                  case 'status':
+                      if (ev.message) setWizardStatusLine(ev.message);
+                      break;
+                  case 'sources': {
+                      const list: WizardSource[] = Array.isArray(ev.sources) ? ev.sources : [];
+                      setWizardSources(list);
+                      setWizardHost(ev.officialHost || null);
+                      setWizardNote(ev.crawlNote || ev.error || null);
+                      setLocateStatus(ev.error && list.length === 0 ? 'failed' : 'done');
+                      setSelectedSources(list.map((_, i) => i).filter(i => list[i].type !== 'General').slice(0, 8));
+                      break;
+                  }
+                  case 'research_start':
+                      setWizardGroups((ev.groups || []).map((g: any) => ({ key: g.key, label: g.label, status: 'running' as const, items: [] })));
+                      break;
+                  case 'group': {
+                      const items: WizardItem[] = (ev.items || []).map((it: any, i: number) => ({
+                          id: `${ev.key}:${i}`,
+                          name: it.name,
+                          category: it.category,
+                          detail: it.detail || '',
+                          misheard: it.misheard || [],
+                          entries: normalizeEntries(it.entries),
+                          group: ev.key,
+                      })).filter((it: WizardItem) => it.entries.length > 0);
+                      setWizardGroups(prev => prev.map(g => g.key === ev.key ? { ...g, status: ev.ok ? 'done' : 'failed', items, error: ev.error, elapsedMs: ev.elapsedMs } : g));
+                      setWizardSelected(prev => { const n = new Set(prev); items.forEach(it => n.add(it.id)); return n; });
+                      break;
+                  }
+                  case 'done':
+                      sawDone = true;
+                      setWizardStatusLine(`Done in ${((ev.totalMs || (Date.now() - startedAt)) / 1000).toFixed(0)}s`);
+                      break;
+                  case 'error':
+                      setWizardError(ev.error || 'Research failed');
+                      break;
+              }
+          });
+          setWizardGroups(prev => prev.map(g => g.status === 'running' ? { ...g, status: 'failed', error: g.error || 'No response' } : g));
+          setLocateStatus(s => s === 'running' ? 'failed' : s);
+          setWizardState(prev => prev === 'running' ? 'done' : prev);
+          if (!sawDone) setWizardStatusLine(`Finished in ${((Date.now() - startedAt) / 1000).toFixed(0)}s`);
+      } catch (e) {
+          if ((e as Error).name === 'AbortError') return;
+          setWizardError((e as Error).message);
+          setWizardState('error');
+          setLocateStatus('failed');
+          setWizardGroups(prev => prev.map(g => g.status === 'running' ? { ...g, status: 'failed' } : g));
+      }
+  };
+
+  const wizardItems = useMemo(() => wizardGroups.flatMap(g => g.items), [wizardGroups]);
+  const wizardSelectedItems = useMemo(() => wizardItems.filter(it => wizardSelected.has(it.id)), [wizardItems, wizardSelected]);
+  const wizardSelectedEntryCount = useMemo(() => wizardSelectedItems.reduce((n, it) => n + it.entries.length, 0), [wizardSelectedItems]);
+  const wizardTotalEntries = useMemo(() => wizardItems.reduce((n, it) => n + it.entries.length, 0), [wizardItems]);
+
+  const toggleWizardItem = (id: string) => setWizardSelected(prev => { const n = new Set(prev); if (n.has(id)) n.delete(id); else n.add(id); return n; });
+  const setGroupSelected = (key: string, on: boolean) => setWizardSelected(prev => {
+      const n = new Set(prev);
+      wizardGroups.find(g => g.key === key)?.items.forEach(it => on ? n.add(it.id) : n.delete(it.id));
+      return n;
+  });
+
+  const handleWizardAdd = () => {
+      const entries = wizardSelectedItems.flatMap(it => it.entries);
+      const n = addEntries(entries, 'wizard');
+      setWizardAdded(n);
+      if (!engineName.trim() && searchQuery.trim()) setEngineName(searchQuery.trim());
+  };
+
+  // --- Deep scan of discovered pages (3 at a time) ---
   const streamScrape = (
     url: string,
-    onPhase: (phase: WizardPhase, detail: string, extra?: any) => void,
-    onEntries: (batch: any[]) => void,
-  ): Promise<{ entries: any[]; ok: boolean; error?: string }> => {
+    onPhase: (phase: ScanPhase, detail: string, extra?: any) => void,
+    onEntries: (batch: PreviewEntry[]) => void,
+  ): Promise<{ entries: PreviewEntry[]; ok: boolean; error?: string }> => {
     return new Promise(async (resolve) => {
-        const collected: any[] = [];
+        const collected: PreviewEntry[] = [];
         try {
-            const apiKeyToSend = getApiKey();
             const res = await fetch(`${getRelayUrl()}/api/context/scrape-stream`, {
                 method: 'POST',
-                headers: { 'Content-Type': 'application/json', 'X-Api-Key': apiKeyToSend, 'Accept': 'text/event-stream' },
-                body: JSON.stringify({ url, apiKey: apiKeyToSend }),
+                headers: { ...apiHeaders(), 'Accept': 'text/event-stream' },
+                body: JSON.stringify({ url, apiKey: getApiKey() }),
             });
             if (!res.ok || !res.body) throw new Error(`HTTP ${res.status}`);
-
-            const reader = res.body.getReader();
-            const decoder = new TextDecoder();
-            let buffer = '';
-
-            while (true) {
-                const { value, done } = await reader.read();
-                if (done) break;
-                buffer += decoder.decode(value, { stream: true });
-                // SSE messages are separated by \n\n
-                let idx;
-                while ((idx = buffer.indexOf('\n\n')) >= 0) {
-                    const raw = buffer.slice(0, idx);
-                    buffer = buffer.slice(idx + 2);
-                    const dataLine = raw.split('\n').find(l => l.startsWith('data:'));
-                    if (!dataLine) continue;
-                    try {
-                        const ev = JSON.parse(dataLine.slice(5).trim());
-                        switch (ev.phase) {
-                            case 'fetching':
-                                onPhase('fetching', 'Connecting to server…');
-                                break;
-                            case 'fetched':
-                                onPhase('fetched', `Server responded (${ev.contentType?.split(';')[0] || 'unknown'})`, { contentType: ev.contentType });
-                                break;
-                            case 'parsing':
-                                onPhase('parsing', ev.sourceType === 'pdf' ? `Parsing PDF (${Math.round((ev.bytes || 0) / 1024)} KB)` : `Stripping HTML (${Math.round((ev.bytes || 0) / 1024)} KB)`, { sourceType: ev.sourceType });
-                                break;
-                            case 'parsed':
-                                onPhase('parsed', `Extracted ${ev.textLength?.toLocaleString() || '?'} chars of text`, { textLength: ev.textLength, sourceType: ev.sourceType });
-                                break;
-                            case 'extracting':
-                                onPhase('extracting', `Asking Gemini to find names, places, acronyms…`);
-                                break;
-                            case 'entries':
-                                if (Array.isArray(ev.batch)) {
-                                    collected.push(...ev.batch);
-                                    onEntries(ev.batch);
-                                    onPhase('extracting', `Streaming entries: ${collected.length} so far…`);
-                                }
-                                break;
-                            case 'done':
-                                onPhase('done', `Done in ${((ev.totalMs || 0) / 1000).toFixed(1)}s — ${ev.totalEntries ?? collected.length} entries`, { totalMs: ev.totalMs });
-                                resolve({ entries: collected, ok: true });
-                                return;
-                            case 'error':
-                                onPhase('failed', ev.error || 'Failed', { error: ev.error });
-                                resolve({ entries: collected, ok: false, error: ev.error });
-                                return;
-                        }
-                    } catch {}
+            let finished = false;
+            await readSse(res, (ev) => {
+                switch (ev.phase) {
+                    case 'fetching': onPhase('fetching', 'Connecting…'); break;
+                    case 'fetched': onPhase('fetched', `Server responded (${ev.contentType?.split(';')[0] || 'unknown'})`); break;
+                    case 'parsing': onPhase('parsing', ev.sourceType === 'pdf' ? `Parsing PDF (${Math.round((ev.bytes || 0) / 1024)} KB)` : `Reading page (${Math.round((ev.bytes || 0) / 1024)} KB)`); break;
+                    case 'parsed': onPhase('parsed', `${(ev.textLength || 0).toLocaleString()} characters of text`); break;
+                    case 'ai_fetch': onPhase('ai_fetch', ev.message || 'Asking Gemini to read the page…'); break;
+                    case 'extracting': onPhase('extracting', 'Finding names, places and acronyms…'); break;
+                    case 'entries':
+                        if (Array.isArray(ev.batch)) { const b = normalizeEntries(ev.batch); collected.push(...b); onEntries(b); onPhase('extracting', `${collected.length} entries so far…`); }
+                        break;
+                    case 'done':
+                        finished = true;
+                        onPhase('done', ev.warning ? ev.warning : `Done in ${((ev.totalMs || 0) / 1000).toFixed(1)}s — ${ev.totalEntries ?? collected.length} entries`);
+                        resolve({ entries: collected, ok: true });
+                        break;
+                    case 'error':
+                        finished = true;
+                        onPhase('failed', ev.error || 'Failed', { error: ev.error });
+                        resolve({ entries: collected, ok: false, error: ev.error });
+                        break;
                 }
-            }
-            // Stream ended without an explicit done event
-            resolve({ entries: collected, ok: true });
+            });
+            if (!finished) resolve({ entries: collected, ok: true });
         } catch (e) {
-            // Fall back to non-streaming endpoint
-            try {
-                onPhase('extracting', 'Streaming unavailable — using direct scrape…');
-                const res = await fetch(`${getRelayUrl()}/api/context/scrape`, {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json', 'X-Api-Key': getApiKey() },
-                    body: JSON.stringify({ url, apiKey: getApiKey() }),
-                });
-                const data = await res.json();
-                if (data.ok && data.entries?.length > 0) {
-                    onEntries(data.entries);
-                    onPhase('done', `Done — ${data.entries.length} entries (fallback)`);
-                    resolve({ entries: data.entries, ok: true });
-                } else {
-                    onPhase('done', data.warning || 'No entries found');
-                    resolve({ entries: [], ok: true });
-                }
-            } catch (err) {
-                onPhase('failed', (err as Error).message);
-                resolve({ entries: [], ok: false, error: (err as Error).message });
-            }
+            onPhase('failed', (e as Error).message);
+            resolve({ entries: [], ok: false, error: (e as Error).message });
         }
     });
   };
 
-  const handleBuildEngine = async () => {
-    const selectedData = searchResults.filter((_: any, i: number) => selectedSources.includes(i));
+  const handleDeepScan = async () => {
+    const selectedData = wizardSources.filter((_, i) => selectedSources.includes(i));
+    if (selectedData.length === 0) return;
+    setScanRunning(true);
+    setScanExtracted([]);
+    setScanRecent([]);
+    setScanLive(selectedData.map(d => ({ url: d.url, phase: 'queued' as ScanPhase, detail: 'Queued', entries: 0, startedAt: 0, elapsedMs: 0 })));
 
-    // Initialize progress tracker
-    const progress = selectedData.map((d: any) => ({
-        url: d.url,
-        status: 'pending' as const,
-        entries: 0,
-    }));
-    setWizardProgress(progress);
-    setWizardExtracted([]);
-    setRecentEntries([]);
-    setWizardEtaMs(null);
-    setWizardLive(selectedData.map((d: any) => ({
-        url: d.url, phase: 'queued' as WizardPhase, detail: 'Queued', entries: 0,
-        startedAt: 0, elapsedMs: 0,
-    })));
-    if (!wizardInline) setView('wizard_analyze');
+    const existingKeys = new Set(dictionary.map(entryKey));
+    const ticker = setInterval(() => {
+        setScanLive(prev => prev.map(p => (p.startedAt && p.phase !== 'done' && p.phase !== 'failed') ? { ...p, elapsedMs: Date.now() - p.startedAt } : p));
+    }, 250);
 
-    // Scrape each URL sequentially via the relay server
-    const existingKeys = new Set(dictionary.map(e => `${e.original.toLowerCase()}→${e.replacement.toLowerCase()}`));
-    const perUrlTimes: number[] = [];
-
-    for (let i = 0; i < selectedData.length; i++) {
-        const startedAt = Date.now();
-        // Mark current as scraping in both legacy progress + new live state
-        setWizardProgress(prev => prev.map((p, j) => j === i ? { ...p, status: 'scraping' } : p));
-        setWizardLive(prev => prev.map((p, j) => j === i
-            ? { ...p, phase: 'fetching', detail: 'Starting…', startedAt, elapsedMs: 0 }
-            : p));
-
-        // Tick elapsed every 200ms for the currently active row
-        const tickInterval = setInterval(() => {
-            setWizardLive(prev => prev.map((p, j) =>
-                j === i && p.phase !== 'done' && p.phase !== 'failed'
-                    ? { ...p, elapsedMs: Date.now() - startedAt }
-                    : p
-            ));
-        }, 200);
-
-        try {
+    let next = 0;
+    const worker = async () => {
+        while (next < selectedData.length) {
+            const i = next++;
+            const startedAt = Date.now();
+            setScanLive(prev => prev.map((p, j) => j === i ? { ...p, phase: 'fetching', detail: 'Starting…', startedAt } : p));
             const result = await streamScrape(
                 selectedData[i].url,
-                (phase, detail, extra) => {
-                    setWizardLive(prev => prev.map((p, j) => j === i
-                        ? { ...p, phase, detail, ...(extra || {}), elapsedMs: Date.now() - startedAt }
-                        : p));
-                },
+                (phase, detail, extra) => setScanLive(prev => prev.map((p, j) => j === i ? { ...p, phase, detail, error: extra?.error, elapsedMs: Date.now() - startedAt } : p)),
                 (batch) => {
-                    // Deduplicate against existing dictionary and already-extracted entries
-                    const novel = batch.filter((e: any) => {
-                        if (!e.original || !e.replacement) return false;
-                        const key = `${e.original.toLowerCase()}→${e.replacement.toLowerCase()}`;
-                        if (existingKeys.has(key)) return false;
-                        existingKeys.add(key);
-                        return true;
-                    }).map((e: any) => ({
-                        original: e.original,
-                        replacement: e.replacement,
-                        type: e.type || 'proper_noun',
-                    }));
+                    const novel = batch.filter(e => { const k = entryKey(e); if (existingKeys.has(k)) return false; existingKeys.add(k); return true; });
                     if (novel.length > 0) {
-                        setWizardExtracted(prev => [...prev, ...novel]);
-                        setRecentEntries(prev => [...novel.slice(-12), ...prev].slice(0, 30));
-                        setWizardLive(prev => prev.map((p, j) => j === i ? { ...p, entries: p.entries + novel.length } : p));
+                        setScanExtracted(prev => [...prev, ...novel]);
+                        setScanRecent(prev => [...novel.slice(-12), ...prev].slice(0, 30));
+                        setScanLive(prev => prev.map((p, j) => j === i ? { ...p, entries: p.entries + novel.length } : p));
                     }
                 },
             );
-
-            clearInterval(tickInterval);
-            const elapsed = Date.now() - startedAt;
-            perUrlTimes.push(elapsed);
-
-            const finalPhase: WizardPhase = result.ok ? 'done' : 'failed';
-            setWizardLive(prev => prev.map((p, j) => j === i
-                ? { ...p, phase: finalPhase, elapsedMs: elapsed, error: result.error }
-                : p));
-            setWizardProgress(prev => prev.map((p, j) => j === i
-                ? { ...p, status: result.ok ? 'done' : 'failed', entries: result.entries.length, error: result.error || (result.entries.length === 0 ? 'No entries found' : undefined) }
-                : p));
-
-            // Recompute ETA from the avg of completed URLs
-            const remaining = selectedData.length - (i + 1);
-            if (remaining > 0 && perUrlTimes.length > 0) {
-                const avg = perUrlTimes.reduce((a, b) => a + b, 0) / perUrlTimes.length;
-                setWizardEtaMs(Math.round(avg * remaining));
-            } else {
-                setWizardEtaMs(0);
-            }
-        } catch (e) {
-            clearInterval(tickInterval);
-            setWizardLive(prev => prev.map((p, j) => j === i
-                ? { ...p, phase: 'failed', detail: 'Network error', error: (e as Error).message, elapsedMs: Date.now() - startedAt }
-                : p));
-            setWizardProgress(prev => prev.map((p, j) => j === i ? { ...p, status: 'failed', error: (e as Error).message } : p));
+            setScanLive(prev => prev.map((p, j) => j === i ? { ...p, phase: result.ok ? 'done' : 'failed', elapsedMs: Date.now() - startedAt, error: result.error } : p));
         }
-    }
+    };
+    await Promise.all(Array.from({ length: Math.min(3, selectedData.length) }, worker));
+    clearInterval(ticker);
+    setScanRunning(false);
   };
 
-  const handleWizardAccept = () => {
-      setDictionary(prev => [...prev, ...wizardExtracted]);
-      setWizardExtracted([]);
-      setWizardProgress([]);
-      setSearchResults([]);
-      setWizardInline(false);
-      setView('main');
+  const handleScanAccept = () => {
+      const n = addEntries(scanExtracted, 'url');
+      setScanExtracted([]);
+      setScanLive([]);
+      setScanRecent([]);
+      setWizardAdded(prev => (prev || 0) + n);
   };
 
-  // Manual & Drag Drop Logic
+  // ---------------------------------------------------------------------
+  // Drag & drop, manual entry, import/export
+  // ---------------------------------------------------------------------
   const handleDrag = useCallback((e: React.DragEvent) => {
     e.preventDefault();
     e.stopPropagation();
@@ -635,40 +780,13 @@ const ContextEngine: React.FC<ContextEngineProps> = ({
     e.preventDefault();
     e.stopPropagation();
     setDragActive(false);
-    if (e.dataTransfer.files && e.dataTransfer.files[0]) {
-       const file = e.dataTransfer.files[0];
-       setUploading(true);
-       try {
-           const formData = new FormData();
-           formData.append('file', file);
-           const res = await fetch(`${getRelayUrl()}/api/context/upload-pdf`, {
-               method: 'POST',
-               headers: { 'X-Api-Key': getApiKey() },
-               body: formData,
-           });
-           const data = await res.json();
-           if (data.ok && data.entries?.length > 0) {
-               const newEntries = data.entries.map((entry: any) => ({
-                   original: entry.original,
-                   replacement: entry.replacement,
-                   type: entry.type || 'proper_noun',
-               }));
-               setDictionary(prev => [...prev, ...newEntries]);
-               alert(`Extracted ${data.entries.length} entries from ${file.name}`);
-           } else {
-               alert(data.warning || data.error || `No entries found in ${file.name}`);
-           }
-       } catch (err) {
-           const entries = await generateContextDictionary(`Context derived from file: ${file.name}`, apiKey || tempKey);
-           setDictionary(prev => [...prev, ...entries]);
-       }
-       setUploading(false);
-    }
-  }, [setDictionary, apiKey, tempKey]);
+    const file = e.dataTransfer.files?.[0];
+    if (file) await handleFileUpload(file);
+  }, [handleFileUpload]);
 
   const addManualEntry = () => {
     if (manualOriginal && manualReplacement) {
-        setDictionary(prev => [...prev, { original: manualOriginal, replacement: manualReplacement, type: 'correction' }]);
+        addEntries([{ original: manualOriginal.trim(), replacement: manualReplacement.trim(), type: 'correction' }], 'manual');
         setManualOriginal('');
         setManualReplacement('');
     }
@@ -692,12 +810,12 @@ const ContextEngine: React.FC<ContextEngineProps> = ({
       reader.onload = (evt) => {
           try {
               const imported = JSON.parse(evt.target?.result as string);
-              if (Array.isArray(imported)) {
-                  setDictionary(prev => [...prev, ...imported]);
-              }
+              const list = Array.isArray(imported) ? imported : Array.isArray(imported?.entries) ? imported.entries : null;
+              if (list) addEntries(normalizeEntries(list), 'import');
           } catch(err) { console.error("Invalid JSON"); }
       };
       reader.readAsText(file);
+      e.target.value = '';
   };
 
   const handleEnterRaw = () => {
@@ -724,6 +842,39 @@ const ContextEngine: React.FC<ContextEngineProps> = ({
       setView('settings');
   };
 
+  // Tailwind only generates classes it can see literally, so accents are looked up, not templated.
+  const ACCENTS: Record<string, { box: string; title: string; button: string }> = {
+      sage: { box: 'bg-sage-50 border-sage-200', title: 'text-sage-700', button: 'bg-sage-500 hover:bg-sage-600' },
+      purple: { box: 'bg-purple-50 border-purple-200', title: 'text-purple-700', button: 'bg-purple-500 hover:bg-purple-600' },
+  };
+  const PreviewList: React.FC<{ entries: PreviewEntry[]; accent: 'sage' | 'purple'; onAccept: () => void; onDiscard: () => void; title: string }> = ({ entries, accent, onAccept, onDiscard, title }) => (
+      <div className={`rounded-lg border p-3 space-y-2 ${ACCENTS[accent].box}`}>
+          <p className={`text-[9px] font-bold uppercase ${ACCENTS[accent].title}`}>{title}</p>
+          <div className="max-h-40 overflow-y-auto space-y-1 custom-scrollbar">
+              {entries.map((e, i) => (
+                  <div key={i} className="flex items-center gap-2 text-[10px] min-w-0">
+                      <span className="text-red-400 line-through truncate">{e.original}</span>
+                      <ArrowRight size={8} className="text-stone-300 shrink-0" />
+                      <span className="font-bold text-forest-dark truncate">{e.replacement}</span>
+                      {e.note && <span className="text-stone-400 truncate hidden sm:inline">· {e.note}</span>}
+                      <span className={`ml-auto text-[8px] px-1 py-0.5 rounded shrink-0 ${e.type === 'acronym' ? 'bg-purple-100 text-purple-600' : e.type === 'place' ? 'bg-green-100 text-green-600' : 'bg-blue-100 text-blue-600'}`}>{(e.type || 'proper_noun').replace('_', ' ')}</span>
+                  </div>
+              ))}
+          </div>
+          <div className="flex gap-2 pt-1">
+              <button onClick={onAccept} className={`flex-1 px-3 py-1.5 text-white text-[10px] font-bold rounded-lg ${ACCENTS[accent].button}`}>Add All to Dictionary</button>
+              <button onClick={onDiscard} className="px-3 py-1.5 bg-white border border-stone-200 text-[10px] font-bold rounded-lg text-stone-500 hover:bg-stone-50">Discard</button>
+          </div>
+      </div>
+  );
+
+  const StatusIcon = ({ status }: { status: 'pending' | 'running' | 'done' | 'failed' }) => (
+      status === 'pending' ? <div className="w-3.5 h-3.5 rounded-full border-2 border-stone-200 shrink-0" />
+      : status === 'running' ? <Loader2 size={14} className="animate-spin text-sage-600 shrink-0" />
+      : status === 'done' ? <CheckCircle size={14} className="text-green-600 shrink-0" />
+      : <X size={14} className="text-red-500 shrink-0" />
+  );
+
   return (
     <div className="absolute inset-0 z-50 bg-stone-50 flex flex-col animate-fade-in text-forest-dark font-sans">
         {/* Header */}
@@ -735,14 +886,14 @@ const ContextEngine: React.FC<ContextEngineProps> = ({
                 <div>
                     <h2 className="text-xl font-bold font-display leading-tight">Context Engine</h2>
                     <div className="flex items-center gap-2 text-xs text-stone-500 font-medium">
-                        <span className="bg-sage-100 text-forest-dark px-1.5 py-0.5 rounded">v5.2</span>
+                        <span className="bg-sage-100 text-forest-dark px-1.5 py-0.5 rounded">v6</span>
                         <span>Knowledge Graph Builder</span>
                     </div>
                 </div>
             </div>
-            
+
             <div className="flex-1 max-w-md mx-8 relative">
-                <input 
+                <input
                     value={engineName}
                     onChange={(e) => { setEngineName(e.target.value); setShowNameError(false); }}
                     placeholder="Name this Engine (e.g. City Council)"
@@ -755,27 +906,64 @@ const ContextEngine: React.FC<ContextEngineProps> = ({
                 )}
             </div>
 
-            <div className="flex items-center gap-2">
+            <div className="flex items-center gap-2 relative">
+                 <button onClick={() => setShowProfiles(s => !s)} className={`flex items-center gap-2 px-4 py-2 rounded-lg font-bold text-sm border transition-all ${showProfiles ? 'bg-sage-100 border-sage-400 text-forest-dark' : 'bg-white border-stone-200 text-stone-600 hover:bg-stone-50'}`} title="Save or load a named profile stored on the relay">
+                    <FolderOpen size={16} /> Profiles
+                 </button>
                  <button onClick={handleActivate} className="flex items-center gap-2 px-6 py-2 bg-forest-dark text-white rounded-lg font-bold hover:bg-forest-light transition-all shadow-md">
                     <CheckCircle size={18} /> Activate & Close
                  </button>
                  <button onClick={onClose} className="p-2 hover:bg-stone-100 rounded-full transition-colors">
                     <X size={24} className="text-stone-400 hover:text-forest-dark" />
                  </button>
+
+                 {showProfiles && (
+                    <div className="absolute right-0 top-full mt-2 w-[420px] bg-white border border-stone-200 rounded-2xl shadow-2xl z-30 p-4 space-y-3 animate-fade-in">
+                        <div className="flex items-center justify-between">
+                            <div>
+                                <p className="text-sm font-bold text-forest-dark">Named profiles</p>
+                                <p className="text-[10px] text-stone-400">Stored on the relay server, shared by every operator machine</p>
+                            </div>
+                            <button onClick={handleSaveProfile} disabled={profilesBusy || dictionary.length === 0}
+                                className="flex items-center gap-1.5 px-3 py-1.5 bg-forest-dark text-white rounded-lg text-xs font-bold hover:bg-forest-light disabled:opacity-40"
+                                title={engineName.trim() ? `Save the current ${dictionary.length} rules as "${engineName.trim()}"` : 'Name the engine first'}>
+                                {profilesBusy ? <Loader2 size={12} className="animate-spin" /> : <Save size={12} />} Save as "{engineName.trim() || 'unnamed'}"
+                            </button>
+                        </div>
+                        {profilesMsg && (
+                            <p className={`text-[11px] font-medium ${profilesMsg.kind === 'ok' ? 'text-green-700' : 'text-red-600'}`}>{profilesMsg.text}</p>
+                        )}
+                        <div className="max-h-64 overflow-y-auto space-y-1.5 custom-scrollbar">
+                            {profiles.length === 0 ? (
+                                <p className="text-xs text-stone-400 text-center py-4">No profiles yet. Build a dictionary, name it, and press Save.</p>
+                            ) : profiles.map(p => (
+                                <div key={p.id} className="flex items-center gap-2 p-2 rounded-lg border border-stone-100 hover:border-sage-300 bg-stone-50/60">
+                                    <div className="flex-1 min-w-0">
+                                        <p className="text-xs font-bold text-forest-dark truncate">{p.name}</p>
+                                        <p className="text-[10px] text-stone-400 truncate">{p.entryCount} rules · {new Date(p.updatedAt).toLocaleDateString()}{p.municipality ? ` · ${p.municipality}` : ''}</p>
+                                    </div>
+                                    <button onClick={() => handleLoadProfile(p.id, 'replace')} disabled={profilesBusy} className="px-2 py-1 rounded bg-forest-dark text-white text-[10px] font-bold hover:bg-forest-light disabled:opacity-40" title="Replace the current rules with this profile">Load</button>
+                                    <button onClick={() => handleLoadProfile(p.id, 'merge')} disabled={profilesBusy} className="px-2 py-1 rounded bg-sage-100 text-forest-dark text-[10px] font-bold hover:bg-sage-200 disabled:opacity-40" title="Add this profile's rules to the current ones">Merge</button>
+                                    <button onClick={() => handleDeleteProfile(p)} disabled={profilesBusy} className="p-1 text-stone-300 hover:text-red-500" title="Delete profile"><Trash2 size={14} /></button>
+                                </div>
+                            ))}
+                        </div>
+                    </div>
+                 )}
             </div>
         </div>
 
         {/* Main Content Area */}
         <div className="flex-1 flex overflow-hidden">
-            
+
             {/* Left Panel: Tabs */}
-            <div className="w-1/3 bg-white border-r border-stone-200 flex flex-col overflow-y-auto">
+            <div className="w-[38%] min-w-[380px] bg-white border-r border-stone-200 flex flex-col overflow-y-auto">
                 <div className="p-2 border-b border-stone-100 flex gap-1 bg-stone-50">
                     <button onClick={() => setView('main')} className={`flex-1 py-2 text-xs font-bold rounded-lg transition-colors flex items-center justify-center gap-2 ${view === 'main' ? 'bg-white shadow-sm text-forest-dark ring-1 ring-stone-200' : 'text-stone-400 hover:bg-stone-100'}`}>
                         <Database size={14} /> Tools
                     </button>
-                    <button 
-                        onClick={openSettings} 
+                    <button
+                        onClick={openSettings}
                         className={`flex-1 py-2 text-xs font-bold rounded-lg transition-all flex items-center justify-center gap-2 ${view === 'settings' ? 'bg-white shadow-sm text-forest-dark ring-1 ring-stone-200' : 'text-stone-400 hover:bg-stone-100'} ${!settingsVisited && view !== 'settings' ? 'animate-pulse ring-2 ring-sage-300 bg-sage-50 text-sage-600' : ''}`}
                     >
                         <Sliders size={14} /> Settings
@@ -799,13 +987,13 @@ const ContextEngine: React.FC<ContextEngineProps> = ({
                             <div className="flex items-center gap-2 mb-2">
                                 <Key size={14} className="text-amber-600" />
                                 <h4 className="font-bold text-sm text-amber-800">Gemini API Key</h4>
-                                {getApiKey() && getApiKey() !== 'PLACEHOLDER_API_KEY' && getApiKey().length > 10 ? (
-                                    <span className="ml-auto text-[9px] bg-green-100 text-green-700 px-1.5 py-0.5 rounded-full font-bold">Connected</span>
+                                {hasUsableKey() ? (
+                                    <span className="ml-auto text-[9px] bg-green-100 text-green-700 px-1.5 py-0.5 rounded-full font-bold">Connected{serverKey?.masked ? ` · ${serverKey.masked}` : ''}</span>
                                 ) : (
                                     <span className="ml-auto text-[9px] bg-red-100 text-red-600 px-1.5 py-0.5 rounded-full font-bold">Not Set</span>
                                 )}
                             </div>
-                            <p className="text-[10px] text-stone-500 mb-2">Required for Auto-Learn, AI extraction from PDFs/URLs, and Summarize caption mode.</p>
+                            <p className="text-[10px] text-stone-500 mb-2">Required for the Municipality Wizard, Auto-Learn, AI extraction from PDFs/URLs, and Summarize caption mode.</p>
                             <div className="flex gap-2">
                                 <input
                                     type="password"
@@ -814,18 +1002,9 @@ const ContextEngine: React.FC<ContextEngineProps> = ({
                                     placeholder="AIzaSy..."
                                     className="flex-1 px-2 py-1.5 rounded-lg border border-stone-200 text-xs focus:outline-none focus:border-amber-400 bg-white"
                                 />
-                                <button onClick={() => {
-                                    if (tempKey && tempKey.length > 10) {
-                                        localStorage.setItem('cc_api_key', tempKey);
-                                        fetch(`${getRelayUrl()}/api/polisher/apikey`, {
-                                            method: 'POST',
-                                            headers: { 'Content-Type': 'application/json' },
-                                            body: JSON.stringify({ key: tempKey }),
-                                        });
-                                    }
-                                }} className="px-3 py-1.5 bg-amber-600 text-white text-xs font-bold rounded-lg hover:bg-amber-700">Save</button>
+                                <button onClick={() => saveKey(tempKey)} className="px-3 py-1.5 bg-amber-600 text-white text-xs font-bold rounded-lg hover:bg-amber-700">Save</button>
                             </div>
-                            <p className="text-[9px] text-stone-400 mt-1.5">Get a free key at <a href="https://aistudio.google.com/apikey" target="_blank" rel="noopener" className="underline text-amber-600">aistudio.google.com/apikey</a></p>
+                            <p className="text-[9px] text-stone-400 mt-1.5">Get a free key at <a href="https://aistudio.google.com/apikey" target="_blank" rel="noopener" className="underline text-amber-600">aistudio.google.com/apikey</a>{capabilities?.model ? ` · model: ${capabilities.model}` : ''}</p>
                         </div>
 
                         {/* Auto-Learn Section */}
@@ -841,6 +1020,7 @@ const ContextEngine: React.FC<ContextEngineProps> = ({
                                 <button onClick={() => {
                                     const newVal = !learnerEnabled;
                                     setLearnerEnabled(newVal);
+                                    setLearningEnabled(newVal);
                                     fetch(`${getRelayUrl()}/api/context/enable`, {
                                         method: 'POST',
                                         headers: { 'Content-Type': 'application/json' },
@@ -855,7 +1035,6 @@ const ContextEngine: React.FC<ContextEngineProps> = ({
                                 <div className="p-3 bg-green-50 text-[10px] text-green-700 space-y-2">
                                     {learnerStatus && learnerStatus.enabled ? (
                                         <>
-                                            {/* Live buffer progress */}
                                             <div>
                                                 <div className="flex justify-between items-center mb-1">
                                                     <span className="font-bold">Speech Buffer</span>
@@ -875,7 +1054,6 @@ const ContextEngine: React.FC<ContextEngineProps> = ({
                                                             : 'Buffer ready — extraction on next 30s cycle'}
                                                 </p>
                                             </div>
-                                            {/* Stats */}
                                             <div className="flex gap-3 pt-1 border-t border-green-200">
                                                 <div className="text-center flex-1">
                                                     <p className="font-bold text-green-800 text-sm">{learnerStatus.extractionCount || 0}</p>
@@ -896,9 +1074,8 @@ const ContextEngine: React.FC<ContextEngineProps> = ({
                                         </>
                                     ) : (
                                         <>
-                                            <p>Learned words appear as toasts in the bottom-right corner.</p>
-                                            <p>They auto-approve after 10 seconds. Click <strong>Reject</strong> to block a word.</p>
-                                            <p>Requires Gemini API key to be set above.</p>
+                                            <p>Learned words appear under <strong>AI Suggestions</strong> in the Active Rules panel and as toasts on the Dashboard.</p>
+                                            <p>Requires a Gemini API key and an active captioning session.</p>
                                         </>
                                     )}
                                 </div>
@@ -920,20 +1097,44 @@ const ContextEngine: React.FC<ContextEngineProps> = ({
                             </button>
                         </div>
 
-                        {/* Correction Sensitivity */}
-                        <div className="bg-white p-4 rounded-xl border border-stone-200">
-                            <h4 className="font-bold text-xs text-stone-700 mb-1">Correction Sensitivity</h4>
-                            <p className="text-[9px] text-stone-400 mb-2">How aggressively the engine applies dictionary substitutions.</p>
-                            <div className="flex items-center gap-3">
-                                <span className="text-[10px] font-bold text-stone-400 w-8">Loose</span>
+                        {/* Correction Sensitivity + live test */}
+                        <div className="bg-white p-4 rounded-xl border border-stone-200 space-y-3">
+                            <div>
+                                <h4 className="font-bold text-xs text-stone-700 mb-1">Correction Sensitivity</h4>
+                                <p className="text-[9px] text-stone-400 mb-2">Exact matches always apply. Higher settings also fix words that merely <em>sound like</em> a rule (phonetic matching), so "Perlman" becomes "Pearlman" without a rule for every misspelling.</p>
+                                <div className="flex items-center gap-3">
+                                    <span className="text-[10px] font-bold text-stone-400 w-8">Exact</span>
+                                    <input
+                                        type="range" min="0" max="100"
+                                        value={settings.sensitivity}
+                                        onChange={(e) => setSettings({...settings, sensitivity: Number(e.target.value)})}
+                                        className="flex-1 accent-forest-dark"
+                                    />
+                                    <span className="text-[10px] font-bold text-stone-400 w-10">Sounds-like</span>
+                                    <span className="text-[10px] font-mono bg-stone-100 px-1.5 py-0.5 rounded">{settings.sensitivity}%</span>
+                                </div>
+                                <p className="text-[9px] text-sage-700 mt-1 font-medium">
+                                    {settings.sensitivity < 30 ? 'Exact matches only.' : settings.sensitivity < 70 ? 'Exact + sounds-like for multi-word names (e.g. "bernard grene").' : 'Exact + sounds-like for multi-word names and single names (never common words).'}
+                                </p>
+                            </div>
+                            <div>
+                                <label className="text-[9px] font-bold text-stone-400 uppercase mb-1 flex items-center gap-1"><Wand2 size={10} /> Try a sentence</label>
                                 <input
-                                    type="range" min="0" max="100"
-                                    value={settings.sensitivity}
-                                    onChange={(e) => setSettings({...settings, sensitivity: Number(e.target.value)})}
-                                    className="flex-1 accent-forest-dark"
+                                    value={testSentence}
+                                    onChange={e => setTestSentence(e.target.value)}
+                                    placeholder="e.g. chair david perlman recognized bernard green"
+                                    className="w-full px-3 py-2 rounded-lg border border-stone-200 text-xs focus:outline-none focus:border-sage-500"
                                 />
-                                <span className="text-[10px] font-bold text-stone-400 w-8">Strict</span>
-                                <span className="text-[10px] font-mono bg-stone-100 px-1.5 py-0.5 rounded">{settings.sensitivity}%</span>
+                                {testResult && (
+                                    <div className="mt-2 text-[11px]">
+                                        <p className="text-forest-dark font-medium">{testResult.text}</p>
+                                        {testResult.applied.length > 0 ? (
+                                            <p className="text-[10px] text-stone-500 mt-1">{testResult.applied.map((a: any) => `${a.matched} → ${a.replacement}${a.mode === 'phonetic' ? ' (sounds-like)' : ''}`).join(' · ')}</p>
+                                        ) : (
+                                            <p className="text-[10px] text-stone-400 mt-1">No rule matched{dictionary.length === 0 ? ' — the dictionary is empty' : ''}.</p>
+                                        )}
+                                    </div>
+                                )}
                             </div>
                         </div>
 
@@ -955,7 +1156,7 @@ const ContextEngine: React.FC<ContextEngineProps> = ({
                             <p className="text-[9px] text-stone-400 mb-2">Helps the AI prioritize corrections for your broadcast type.</p>
                             <select
                                 value={settings.dialect}
-                                onChange={e => setSettings({...settings, dialect: e.target.value})}
+                                onChange={e => setSettings({...settings, dialect: e.target.value as any})}
                                 className="w-full px-3 py-2 rounded-lg border border-stone-200 text-xs bg-white focus:outline-none focus:border-forest-dark"
                             >
                                 <option value="general">General</option>
@@ -976,23 +1177,23 @@ const ContextEngine: React.FC<ContextEngineProps> = ({
                             <div className="space-y-2 text-[10px] text-stone-600 leading-relaxed">
                                 <div className="flex gap-2">
                                     <span className="bg-forest-dark text-white w-4 h-4 rounded-full flex items-center justify-center text-[8px] font-bold shrink-0 mt-0.5">1</span>
-                                    <p><strong>Before the broadcast:</strong> Upload the meeting agenda PDF or paste its text. The AI extracts all proper nouns, names, places, and acronyms into the dictionary.</p>
+                                    <p><strong>Run the Municipality Wizard:</strong> type your town (e.g. "Brookline, MA"). It researches current officials, boards, departments, places and acronyms with Google Search and builds correction rules in under a minute.</p>
                                 </div>
                                 <div className="flex gap-2">
                                     <span className="bg-forest-dark text-white w-4 h-4 rounded-full flex items-center justify-center text-[8px] font-bold shrink-0 mt-0.5">2</span>
-                                    <p><strong>Scrape the town website:</strong> Use the URL scraper to pull names from official pages (elected officials, committee rosters, etc.)</p>
+                                    <p><strong>Add tonight's agenda:</strong> drop the agenda PDF (or paste its text). Names of applicants, streets and projects specific to this meeting get added.</p>
                                 </div>
                                 <div className="flex gap-2">
                                     <span className="bg-forest-dark text-white w-4 h-4 rounded-full flex items-center justify-center text-[8px] font-bold shrink-0 mt-0.5">3</span>
-                                    <p><strong>Review the Active Rules:</strong> Check the dictionary on the right. Remove any entries that look wrong. Add manual corrections for words you know the STT engine gets wrong.</p>
+                                    <p><strong>Review the Active Rules:</strong> remove anything that looks wrong. Add manual corrections for words you know the speech engine gets wrong.</p>
                                 </div>
                                 <div className="flex gap-2">
                                     <span className="bg-forest-dark text-white w-4 h-4 rounded-full flex items-center justify-center text-[8px] font-bold shrink-0 mt-0.5">4</span>
-                                    <p><strong>Turn on Auto-Learn:</strong> During the broadcast, the AI listens to live captions and extracts new proper nouns it hasn't seen before. These appear as toast notifications that auto-approve after 10 seconds.</p>
+                                    <p><strong>Turn on Auto-Learn:</strong> during the broadcast the AI watches live captions and suggests new names it hasn't seen before.</p>
                                 </div>
                                 <div className="flex gap-2">
                                     <span className="bg-forest-dark text-white w-4 h-4 rounded-full flex items-center justify-center text-[8px] font-bold shrink-0 mt-0.5">5</span>
-                                    <p><strong>Name & Export:</strong> Give your engine a name (e.g. "Brookline Select Board") and click Activate. Export to JSON to reuse next time.</p>
+                                    <p><strong>Name & Export:</strong> the dictionary is saved in this browser automatically. Export to JSON to move it to another machine or share it.</p>
                                 </div>
                             </div>
                         </div>
@@ -1001,8 +1202,8 @@ const ContextEngine: React.FC<ContextEngineProps> = ({
                         <div className="bg-sage-50 rounded-xl border border-sage-200 p-3 space-y-1.5">
                             <h4 className="font-bold text-xs text-sage-700">Tips for Best Results</h4>
                             <ul className="text-[10px] text-stone-600 space-y-1 list-disc list-inside">
+                                <li>Include the state in the wizard search ("Newton, MA" not just "Newton")</li>
                                 <li>Upload the agenda <strong>before</strong> the meeting starts for immediate corrections</li>
-                                <li>The "Municipal Scraper" wizard can auto-find town websites for your area</li>
                                 <li>Manual entries work best for recurring mistakes (e.g. "brookline" always heard as "Brooklyn")</li>
                                 <li>Export your engine after each meeting to build a reusable dictionary over time</li>
                                 <li>The profanity filter works independently of the dictionary</li>
@@ -1015,17 +1216,17 @@ const ContextEngine: React.FC<ContextEngineProps> = ({
                             <h3 className="text-sm font-bold text-stone-500 uppercase">Raw JSON Editor</h3>
                             <button onClick={handleSaveRaw} className="text-xs bg-forest-dark text-white px-3 py-1 rounded font-bold hover:bg-forest-light">Save Changes</button>
                         </div>
-                        <textarea 
+                        <textarea
                             value={rawJson}
                             onChange={(e) => setRawJson(e.target.value)}
                             className="flex-1 w-full bg-stone-900 text-green-400 font-mono text-xs p-4 rounded-xl outline-none resize-none"
                             spellCheck="false"
                         />
                     </div>
-                ) : view === 'main' ? (
+                ) : (
                     <div className="p-6 space-y-6 animate-fade-in overflow-y-auto custom-scrollbar">
 
-                        {/* === API KEY STATUS BANNER — always visible at the top === */}
+                        {/* === API KEY STATUS BANNER === */}
                         <div className={`rounded-2xl border-2 p-4 transition-all ${
                             hasUsableKey()
                                 ? 'bg-green-50 border-green-200'
@@ -1049,7 +1250,7 @@ const ContextEngine: React.FC<ContextEngineProps> = ({
                                                 </span>
                                             </div>
                                             <p className="text-[11px] text-green-700 mt-0.5">
-                                                Municipality search, PDF extraction, and Auto-Learn are ready.
+                                                Municipality Wizard, PDF extraction, and Auto-Learn are ready.
                                                 {serverKey?.masked && ` Key: ${serverKey.masked}`}
                                             </p>
                                         </>
@@ -1089,18 +1290,7 @@ const ContextEngine: React.FC<ContextEngineProps> = ({
                                         className="flex-1 px-3 py-2 rounded-lg border border-amber-300 text-xs focus:outline-none focus:border-amber-500 bg-white font-mono"
                                     />
                                     <button
-                                        onClick={async () => {
-                                            if (tempKey && tempKey.length > 10) {
-                                                localStorage.setItem('cc_api_key', tempKey);
-                                                await fetch(`${getRelayUrl()}/api/polisher/apikey`, {
-                                                    method: 'POST',
-                                                    headers: { 'Content-Type': 'application/json' },
-                                                    body: JSON.stringify({ key: tempKey }),
-                                                }).catch(() => {});
-                                                await refreshServerKey();
-                                                setShowInlineKeyForm(false);
-                                            }
-                                        }}
+                                        onClick={async () => { await saveKey(tempKey); setShowInlineKeyForm(false); }}
                                         disabled={!tempKey || tempKey.length < 10}
                                         className="px-4 py-2 bg-forest-dark text-white text-xs font-bold rounded-lg disabled:opacity-40"
                                     >
@@ -1110,7 +1300,7 @@ const ContextEngine: React.FC<ContextEngineProps> = ({
                             )}
                         </div>
 
-                        {/* === MUNICIPALITY WIZARD — inline at top === */}
+                        {/* === MUNICIPALITY WIZARD === */}
                         <div className={`bg-gradient-to-br from-forest-dark to-forest-light rounded-2xl shadow-xl relative overflow-hidden ${!hasUsableKey() ? 'opacity-60' : ''}`}>
                             <div className="absolute top-0 right-0 w-32 h-32 bg-white/10 rounded-full -translate-y-1/2 translate-x-1/2 blur-2xl"></div>
                             <div className="p-5 relative z-10">
@@ -1118,180 +1308,231 @@ const ContextEngine: React.FC<ContextEngineProps> = ({
                                     <div className="w-10 h-10 bg-white/20 rounded-xl flex items-center justify-center text-white">
                                         <Globe size={22} />
                                     </div>
-                                    <div className="flex-1">
+                                    <div className="flex-1 min-w-0">
                                         <div className="flex items-center gap-2">
                                             <h4 className="font-bold text-base text-white">Municipality Wizard</h4>
                                             {!hasUsableKey() && (
                                                 <span className="text-[9px] bg-amber-400 text-amber-900 px-1.5 py-0.5 rounded font-bold uppercase">Needs API Key</span>
                                             )}
                                         </div>
-                                        <p className="text-sage-100 text-[10px] opacity-80">AI finds and scrapes your town's official web pages</p>
+                                        <p className="text-sage-100 text-[10px] opacity-80">Researches your town with Google Search: officials, boards, departments, places and acronyms → correction rules</p>
                                     </div>
+                                    {wizardState !== 'idle' && (
+                                        <button onClick={resetWizard} title="Start over" className="text-white/70 hover:text-white p-1.5 rounded-lg hover:bg-white/10"><RotateCcw size={14} /></button>
+                                    )}
                                 </div>
 
-                                {/* Inline search */}
                                 <div className="flex gap-2">
                                     <input
                                         value={searchQuery}
                                         onChange={e => setSearchQuery(e.target.value)}
-                                        onKeyDown={e => e.key === 'Enter' && !isProcessing && searchQuery.trim() && hasUsableKey() && (() => { setWizardInline(true); handleMunicipalitySearch(); })()}
-                                        placeholder={hasUsableKey() ? "e.g. Brookline, MA" : "Add an API key above to enable search"}
+                                        onKeyDown={e => e.key === 'Enter' && wizardState !== 'running' && searchQuery.trim() && hasUsableKey() && handleWizardResearch()}
+                                        placeholder={hasUsableKey() ? "e.g. Brookline, MA" : "Add an API key above to enable the wizard"}
                                         className="flex-1 px-4 py-2.5 rounded-xl text-sm bg-white/95 text-forest-dark placeholder:text-stone-400 outline-none focus:ring-2 focus:ring-white/50 disabled:bg-white/60"
-                                        disabled={isProcessing || !hasUsableKey()}
+                                        disabled={wizardState === 'running' || !hasUsableKey()}
                                     />
                                     <button
-                                        onClick={() => { setWizardInline(true); handleMunicipalitySearch(); }}
-                                        disabled={isProcessing || !searchQuery.trim() || !hasUsableKey()}
+                                        onClick={handleWizardResearch}
+                                        disabled={wizardState === 'running' || !searchQuery.trim() || !hasUsableKey()}
                                         className="px-4 py-2.5 bg-white text-forest-dark rounded-xl font-bold text-sm hover:bg-sage-50 transition-colors disabled:opacity-50 flex items-center gap-1.5"
                                     >
-                                        {isProcessing ? <Loader2 size={14} className="animate-spin" /> : <Search size={14} />}
-                                        {isProcessing ? '' : 'Search'}
+                                        {wizardState === 'running' ? <Loader2 size={14} className="animate-spin" /> : <Search size={14} />}
+                                        {wizardState === 'running' ? `${(wizardElapsed / 1000).toFixed(0)}s` : 'Research'}
                                     </button>
                                 </div>
-                                {isProcessing && wizardPhase && (
+                                {wizardState === 'running' && wizardStatusLine && (
                                     <p className="text-[11px] text-white mt-2 flex items-center gap-2 bg-white/10 px-2.5 py-1.5 rounded-lg">
                                         <Loader2 size={11} className="animate-spin shrink-0" />
-                                        <span className="font-medium">{wizardPhase}</span>
+                                        <span className="font-medium truncate">{wizardStatusLine}</span>
                                     </p>
-                                )}
-                                {!isProcessing && wizardPhase && (
-                                    <p className="text-[11px] text-sage-100 mt-2 px-2.5 py-1.5 rounded-lg bg-white/10">{wizardPhase}</p>
                                 )}
                             </div>
 
-                            {/* Inline results — shown below search without leaving main view */}
-                            {wizardInline && searchResults.length > 0 && wizardProgress.length === 0 && (
-                                <div className="bg-white rounded-b-2xl p-4 space-y-2 border-t border-stone-200">
-                                    <div className="flex justify-between items-center">
-                                        <p className="text-xs font-bold text-forest-dark">Found {searchResults.length} sources</p>
-                                        <button onClick={() => { setSearchResults([]); setWizardInline(false); }} className="text-[10px] text-stone-400 hover:text-stone-600">Dismiss</button>
-                                    </div>
-                                    <div className="max-h-40 overflow-y-auto space-y-1.5">
-                                        {searchResults.map((result: any, i: number) => (
-                                            <div
-                                                key={i}
-                                                onClick={() => setSelectedSources(prev => prev.includes(i) ? prev.filter(x => x !== i) : [...prev, i])}
-                                                className={`p-2 rounded-lg border cursor-pointer transition-all flex items-center gap-2 ${selectedSources.includes(i) ? 'border-sage-400 bg-sage-50' : 'border-stone-100 hover:border-sage-300'}`}
-                                            >
-                                                <div className={`w-4 h-4 rounded-full border-2 flex items-center justify-center shrink-0 ${selectedSources.includes(i) ? 'border-sage-500 bg-sage-500 text-white' : 'border-stone-300'}`}>
-                                                    {selectedSources.includes(i) && <CheckCircle size={10} />}
-                                                </div>
-                                                <div className="min-w-0 flex-1">
-                                                    <p className="text-[10px] font-bold text-forest-dark truncate">{result.title}</p>
-                                                    <a href={result.url} target="_blank" rel="noopener noreferrer" onClick={e => e.stopPropagation()} className="text-[8px] text-sage-600 hover:text-sage-800 underline font-mono truncate block">{result.url}</a>
-                                                </div>
-                                                <span className={`text-[8px] font-bold px-1.5 py-0.5 rounded shrink-0 ${
-                                                    result.type === 'Officials' ? 'bg-blue-100 text-blue-700' :
-                                                    result.type === 'Meetings' ? 'bg-purple-100 text-purple-700' :
-                                                    result.type === 'Departments' ? 'bg-green-100 text-green-700' :
-                                                    'bg-stone-100 text-stone-600'
-                                                }`}>{result.type}</span>
-                                            </div>
-                                        ))}
-                                    </div>
-                                    <button
-                                        onClick={handleBuildEngine}
-                                        disabled={selectedSources.length === 0}
-                                        className="w-full py-2 bg-forest-dark text-white rounded-xl text-xs font-bold hover:bg-forest-light disabled:opacity-50 transition-colors"
-                                    >
-                                        Scrape {selectedSources.length} Source{selectedSources.length !== 1 ? 's' : ''}
-                                    </button>
-                                </div>
-                            )}
-
-                            {/* Inline scraping progress — live stream with phases + ETA + entry feed */}
-                            {wizardInline && wizardProgress.length > 0 && (
-                                <div className="bg-white rounded-b-2xl p-4 space-y-3 border-t border-stone-200">
-                                    {/* Header row: status + ETA */}
-                                    <div className="flex justify-between items-center">
-                                        <p className="text-xs font-bold text-forest-dark">
-                                            {wizardProgress.every(p => p.status === 'done' || p.status === 'failed')
-                                                ? `Done — extracted ${wizardExtracted.length} new entries from ${wizardProgress.filter(p => p.status === 'done').length} pages`
-                                                : `Scraping page ${wizardProgress.filter(p => p.status !== 'pending').length} of ${wizardProgress.length}`}
-                                        </p>
-                                        {wizardEtaMs !== null && wizardEtaMs > 0 && (
-                                            <span className="text-[10px] font-mono bg-sage-100 text-sage-700 px-2 py-0.5 rounded">
-                                                ~{(wizardEtaMs / 1000).toFixed(0)}s remaining
+                            {wizardState !== 'idle' && (
+                                <div className="bg-white rounded-b-2xl border-t border-stone-200">
+                                    {/* Steps */}
+                                    <div className="p-4 space-y-1.5">
+                                        <div className="flex items-center gap-2 text-[11px]">
+                                            <StatusIcon status={locateStatus} />
+                                            <span className="font-bold text-forest-dark">Official website</span>
+                                            <span className="text-stone-500 truncate">
+                                                {locateStatus === 'running' ? 'Searching…' : wizardHost ? wizardHost : locateStatus === 'failed' ? 'Not found' : ''}
                                             </span>
-                                        )}
-                                    </div>
-                                    {/* Progress bar */}
-                                    <div className="w-full bg-stone-100 rounded-full h-1.5">
-                                        <div className="bg-sage-500 h-1.5 rounded-full transition-all duration-500" style={{ width: `${Math.round((wizardProgress.filter(p => p.status === 'done' || p.status === 'failed').length / Math.max(wizardProgress.length, 1)) * 100)}%` }} />
-                                    </div>
-
-                                    {/* Live per-URL feed */}
-                                    <div className="max-h-44 overflow-y-auto space-y-1.5">
-                                        {wizardLive.map((p, i) => {
-                                            const host = (() => { try { return new URL(p.url).hostname.replace(/^www\./, ''); } catch { return p.url; } })();
+                                            {wizardSources.length > 0 && (
+                                                <button onClick={() => setShowSources(s => !s)} className="ml-auto text-[10px] font-bold text-sage-700 hover:text-sage-900 flex items-center gap-1 shrink-0">
+                                                    {showSources ? <ChevronDown size={12} /> : <ChevronRight size={12} />} {wizardSources.length} pages
+                                                </button>
+                                            )}
+                                        </div>
+                                        {wizardGroups.map(g => {
+                                            const Icon = GROUP_ICONS[g.key] || Sparkles;
+                                            const sel = g.items.filter(it => wizardSelected.has(it.id)).length;
                                             return (
-                                                <div key={i} className={`p-2 rounded-lg border text-[10px] ${
-                                                    p.phase === 'queued' ? 'bg-white border-stone-100' :
-                                                    p.phase === 'done' ? 'bg-green-50 border-green-200' :
-                                                    p.phase === 'failed' ? 'bg-red-50 border-red-200' :
-                                                    'bg-sage-50 border-sage-200'
-                                                }`}>
-                                                    <div className="flex items-center gap-2">
-                                                        {p.phase === 'queued' && <div className="w-3 h-3 rounded-full border border-stone-200 shrink-0" />}
-                                                        {(p.phase === 'fetching' || p.phase === 'fetched' || p.phase === 'parsing' || p.phase === 'parsed' || p.phase === 'extracting') && <Loader2 size={12} className="animate-spin text-sage-600 shrink-0" />}
-                                                        {p.phase === 'done' && <CheckCircle size={12} className="text-green-600 shrink-0" />}
-                                                        {p.phase === 'failed' && <X size={12} className="text-red-500 shrink-0" />}
-                                                        <a href={p.url} target="_blank" rel="noopener noreferrer" className="font-mono text-sage-700 hover:text-sage-900 underline truncate flex-1">{host}</a>
-                                                        {p.entries > 0 && <span className="text-green-700 font-bold shrink-0">+{p.entries}</span>}
-                                                        {p.phase !== 'queued' && p.elapsedMs > 0 && (
-                                                            <span className="font-mono text-stone-400 shrink-0 text-[9px]">{(p.elapsedMs / 1000).toFixed(1)}s</span>
-                                                        )}
-                                                    </div>
-                                                    {p.detail && p.phase !== 'queued' && (
-                                                        <p className={`ml-5 mt-0.5 ${p.phase === 'failed' ? 'text-red-600' : 'text-stone-500'}`}>
-                                                            {p.detail}
-                                                        </p>
+                                                <div key={g.key} className="flex items-center gap-2 text-[11px]">
+                                                    <StatusIcon status={g.status} />
+                                                    <Icon size={12} className="text-stone-400 shrink-0" />
+                                                    <span className="font-bold text-forest-dark">{g.label}</span>
+                                                    <span className="text-stone-500 truncate">
+                                                        {g.status === 'running' ? 'Researching…' : g.status === 'failed' ? (g.error || 'Failed') : `${g.items.length} found`}
+                                                    </span>
+                                                    {g.status === 'done' && g.items.length > 0 && (
+                                                        <span className="ml-auto text-[10px] font-mono text-stone-400 shrink-0">{sel}/{g.items.length} selected · {((g.elapsedMs || 0) / 1000).toFixed(0)}s</span>
                                                     )}
                                                 </div>
                                             );
                                         })}
+                                        {wizardError && (
+                                            <div className="flex items-start gap-2 text-[11px] text-red-700 bg-red-50 border border-red-200 rounded-lg p-2 mt-1">
+                                                <AlertTriangle size={13} className="shrink-0 mt-0.5" />
+                                                <span>{wizardError}</span>
+                                            </div>
+                                        )}
+                                        {wizardNote && !wizardError && (
+                                            <p className="text-[10px] text-amber-700 bg-amber-50 border border-amber-200 rounded-lg px-2 py-1 mt-1">{wizardNote}</p>
+                                        )}
                                     </div>
 
-                                    {/* Live entry stream — appears as they're extracted */}
-                                    {recentEntries.length > 0 && (
-                                        <div className="bg-stone-50 rounded-lg border border-stone-200 p-2.5">
-                                            <div className="flex items-center justify-between mb-1.5">
-                                                <p className="text-[9px] font-bold text-stone-500 uppercase tracking-wider">Latest entries</p>
-                                                <span className="text-[9px] font-mono text-sage-600">{wizardExtracted.length} total</span>
+                                    {/* Sources (collapsible) + deep scan */}
+                                    {showSources && wizardSources.length > 0 && (
+                                        <div className="px-4 pb-4 space-y-2 border-t border-stone-100 pt-3">
+                                            <div className="flex items-center justify-between">
+                                                <p className="text-[10px] font-bold text-stone-500 uppercase tracking-wider">Official pages found</p>
+                                                <div className="flex gap-2 text-[10px] font-bold">
+                                                    <button onClick={() => setSelectedSources(wizardSources.map((_, i) => i))} className="text-sage-700 hover:underline">All</button>
+                                                    <button onClick={() => setSelectedSources([])} className="text-stone-400 hover:underline">None</button>
+                                                </div>
                                             </div>
-                                            <div className="flex flex-wrap gap-1">
-                                                {recentEntries.slice(0, 12).map((e, i) => (
-                                                    <span key={i} className={`text-[10px] px-1.5 py-0.5 rounded border animate-fade-in ${
-                                                        e.type === 'acronym' ? 'bg-purple-50 border-purple-200 text-purple-700' :
-                                                        e.type === 'place' ? 'bg-green-50 border-green-200 text-green-700' :
-                                                        'bg-white border-stone-200 text-stone-700'
-                                                    }`}>
-                                                        {e.replacement}
-                                                    </span>
-                                                ))}
+                                            <div className="max-h-44 overflow-y-auto space-y-1 custom-scrollbar">
+                                                {wizardSources.map((s, i) => {
+                                                    const host = (() => { try { return new URL(s.url).hostname.replace(/^www\./, ''); } catch { return s.url; } })();
+                                                    const on = selectedSources.includes(i);
+                                                    return (
+                                                        <div key={i} onClick={() => setSelectedSources(prev => on ? prev.filter(x => x !== i) : [...prev, i])}
+                                                            className={`p-2 rounded-lg border cursor-pointer transition-all flex items-center gap-2 ${on ? 'border-sage-400 bg-sage-50' : 'border-stone-100 hover:border-sage-300'}`}>
+                                                            <div className={`w-4 h-4 rounded-full border-2 flex items-center justify-center shrink-0 ${on ? 'border-sage-500 bg-sage-500 text-white' : 'border-stone-300'}`}>
+                                                                {on && <CheckCircle size={10} />}
+                                                            </div>
+                                                            <div className="min-w-0 flex-1">
+                                                                <p className="text-[10px] font-bold text-forest-dark truncate">{s.title}</p>
+                                                                <p className="text-[8px] text-stone-400 font-mono truncate">{host}{(() => { try { return new URL(s.url).pathname; } catch { return ''; } })()}</p>
+                                                            </div>
+                                                            {s.blocked && <span title="Site blocks bots — Gemini will read it" className="text-[8px] text-amber-700 bg-amber-50 border border-amber-200 px-1 rounded shrink-0">AI read</span>}
+                                                            {s.isPdf && <span className="text-[8px] text-stone-500 bg-stone-100 px-1 rounded shrink-0">PDF</span>}
+                                                            <span className={`text-[8px] font-bold px-1.5 py-0.5 rounded shrink-0 ${
+                                                                s.type === 'Officials' ? 'bg-blue-100 text-blue-700' :
+                                                                s.type === 'Meetings' ? 'bg-purple-100 text-purple-700' :
+                                                                s.type === 'Departments' ? 'bg-green-100 text-green-700' :
+                                                                s.type === 'Committees' ? 'bg-amber-100 text-amber-700' :
+                                                                'bg-stone-100 text-stone-600'
+                                                            }`}>{s.type}</span>
+                                                            <a href={s.url} target="_blank" rel="noopener noreferrer" onClick={e => e.stopPropagation()} className="text-stone-300 hover:text-sage-700 shrink-0"><ExternalLink size={11} /></a>
+                                                        </div>
+                                                    );
+                                                })}
                                             </div>
+                                            {scanLive.length === 0 ? (
+                                                <button onClick={handleDeepScan} disabled={selectedSources.length === 0 || scanRunning || wizardState === 'running'}
+                                                    className="w-full py-2 bg-stone-800 text-white rounded-xl text-xs font-bold hover:bg-stone-700 disabled:opacity-40 transition-colors">
+                                                    Deep scan {selectedSources.length} page{selectedSources.length !== 1 ? 's' : ''} for more names
+                                                </button>
+                                            ) : (
+                                                <div className="space-y-2">
+                                                    <div className="max-h-40 overflow-y-auto space-y-1 custom-scrollbar">
+                                                        {scanLive.map((p, i) => {
+                                                            const host = (() => { try { const u = new URL(p.url); return u.hostname.replace(/^www\./, '') + u.pathname; } catch { return p.url; } })();
+                                                            return (
+                                                                <div key={i} className={`p-2 rounded-lg border text-[10px] ${p.phase === 'queued' ? 'bg-white border-stone-100' : p.phase === 'done' ? 'bg-green-50 border-green-200' : p.phase === 'failed' ? 'bg-red-50 border-red-200' : 'bg-sage-50 border-sage-200'}`}>
+                                                                    <div className="flex items-center gap-2">
+                                                                        <StatusIcon status={p.phase === 'queued' ? 'pending' : p.phase === 'done' ? 'done' : p.phase === 'failed' ? 'failed' : 'running'} />
+                                                                        <span className="font-mono text-sage-700 truncate flex-1">{host}</span>
+                                                                        {p.entries > 0 && <span className="text-green-700 font-bold shrink-0">+{p.entries}</span>}
+                                                                        {p.phase !== 'queued' && p.elapsedMs > 0 && <span className="font-mono text-stone-400 shrink-0 text-[9px]">{(p.elapsedMs / 1000).toFixed(1)}s</span>}
+                                                                    </div>
+                                                                    {p.detail && p.phase !== 'queued' && <p className={`ml-5 mt-0.5 ${p.phase === 'failed' ? 'text-red-600' : 'text-stone-500'}`}>{p.detail}</p>}
+                                                                </div>
+                                                            );
+                                                        })}
+                                                    </div>
+                                                    {scanRecent.length > 0 && (
+                                                        <div className="flex flex-wrap gap-1">
+                                                            {scanRecent.slice(0, 16).map((e, i) => (
+                                                                <span key={i} className={`text-[10px] px-1.5 py-0.5 rounded border ${e.type === 'acronym' ? 'bg-purple-50 border-purple-200 text-purple-700' : e.type === 'place' ? 'bg-green-50 border-green-200 text-green-700' : 'bg-white border-stone-200 text-stone-700'}`}>{e.replacement}</span>
+                                                            ))}
+                                                        </div>
+                                                    )}
+                                                    {!scanRunning && (
+                                                        <div className="flex gap-2">
+                                                            <button onClick={handleScanAccept} disabled={scanExtracted.length === 0} className="flex-1 py-2 bg-forest-dark text-white rounded-xl text-xs font-bold hover:bg-forest-light disabled:opacity-40">
+                                                                {scanExtracted.length > 0 ? `Add ${scanExtracted.length} new entries from pages` : 'No new entries found on these pages'}
+                                                            </button>
+                                                            <button onClick={() => { setScanLive([]); setScanExtracted([]); setScanRecent([]); }} className="px-3 py-2 bg-white border border-stone-200 rounded-xl text-xs font-bold text-stone-500 hover:bg-stone-50">Clear</button>
+                                                        </div>
+                                                    )}
+                                                </div>
+                                            )}
                                         </div>
                                     )}
 
-                                    {/* Accept button when done */}
-                                    {wizardProgress.every(p => p.status === 'done' || p.status === 'failed') && wizardExtracted.length > 0 && (
-                                        <div className="flex gap-2 pt-1">
-                                            <button onClick={handleWizardAccept} className="flex-1 py-2 bg-forest-dark text-white rounded-xl text-xs font-bold hover:bg-forest-light transition-colors">
-                                                Add {wizardExtracted.length} Entries
-                                            </button>
-                                            <button onClick={() => { setWizardExtracted([]); setWizardProgress([]); setWizardLive([]); setRecentEntries([]); setSearchResults([]); setWizardInline(false); }} className="px-3 py-2 bg-white border border-stone-200 rounded-xl text-xs font-bold text-stone-500 hover:bg-stone-50">
-                                                Discard
-                                            </button>
+                                    {/* Research results */}
+                                    {wizardItems.length > 0 && (
+                                        <div className="px-4 pb-4 space-y-2 border-t border-stone-100 pt-3">
+                                            <div className="flex items-center justify-between">
+                                                <p className="text-xs font-bold text-forest-dark">{wizardItems.length} names · {wizardTotalEntries} correction rules</p>
+                                                <div className="flex gap-2 text-[10px] font-bold">
+                                                    <button onClick={() => setWizardSelected(new Set(wizardItems.map(it => it.id)))} className="text-sage-700 hover:underline">Select all</button>
+                                                    <button onClick={() => setWizardSelected(new Set())} className="text-stone-400 hover:underline">None</button>
+                                                </div>
+                                            </div>
+                                            <div className="max-h-72 overflow-y-auto space-y-2 custom-scrollbar pr-1">
+                                                {wizardGroups.filter(g => g.items.length > 0).map(g => {
+                                                    const Icon = GROUP_ICONS[g.key] || Sparkles;
+                                                    const collapsed = wizardCollapsed.has(g.key);
+                                                    const sel = g.items.filter(it => wizardSelected.has(it.id)).length;
+                                                    return (
+                                                        <div key={g.key} className="rounded-lg border border-stone-200 overflow-hidden">
+                                                            <div className="flex items-center gap-2 px-2 py-1.5 bg-stone-50 text-[10px]">
+                                                                <button onClick={() => setWizardCollapsed(prev => { const n = new Set(prev); if (n.has(g.key)) n.delete(g.key); else n.add(g.key); return n; })} className="flex items-center gap-1 font-bold text-forest-dark">
+                                                                    {collapsed ? <ChevronRight size={12} /> : <ChevronDown size={12} />}
+                                                                    <Icon size={11} className="text-stone-400" /> {g.label}
+                                                                </button>
+                                                                <span className="text-stone-400">{sel}/{g.items.length}</span>
+                                                                <div className="ml-auto flex gap-2 font-bold">
+                                                                    <button onClick={() => setGroupSelected(g.key, true)} className="text-sage-700 hover:underline">all</button>
+                                                                    <button onClick={() => setGroupSelected(g.key, false)} className="text-stone-400 hover:underline">none</button>
+                                                                </div>
+                                                            </div>
+                                                            {!collapsed && (
+                                                                <div className="divide-y divide-stone-100">
+                                                                    {g.items.map(it => {
+                                                                        const on = wizardSelected.has(it.id);
+                                                                        return (
+                                                                            <label key={it.id} className={`flex items-center gap-2 px-2 py-1 cursor-pointer text-[10px] ${on ? 'bg-white' : 'bg-stone-50/60 opacity-60'}`}>
+                                                                                <input type="checkbox" checked={on} onChange={() => toggleWizardItem(it.id)} className="accent-forest-dark shrink-0" />
+                                                                                <span className="font-bold text-forest-dark truncate">{it.name}</span>
+                                                                                {it.detail && <span className="text-stone-500 truncate">· {it.detail}</span>}
+                                                                                <span className="ml-auto text-[9px] font-mono text-stone-400 shrink-0" title={it.entries.map(e => e.original).join(', ')}>{it.entries.length} rule{it.entries.length === 1 ? '' : 's'}</span>
+                                                                            </label>
+                                                                        );
+                                                                    })}
+                                                                </div>
+                                                            )}
+                                                        </div>
+                                                    );
+                                                })}
+                                            </div>
+                                            <div className="flex gap-2 pt-1 items-center">
+                                                <button onClick={handleWizardAdd} disabled={wizardSelectedItems.length === 0 || wizardState === 'running'}
+                                                    className="flex-1 py-2 bg-forest-dark text-white rounded-xl text-xs font-bold hover:bg-forest-light disabled:opacity-50 transition-colors">
+                                                    Add {wizardSelectedItems.length} name{wizardSelectedItems.length === 1 ? '' : 's'} ({wizardSelectedEntryCount} rules) to dictionary
+                                                </button>
+                                                {wizardAdded !== null && (
+                                                    <span className="text-[10px] font-bold text-green-700 bg-green-50 border border-green-200 px-2 py-1 rounded-lg shrink-0">{wizardAdded} added</span>
+                                                )}
+                                            </div>
                                         </div>
                                     )}
-                                    {/* Empty result */}
-                                    {wizardProgress.every(p => p.status === 'done' || p.status === 'failed') && wizardExtracted.length === 0 && (
-                                        <div className="text-center py-2">
-                                            <p className="text-[10px] text-stone-500">No new entries found. Try a different search or upload an agenda PDF directly.</p>
-                                            <button onClick={() => { setWizardProgress([]); setWizardLive([]); setSearchResults([]); setWizardInline(false); }} className="mt-2 text-[10px] font-bold text-sage-600 hover:text-sage-800 underline">
-                                                Dismiss
-                                            </button>
-                                        </div>
+                                    {wizardState === 'done' && wizardItems.length === 0 && !wizardError && (
+                                        <p className="px-4 pb-4 text-[10px] text-stone-500">Nothing found. Try adding the state ("Brookline, MA") or a more specific name.</p>
                                     )}
                                 </div>
                             )}
@@ -1303,7 +1544,7 @@ const ContextEngine: React.FC<ContextEngineProps> = ({
                             <p className="text-[10px] text-stone-400">Add the people and terms for today's meeting</p>
                         </div>
 
-                        {/* 1. Quick Names — the #1 most useful tool */}
+                        {/* 1. Quick Names */}
                         <div className="bg-white rounded-xl border-2 border-sage-200 p-4 space-y-3 shadow-sm">
                             <div className="flex items-center gap-2">
                                 <div className="w-6 h-6 bg-sage-500 rounded-lg flex items-center justify-center text-white"><Type size={12} /></div>
@@ -1327,24 +1568,8 @@ const ContextEngine: React.FC<ContextEngineProps> = ({
                                 {quickNamesProcessing ? <><Loader2 size={12} className="animate-spin" /> Generating STT corrections...</> : <><Sparkles size={12} /> Generate Corrections</>}
                             </button>
                             {quickNamesResult && <p className="text-[10px] text-sage-600 font-medium">{quickNamesResult}</p>}
-                            {/* Preview */}
                             {quickNamesPreview && (
-                                <div className="bg-sage-50 rounded-lg border border-sage-200 p-3 space-y-2">
-                                    <p className="text-[9px] font-bold text-sage-700 uppercase">Preview — {quickNamesPreview.length} corrections</p>
-                                    <div className="max-h-32 overflow-y-auto space-y-1">
-                                        {quickNamesPreview.map((e, i) => (
-                                            <div key={i} className="flex items-center gap-2 text-[10px]">
-                                                <span className="text-red-400 line-through">{e.original}</span>
-                                                <ArrowRight size={8} className="text-stone-300" />
-                                                <span className="font-bold text-forest-dark">{e.replacement}</span>
-                                            </div>
-                                        ))}
-                                    </div>
-                                    <div className="flex gap-2 pt-1">
-                                        <button onClick={handleAcceptQuickNames} className="flex-1 px-3 py-1.5 bg-sage-500 text-white text-[10px] font-bold rounded-lg hover:bg-sage-600">Add All to Dictionary</button>
-                                        <button onClick={() => setQuickNamesPreview(null)} className="px-3 py-1.5 bg-white border border-stone-200 text-[10px] font-bold rounded-lg text-stone-500 hover:bg-stone-50">Discard</button>
-                                    </div>
-                                </div>
+                                <PreviewList entries={quickNamesPreview} accent="sage" title={`Preview — ${quickNamesPreview.length} corrections`} onAccept={handleAcceptQuickNames} onDiscard={() => setQuickNamesPreview(null)} />
                             )}
                         </div>
 
@@ -1400,7 +1625,54 @@ const ContextEngine: React.FC<ContextEngineProps> = ({
                             <p className="text-[10px] text-stone-400">Extract names from agendas and documents</p>
                         </div>
 
-                        {/* 3. Paste Agenda Text — with preview */}
+                        {/* 3. Drag & Drop Upload — with preview */}
+                        <div className="space-y-2">
+                            <div
+                                onDragEnter={handleDrag}
+                                onDragLeave={handleDrag}
+                                onDragOver={handleDrag}
+                                onDrop={handleDrop}
+                                onClick={() => !uploading && fileUploadRef.current?.click()}
+                                className={`border-2 border-dashed rounded-2xl h-28 flex flex-col items-center justify-center text-center p-4 transition-all cursor-pointer ${dragActive ? 'border-sage-500 bg-sage-50' : 'border-stone-200 hover:border-sage-400 hover:bg-stone-50'}`}
+                            >
+                                {uploading ? (
+                                    <>
+                                        <Loader2 size={24} className="animate-spin text-sage-500 mb-2" />
+                                        <p className="text-xs font-bold text-sage-600">Reading document & extracting names…</p>
+                                        <p className="text-[10px] text-stone-400">Long agendas take 10–30 seconds</p>
+                                    </>
+                                ) : (
+                                    <>
+                                        <Upload size={24} className={`mb-2 ${dragActive ? 'text-sage-600' : 'text-stone-300'}`} />
+                                        <p className="text-xs font-bold text-stone-600">Drop Agenda PDF Here</p>
+                                        <p className="text-[10px] text-stone-400">PDF, Word (.docx) or text · or click to choose</p>
+                                        {capabilities && !capabilities.pdf && <p className="text-[9px] text-red-500 mt-1">PDF parsing unavailable on this server</p>}
+                                    </>
+                                )}
+                                <input
+                                    ref={fileUploadRef}
+                                    type="file"
+                                    className="hidden"
+                                    accept=".pdf,.txt,.docx,.html,.htm,.md"
+                                    onChange={async (e) => {
+                                        const file = e.target.files?.[0];
+                                        if (file) await handleFileUpload(file);
+                                        e.target.value = '';
+                                    }}
+                                />
+                            </div>
+                            {uploadResult && (
+                                <p className={`text-[10px] font-medium flex items-start gap-1.5 ${uploadResult.kind === 'ok' ? 'text-green-700' : uploadResult.kind === 'warn' ? 'text-amber-700' : 'text-red-600'}`}>
+                                    {uploadResult.kind !== 'ok' && <AlertTriangle size={11} className="shrink-0 mt-0.5" />}
+                                    <span>{uploadResult.text}</span>
+                                </p>
+                            )}
+                            {uploadPreview && (
+                                <PreviewList entries={uploadPreview.entries} accent="sage" title={`${uploadPreview.filename} — ${uploadPreview.entries.length} entries, review before adding`} onAccept={handleAcceptUpload} onDiscard={() => { setUploadPreview(null); setUploadResult(null); }} />
+                            )}
+                        </div>
+
+                        {/* 4. Paste Agenda Text — with preview */}
                         <div className="bg-white rounded-xl border border-stone-200 p-4 space-y-3">
                             <div className="flex items-center gap-2">
                                 <div className="w-6 h-6 bg-purple-500 rounded-lg flex items-center justify-center text-white"><FileText size={12} /></div>
@@ -1420,85 +1692,9 @@ const ContextEngine: React.FC<ContextEngineProps> = ({
                                 {extracting ? <><Loader2 size={12} className="animate-spin" /> Analyzing text...</> : 'Extract Names & Terms'}
                             </button>
                             {pasteResult && !pastePreview && <p className="text-[10px] text-purple-600 font-medium">{pasteResult}</p>}
-                            {/* Preview before adding */}
                             {pastePreview && (
-                                <div className="bg-purple-50 rounded-lg border border-purple-200 p-3 space-y-2">
-                                    <p className="text-[9px] font-bold text-purple-700 uppercase">Found {pastePreview.length} entries — review before adding</p>
-                                    <div className="max-h-32 overflow-y-auto space-y-1">
-                                        {pastePreview.map((e, i) => (
-                                            <div key={i} className="flex items-center gap-2 text-[10px]">
-                                                <span className="text-red-400 line-through">{e.original}</span>
-                                                <ArrowRight size={8} className="text-stone-300" />
-                                                <span className="font-bold text-forest-dark">{e.replacement}</span>
-                                                <span className={`text-[8px] px-1 py-0.5 rounded ${e.type === 'acronym' ? 'bg-purple-100 text-purple-600' : 'bg-blue-100 text-blue-600'}`}>{e.type}</span>
-                                            </div>
-                                        ))}
-                                    </div>
-                                    <div className="flex gap-2 pt-1">
-                                        <button onClick={handleAcceptPastePreview} className="flex-1 px-3 py-1.5 bg-purple-500 text-white text-[10px] font-bold rounded-lg hover:bg-purple-600">Add All to Dictionary</button>
-                                        <button onClick={() => setPastePreview(null)} className="px-3 py-1.5 bg-white border border-stone-200 text-[10px] font-bold rounded-lg text-stone-500 hover:bg-stone-50">Discard</button>
-                                    </div>
-                                </div>
+                                <PreviewList entries={pastePreview} accent="purple" title={`Found ${pastePreview.length} entries — review before adding`} onAccept={handleAcceptPastePreview} onDiscard={() => setPastePreview(null)} />
                             )}
-                        </div>
-
-                        {/* 4. Drag & Drop Upload */}
-                        <div
-                            onDragEnter={handleDrag}
-                            onDragLeave={handleDrag}
-                            onDragOver={handleDrag}
-                            onDrop={handleDrop}
-                            onClick={() => fileUploadRef.current?.click()}
-                            className={`border-2 border-dashed rounded-2xl h-28 flex flex-col items-center justify-center text-center p-4 transition-all cursor-pointer ${dragActive ? 'border-sage-500 bg-sage-50' : 'border-stone-200 hover:border-sage-400 hover:bg-stone-50'}`}
-                        >
-                            {uploading ? (
-                                <>
-                                    <Loader2 size={24} className="animate-spin text-sage-500 mb-2" />
-                                    <p className="text-xs font-bold text-sage-600">Extracting names & terms...</p>
-                                </>
-                            ) : (
-                                <>
-                                    <Upload size={24} className={`mb-2 ${dragActive ? 'text-sage-600' : 'text-stone-300'}`} />
-                                    <p className="text-xs font-bold text-stone-600">Drop Agenda PDFs Here</p>
-                                    <p className="text-[10px] text-stone-400">or click to upload</p>
-                                </>
-                            )}
-                            <input
-                                ref={fileUploadRef}
-                                type="file"
-                                className="hidden"
-                                accept=".pdf,.txt,.doc,.docx,.json"
-                                onChange={async (e) => {
-                                    const file = e.target.files?.[0];
-                                    if (!file) return;
-                                    setUploading(true);
-                                    const formData = new FormData();
-                                    formData.append('file', file);
-                                    try {
-                                        const res = await fetch(`${getRelayUrl()}/api/context/upload-pdf`, {
-                                            method: 'POST',
-                                            headers: { 'X-Api-Key': getApiKey() },
-                                            body: formData,
-                                        });
-                                        const data = await res.json();
-                                        if (data.ok && data.entries?.length > 0) {
-                                            const newEntries = data.entries.map((entry: any) => ({
-                                                original: entry.original,
-                                                replacement: entry.replacement,
-                                                type: entry.type || 'proper_noun',
-                                            }));
-                                            setDictionary(prev => [...prev, ...newEntries]);
-                                            alert(`Extracted ${data.entries.length} entries from ${file.name}`);
-                                        } else {
-                                            alert(data.warning || data.error || `No entries found in ${file.name}`);
-                                        }
-                                    } catch (err) {
-                                        alert('Upload failed: ' + (err as Error).message);
-                                    }
-                                    setUploading(false);
-                                    e.target.value = '';
-                                }}
-                            />
                         </div>
 
                         {/* === ADVANCED TOOLS === */}
@@ -1510,244 +1706,36 @@ const ContextEngine: React.FC<ContextEngineProps> = ({
                         <div className="bg-white rounded-xl border border-stone-200 p-4 space-y-3">
                             <div className="flex items-center gap-2">
                                 <div className="w-6 h-6 bg-stone-400 rounded-lg flex items-center justify-center text-white"><Link size={12} /></div>
-                                <label className="text-xs font-bold text-forest-dark">Scrape URL</label>
+                                <div>
+                                    <label className="text-xs font-bold text-forest-dark">Scrape URL</label>
+                                    <p className="text-[9px] text-stone-400">Any web page or online PDF (agenda portals, rosters). Sites that block bots are read by Gemini.</p>
+                                </div>
                             </div>
                             <div className="flex gap-2">
                                 <input
                                     type="url"
                                     value={scrapeUrl}
                                     onChange={e => setScrapeUrl(e.target.value)}
+                                    onKeyDown={e => e.key === 'Enter' && !scraping && scrapeUrl.trim() && handleScrapeUrl()}
                                     placeholder="https://townsite.gov/elected-officials"
                                     className="flex-1 px-3 py-2 rounded-lg border border-stone-200 text-xs focus:outline-none focus:border-forest-dark"
                                 />
                                 <button
                                     onClick={handleScrapeUrl}
-                                    disabled={scraping || !scrapeUrl}
+                                    disabled={scraping || !scrapeUrl.trim()}
                                     className="px-4 py-2 rounded-lg bg-forest-dark text-white text-xs font-bold hover:opacity-90 disabled:opacity-40 flex items-center gap-1.5"
                                 >
                                     {scraping ? <Loader2 size={12} className="animate-spin" /> : 'Scrape'}
                                 </button>
                             </div>
-                            {scrapeResult && <p className="text-[10px] text-green-600">{scrapeResult}</p>}
+                            {scrapeResult && !scrapePreview && (
+                                <p className={`text-[10px] font-medium ${scrapeResult.kind === 'ok' ? 'text-green-700' : scrapeResult.kind === 'warn' ? 'text-amber-700' : 'text-red-600'}`}>{scrapeResult.text}</p>
+                            )}
+                            {scrapePreview && (
+                                <PreviewList entries={scrapePreview} accent="sage" title={scrapeResult?.text || `${scrapePreview.length} entries`} onAccept={() => { const n = addEntries(scrapePreview, 'url'); setScrapePreview(null); setScrapeResult({ text: `Added ${n} entries`, kind: 'ok' }); setScrapeUrl(''); }} onDiscard={() => { setScrapePreview(null); setScrapeResult(null); }} />
+                            )}
                         </div>
 
-                    </div>
-                ) : (
-                    // Wizard Views
-                    <div className="p-8 h-full flex flex-col animate-fade-in">
-                        <button onClick={() => setView('main')} className="mb-6 text-stone-500 hover:text-forest-dark flex items-center gap-2 text-sm font-bold">
-                            <ArrowRight className="rotate-180" size={16} /> Back to Tools
-                        </button>
-                        
-                        {view === 'wizard_search' && (
-                            <div className="flex-1 flex flex-col justify-center items-center text-center">
-                                <div className="w-20 h-20 bg-sage-100 rounded-full flex items-center justify-center mb-6 text-forest-dark">
-                                    <MapPin size={40} />
-                                </div>
-                                <h3 className="text-2xl font-display font-bold text-forest-dark mb-3">Municipality Scraper</h3>
-
-                                {showKeyPrompt ? (
-                                    <div className="w-full max-w-sm bg-orange-50 p-4 rounded-xl border border-orange-200 animate-slide-up">
-                                        <div className="flex items-center gap-2 text-orange-700 font-bold text-sm mb-2">
-                                            <Key size={16} /> API Key Required
-                                        </div>
-                                        <p className="text-xs text-stone-600 mb-3 text-left">Gemini AI is needed to find and analyze municipal web pages.</p>
-                                        <input
-                                            type="password"
-                                            value={tempKey}
-                                            onChange={e => setTempKey(e.target.value)}
-                                            placeholder="Paste Gemini API Key..."
-                                            className="w-full border border-stone-200 rounded p-2 text-sm mb-2"
-                                        />
-                                        <button
-                                            onClick={() => { setShowKeyPrompt(false); handleMunicipalitySearch(); }}
-                                            disabled={!tempKey}
-                                            className="w-full bg-forest-dark text-white py-2 rounded font-bold text-sm disabled:opacity-50"
-                                        >
-                                            Save & Continue
-                                        </button>
-                                    </div>
-                                ) : (
-                                    <>
-                                        <p className="text-stone-500 mb-4 max-w-sm text-sm">Enter a municipality name. We'll find their official web pages and scrape them for council members, department heads, street names, and local terminology.</p>
-                                        <div className="relative w-full max-w-sm">
-                                            <input
-                                                value={searchQuery}
-                                                onChange={(e) => setSearchQuery(e.target.value)}
-                                                onKeyDown={(e) => e.key === 'Enter' && !isProcessing && handleMunicipalitySearch()}
-                                                placeholder="e.g. Brookline, MA"
-                                                className="w-full text-lg px-6 py-4 bg-white border-2 border-stone-200 rounded-xl shadow-sm focus:border-sage-500 outline-none pr-14"
-                                                autoFocus
-                                                disabled={isProcessing}
-                                            />
-                                            <button
-                                                onClick={handleMunicipalitySearch}
-                                                disabled={isProcessing || !searchQuery.trim()}
-                                                className="absolute right-2 top-2 bottom-2 w-12 bg-forest-dark text-white rounded-lg hover:bg-forest-light transition-colors flex items-center justify-center disabled:opacity-50"
-                                            >
-                                                {isProcessing ? <Loader2 className="animate-spin" size={20} /> : <ArrowRight size={20} />}
-                                            </button>
-                                        </div>
-                                        {isProcessing && (
-                                            <p className="text-xs text-sage-600 mt-3 animate-pulse">{wizardPhase || `Finding official web pages for ${searchQuery}...`}</p>
-                                        )}
-                                    </>
-                                )}
-                            </div>
-                        )}
-
-                        {view === 'wizard_select' && (
-                             <div className="flex-1 flex flex-col">
-                                <div className="mb-4">
-                                    <h3 className="text-xl font-display font-bold text-forest-dark mb-1">Found {searchResults.length} Sources</h3>
-                                    <p className="text-stone-500 text-sm">Select pages to scrape. Each URL will be fetched and analyzed for proper nouns.</p>
-                                </div>
-                                <div className="flex-1 overflow-y-auto space-y-2 pr-2 custom-scrollbar">
-                                    {searchResults.map((result: any, i: number) => (
-                                        <div
-                                            key={i}
-                                            onClick={() => setSelectedSources(prev => prev.includes(i) ? prev.filter(x => x !== i) : [...prev, i])}
-                                            className={`p-3 rounded-xl border-2 cursor-pointer transition-all ${selectedSources.includes(i) ? 'border-sage-500 bg-sage-50' : 'border-stone-100 bg-white hover:border-sage-300'}`}
-                                        >
-                                            <div className="flex justify-between items-start gap-2">
-                                                <div className="flex-1 min-w-0">
-                                                    <div className="flex items-center gap-2 mb-1">
-                                                        <span className={`text-[9px] font-bold uppercase px-1.5 py-0.5 rounded ${
-                                                            result.type === 'Officials' ? 'bg-blue-100 text-blue-700' :
-                                                            result.type === 'Meetings' ? 'bg-purple-100 text-purple-700' :
-                                                            result.type === 'Departments' ? 'bg-green-100 text-green-700' :
-                                                            result.type === 'Committees' ? 'bg-amber-100 text-amber-700' :
-                                                            'bg-stone-100 text-stone-600'
-                                                        }`}>{result.type}</span>
-                                                        <h4 className="font-bold text-forest-dark text-sm truncate">{result.title}</h4>
-                                                    </div>
-                                                    <a href={result.url} target="_blank" rel="noopener noreferrer" onClick={e => e.stopPropagation()} className="text-[10px] text-sage-600 hover:text-sage-800 underline font-mono truncate block">{result.url}</a>
-                                                    {result.why && <p className="text-xs text-stone-500 mt-1">{result.why}</p>}
-                                                </div>
-                                                <div className={`w-5 h-5 rounded-full border-2 flex items-center justify-center shrink-0 mt-1 ${selectedSources.includes(i) ? 'border-sage-500 bg-sage-500 text-white' : 'border-stone-300'}`}>
-                                                    {selectedSources.includes(i) && <CheckCircle size={12} />}
-                                                </div>
-                                            </div>
-                                        </div>
-                                    ))}
-                                </div>
-                                <div className="pt-4 mt-auto flex gap-2">
-                                    <button onClick={() => setView('wizard_search')} className="px-4 py-3 rounded-xl font-bold text-sm text-stone-500 hover:bg-stone-100 transition-colors">
-                                        Back
-                                    </button>
-                                    <button
-                                        onClick={handleBuildEngine}
-                                        disabled={selectedSources.length === 0}
-                                        className="flex-1 bg-forest-dark text-white py-3 rounded-xl font-bold hover:bg-forest-light disabled:opacity-50 shadow-lg transition-colors"
-                                    >
-                                        Scrape {selectedSources.length} Source{selectedSources.length !== 1 ? 's' : ''}
-                                    </button>
-                                </div>
-                            </div>
-                        )}
-
-                        {view === 'wizard_analyze' && (
-                            <div className="flex-1 flex flex-col">
-                                <div className="mb-4 flex items-end justify-between gap-4">
-                                    <div>
-                                        <h3 className="text-xl font-display font-bold text-forest-dark mb-1">Scraping & Extracting</h3>
-                                        <p className="text-stone-500 text-sm">
-                                            {wizardProgress.every(p => p.status === 'done' || p.status === 'failed')
-                                                ? `Done! Found ${wizardExtracted.length} new dictionary entries.`
-                                                : `Working on page ${wizardProgress.filter(p => p.status !== 'pending').length} of ${wizardProgress.length}…`
-                                            }
-                                        </p>
-                                    </div>
-                                    {wizardEtaMs !== null && wizardEtaMs > 0 && (
-                                        <div className="text-right">
-                                            <p className="text-[10px] text-stone-400 uppercase font-bold tracking-wider">Est. remaining</p>
-                                            <p className="text-lg font-mono font-bold text-sage-600">{(wizardEtaMs / 1000).toFixed(0)}s</p>
-                                        </div>
-                                    )}
-                                </div>
-
-                                {/* Progress bar */}
-                                <div className="w-full bg-stone-100 rounded-full h-2 mb-4">
-                                    <div
-                                        className="bg-sage-500 h-2 rounded-full transition-all duration-500"
-                                        style={{ width: `${Math.round((wizardProgress.filter(p => p.status === 'done' || p.status === 'failed').length / Math.max(wizardProgress.length, 1)) * 100)}%` }}
-                                    />
-                                </div>
-
-                                {/* Per-URL streaming detail */}
-                                <div className="flex-1 overflow-y-auto space-y-2 pr-2 custom-scrollbar">
-                                    {wizardLive.map((p, i) => {
-                                        const host = (() => { try { return new URL(p.url).hostname.replace(/^www\./, ''); } catch { return p.url; } })();
-                                        return (
-                                            <div key={i} className={`p-3 rounded-lg border ${
-                                                p.phase === 'queued' ? 'border-stone-100 bg-white' :
-                                                p.phase === 'done' ? 'border-green-200 bg-green-50' :
-                                                p.phase === 'failed' ? 'border-red-200 bg-red-50' :
-                                                'border-sage-300 bg-sage-50'
-                                            }`}>
-                                                <div className="flex items-center gap-3">
-                                                    <div className="shrink-0">
-                                                        {p.phase === 'queued' && <div className="w-5 h-5 rounded-full border-2 border-stone-200" />}
-                                                        {(p.phase === 'fetching' || p.phase === 'fetched' || p.phase === 'parsing' || p.phase === 'parsed' || p.phase === 'extracting') && <Loader2 size={20} className="animate-spin text-sage-600" />}
-                                                        {p.phase === 'done' && <CheckCircle size={20} className="text-green-600" />}
-                                                        {p.phase === 'failed' && <X size={20} className="text-red-500" />}
-                                                    </div>
-                                                    <div className="flex-1 min-w-0">
-                                                        <div className="flex items-center gap-2">
-                                                            <a href={p.url} target="_blank" rel="noopener noreferrer" className="text-xs font-mono text-sage-700 hover:text-sage-900 underline truncate">{host}</a>
-                                                            {p.entries > 0 && <span className="text-[10px] bg-green-200 text-green-800 font-bold px-1.5 py-0.5 rounded shrink-0">+{p.entries}</span>}
-                                                        </div>
-                                                        {p.detail && p.phase !== 'queued' && (
-                                                            <p className={`text-[11px] mt-0.5 ${p.phase === 'failed' ? 'text-red-600' : p.phase === 'done' ? 'text-green-700' : 'text-sage-700'}`}>
-                                                                {p.detail}
-                                                            </p>
-                                                        )}
-                                                    </div>
-                                                    {p.phase !== 'queued' && p.elapsedMs > 0 && (
-                                                        <span className="text-[10px] font-mono text-stone-400 shrink-0">{(p.elapsedMs / 1000).toFixed(1)}s</span>
-                                                    )}
-                                                </div>
-                                            </div>
-                                        );
-                                    })}
-                                </div>
-
-                                {/* Live extracted entries — appears as Gemini returns them */}
-                                {recentEntries.length > 0 && (
-                                    <div className="mt-3 p-3 bg-stone-50 rounded-lg border border-stone-200 max-h-32 overflow-y-auto">
-                                        <div className="flex items-center justify-between mb-2">
-                                            <p className="text-[10px] font-bold text-stone-400 uppercase tracking-wider">Live Stream — {wizardExtracted.length} new entries</p>
-                                            <span className="text-[9px] font-mono text-sage-600">most recent first</span>
-                                        </div>
-                                        <div className="flex flex-wrap gap-1">
-                                            {recentEntries.slice(0, 30).map((e, i) => (
-                                                <span key={i} className={`text-[10px] px-1.5 py-0.5 rounded border animate-fade-in ${
-                                                    e.type === 'acronym' ? 'bg-purple-50 border-purple-200 text-purple-700' :
-                                                    e.type === 'place' ? 'bg-green-50 border-green-200 text-green-700' :
-                                                    'bg-white border-stone-200 text-stone-700'
-                                                }`}>{e.replacement}</span>
-                                            ))}
-                                        </div>
-                                    </div>
-                                )}
-
-                                {/* Action buttons */}
-                                {wizardProgress.every(p => p.status === 'done' || p.status === 'failed') && (
-                                    <div className="pt-4 mt-auto flex gap-2">
-                                        <button onClick={() => { setWizardExtracted([]); setWizardProgress([]); setWizardLive([]); setRecentEntries([]); setView('wizard_select'); }} className="px-4 py-3 rounded-xl font-bold text-sm text-stone-500 hover:bg-stone-100 transition-colors">
-                                            Back
-                                        </button>
-                                        <button
-                                            onClick={handleWizardAccept}
-                                            disabled={wizardExtracted.length === 0}
-                                            className="flex-1 bg-forest-dark text-white py-3 rounded-xl font-bold hover:bg-forest-light disabled:opacity-50 shadow-lg transition-colors"
-                                        >
-                                            Add {wizardExtracted.length} Entries to Dictionary
-                                        </button>
-                                    </div>
-                                )}
-                            </div>
-                        )}
                     </div>
                 )}
             </div>
@@ -1841,7 +1829,7 @@ const ContextEngine: React.FC<ContextEngineProps> = ({
                                             body: JSON.stringify({ id: s.id }),
                                         }).then(r => r.json()).then(data => {
                                             if (data.ok && data.entry) {
-                                                setDictionary([...dictionary, data.entry]);
+                                                addEntries([data.entry], 'auto_learned');
                                                 setSuggestions(prev => prev.filter(x => x.id !== s.id));
                                             }
                                         });
@@ -1863,9 +1851,10 @@ const ContextEngine: React.FC<ContextEngineProps> = ({
                     <div className="bg-white border border-stone-200 p-4 rounded-xl shadow-sm mb-6 flex gap-4 items-end">
                         <div className="flex-1">
                             <label className="text-[10px] font-bold text-stone-400 uppercase tracking-wider mb-1 block">Incorrect (Input)</label>
-                            <input 
+                            <input
                                 value={manualOriginal}
                                 onChange={(e) => setManualOriginal(e.target.value)}
+                                onKeyDown={e => e.key === 'Enter' && addManualEntry()}
                                 placeholder="e.g. Steven Woo"
                                 className="w-full bg-stone-50 border border-stone-200 rounded-lg p-2 text-sm outline-none focus:border-sage-500"
                             />
@@ -1873,14 +1862,15 @@ const ContextEngine: React.FC<ContextEngineProps> = ({
                         <div className="flex items-center pb-3 text-stone-300"><ArrowRight size={20} /></div>
                         <div className="flex-1">
                              <label className="text-[10px] font-bold text-stone-400 uppercase tracking-wider mb-1 block">Correct (Output)</label>
-                            <input 
+                            <input
                                 value={manualReplacement}
                                 onChange={(e) => setManualReplacement(e.target.value)}
+                                onKeyDown={e => e.key === 'Enter' && addManualEntry()}
                                 placeholder="e.g. Stephen Wu"
                                 className="w-full bg-stone-50 border border-stone-200 rounded-lg p-2 text-sm outline-none focus:border-sage-500"
                             />
                         </div>
-                        <button 
+                        <button
                             onClick={addManualEntry}
                             disabled={!manualOriginal || !manualReplacement}
                             className="bg-sage-100 hover:bg-sage-200 text-forest-dark p-2.5 rounded-lg disabled:opacity-50 transition-colors"
@@ -1895,7 +1885,7 @@ const ContextEngine: React.FC<ContextEngineProps> = ({
                             <div className="text-center py-20 opacity-40">
                                 <Sparkles size={48} className="mx-auto mb-4 text-stone-400" />
                                 <h4 className="text-xl font-bold text-stone-400">Context Empty</h4>
-                                <p className="text-stone-400">Add rules manually or use the Ingestion Tools.</p>
+                                <p className="text-stone-400">Run the Municipality Wizard, drop an agenda PDF, or add rules manually.</p>
                             </div>
                          ) : (
                              dictionary
@@ -1904,7 +1894,7 @@ const ContextEngine: React.FC<ContextEngineProps> = ({
                                     if (dictTypeFilter && (entry.type || 'proper_noun') !== dictTypeFilter) return false;
                                     if (dictSearch) {
                                         const q = dictSearch.toLowerCase();
-                                        return entry.original.toLowerCase().includes(q) || entry.replacement.toLowerCase().includes(q);
+                                        return entry.original.toLowerCase().includes(q) || entry.replacement.toLowerCase().includes(q) || (entry.note || '').toLowerCase().includes(q);
                                     }
                                     return true;
                                 })
@@ -1921,10 +1911,13 @@ const ContextEngine: React.FC<ContextEngineProps> = ({
                                              entry.type === 'place' ? 'PL' :
                                              entry.type === 'acronym' ? 'AC' : 'FX'}
                                         </div>
-                                        <div className="flex items-center gap-2 min-w-0">
-                                            <span className="text-red-400 line-through text-sm truncate">{entry.original}</span>
-                                            <ArrowRight size={12} className="text-stone-300 shrink-0" />
-                                            <span className="text-forest-dark font-bold text-sm truncate">{entry.replacement}</span>
+                                        <div className="flex flex-col min-w-0">
+                                            <div className="flex items-center gap-2 min-w-0">
+                                                <span className="text-red-400 line-through text-sm truncate">{entry.original}</span>
+                                                <ArrowRight size={12} className="text-stone-300 shrink-0" />
+                                                <span className="text-forest-dark font-bold text-sm truncate">{entry.replacement}</span>
+                                            </div>
+                                            {entry.note && <span className="text-[10px] text-stone-400 truncate">{entry.note}</span>}
                                         </div>
                                     </div>
                                     <button

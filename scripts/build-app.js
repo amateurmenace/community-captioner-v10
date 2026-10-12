@@ -42,6 +42,8 @@ if (!platformFlag) platformFlag = currentPlatform;
 
 const buildMac = platformFlag === 'mac' || platformFlag === 'all';
 const buildWin = platformFlag === 'win' || platformFlag === 'all';
+// --notarize (or NOTARIZE=1): submit the signed .app to Apple and staple the ticket
+const notarize = args.includes('--notarize') || /^(1|true|yes)$/i.test(process.env.NOTARIZE || '');
 
 if (!buildMac && !buildWin) {
   console.error(`Unknown platform "${platformFlag}". Use: mac, win, or all`);
@@ -263,10 +265,12 @@ function buildMacApp(binaryPath, version) {
 
   // Write a shell script that opens Terminal.app running the binary.
   // This ensures the user sees server logs when double-clicking the .app.
+  // If Terminal automation is denied (or osascript fails), run the binary
+  // directly so the app still starts and opens the browser.
   const launchScript = `#!/bin/bash
 DIR="$(cd "$(dirname "$0")" && pwd)"
 BIN="$DIR/CommunityCaptioner-bin"
-osascript - "$BIN" <<'END_SCRIPT'
+osascript - "$BIN" <<'END_SCRIPT' || exec "$BIN"
 on run argv
   set binPath to item 1 of argv
   tell application "Terminal"
@@ -283,7 +287,211 @@ END_SCRIPT
   const distSrc = path.join(ROOT, 'dist');
   fs.cpSync(distSrc, path.join(resourcesDir, 'dist'), { recursive: true });
 
+  // Bundle the macOS DeckLink addon next to the binary. relay.js falls back to
+  // <exe dir>/decklink_addon.node when the in-tree path isn't available (pkg).
+  const macAddon = path.join(ROOT, 'native', 'decklink', 'build', 'Release', 'decklink_addon.node');
+  if (fs.existsSync(macAddon)) {
+    fs.copyFileSync(macAddon, path.join(macosDir, 'decklink_addon.node'));
+    console.log('  Bundled macOS DeckLink addon (native/decklink/build/Release/decklink_addon.node)');
+  } else {
+    console.warn('  WARNING: no macOS DeckLink addon found — run "npm run build:native" first for SDI caption injection.');
+  }
+
+  // Bundle .env.local (Gemini key) so the Context Engine works out-of-box,
+  // mirroring the Windows bundle. It lives in Resources/ (not MacOS/) because
+  // codesign refuses non-code files inside Contents/MacOS. relay.js checks
+  // <Resources>/.env.local (the parent of DIST_PATH) as well as <exe dir>.
+  const envSrc = path.join(ROOT, '.env.local');
+  if (fs.existsSync(envSrc)) {
+    fs.copyFileSync(envSrc, path.join(resourcesDir, '.env.local'));
+    console.log('  Bundled .env.local (Gemini API key) into Resources/ — anyone with this build can use that key.');
+  }
+
+  // Operator-facing readme shipped next to the .app in the zip
+  fs.writeFileSync(path.join(BUILD, 'README-MAC.txt'), createMacReadme(version));
+
   return appDir;
+}
+
+function createMacReadme(version) {
+  return `Community Captioner ${version} — macOS (Apple Silicon)
+=====================================================
+
+FIRST LAUNCH
+  macOS blocks apps downloaded outside the App Store the first time.
+  Either: right-click "Community Captioner.app" → Open → Open,
+  or: System Settings → Privacy & Security → scroll down → "Open Anyway".
+  (The app is signed but not notarized; this prompt appears once.)
+
+WHAT HAPPENS
+  1. A Terminal window opens showing the relay server log.
+  2. Your browser opens http://localhost:8080 automatically.
+  3. Close the Terminal window (or press Ctrl+C in it) to stop.
+  The app asks for Microphone access the first time you press Start.
+
+SDI CAPTION INJECTION (DeckLink)
+  Install Blackmagic Desktop Video 12+ first (free, blackmagicdesign.com/support).
+  The DeckLink addon is bundled inside the app; the Caption Injection screen
+  shows "driver loaded" when a device is detected.
+
+GEMINI API KEY
+  Needed for the Municipality Wizard, PDF extraction, Auto-Learn, Summarize
+  mode and translation. Enter it in Context Engine → Settings, or edit the
+  .env.local file inside "Community Captioner.app/Contents/Resources/".
+
+PHONE / AUDIENCE VIEW
+  Press the QR button on the dashboard. A public link (Cloudflare tunnel) is
+  created automatically when the machine has internet access.
+`;
+}
+
+/**
+ * Sign the .app so Apple Silicon will run it. Uses the "Developer ID
+ * Application" identity from the keychain when present, otherwise ad-hoc.
+ * Inner Mach-O binaries are signed first, then the bundle. With a Developer ID
+ * the hardened runtime is enabled (required for notarization) using
+ * electron/entitlements.mac.plist, which allows JIT (Node), loading the
+ * DeckLink framework signed by Blackmagic, microphone and network.
+ * Returns the identity used.
+ */
+function signMacApp(appDir) {
+  let identity = '-';
+  try {
+    const out = execSync('security find-identity -v -p codesigning', { encoding: 'utf8' });
+    const m = out.match(/"(Developer ID Application: [^"]+)"/);
+    if (m) identity = m[1];
+  } catch {}
+
+  const macosDir = path.join(appDir, 'Contents', 'MacOS');
+  const entitlements = path.join(ROOT, 'electron', 'entitlements.mac.plist');
+  const addon = path.join(macosDir, 'decklink_addon.node');
+  const bin = path.join(macosDir, 'CommunityCaptioner-bin');
+
+  // Anything that is not code inside Contents/MacOS breaks the bundle seal
+  // (e.g. a .data folder left behind by a test launch of the binary).
+  for (const entry of fs.readdirSync(macosDir)) {
+    if (!['decklink_addon.node', 'CommunityCaptioner-bin', 'CommunityCaptioner'].includes(entry)) {
+      fs.rmSync(path.join(macosDir, entry), { recursive: true, force: true });
+      console.log(`  Removed stray ${entry} from Contents/MacOS before signing`);
+    }
+  }
+
+  const signWith = (id) => {
+    const devId = id !== '-';
+    const ts = devId ? '--timestamp' : '';
+    const runtime = devId ? '--options runtime' : '';
+    const ent = devId && fs.existsSync(entitlements) ? `--entitlements "${entitlements}"` : '';
+    if (fs.existsSync(addon)) execSync(`codesign --force --sign "${id}" ${runtime} ${ts} "${addon}"`, { stdio: 'inherit' });
+    if (fs.existsSync(bin)) execSync(`codesign --force --sign "${id}" ${runtime} ${ent} ${ts} "${bin}"`, { stdio: 'inherit' });
+    execSync(`codesign --force --sign "${id}" ${runtime} ${ent} ${ts} "${appDir}"`, { stdio: 'inherit' });
+  };
+
+  let used = identity;
+  try {
+    signWith(identity);
+    console.log(`  Signed with: ${identity === '-' ? 'ad-hoc signature (no Developer ID in keychain)' : `${identity} (hardened runtime)`}`);
+  } catch (e) {
+    console.warn('  Code signing with identity failed:', e.message);
+    if (identity !== '-') {
+      try { signWith('-'); used = '-'; console.log('  Fell back to ad-hoc signature'); } catch (e2) { console.warn('  Ad-hoc signing failed too:', e2.message); }
+    }
+  }
+  try {
+    execSync(`codesign --verify --deep --strict "${appDir}"`, { stdio: 'inherit' });
+    console.log('  Signature verified');
+  } catch { console.warn('  Signature verification failed (app may still run locally)'); }
+  return used;
+}
+
+/**
+ * Notarize the signed .app with Apple and staple the ticket, so Gatekeeper
+ * opens it without the "unidentified developer" prompt.
+ *
+ * Credentials (first match wins):
+ *   1. NOTARY_PROFILE            keychain profile created once with
+ *                                `xcrun notarytool store-credentials <name> --apple-id … --team-id … --password <app-specific>`
+ *                                (default profile name: "community-captioner")
+ *   2. APPLE_API_KEY (.p8 path) + APPLE_API_KEY_ID + APPLE_API_ISSUER   App Store Connect API key
+ *   3. APPLE_ID + APPLE_APP_SPECIFIC_PASSWORD + APPLE_TEAM_ID             Apple ID
+ * Returns true on success. Throws if credentials are missing or Apple rejects the build.
+ */
+function notarizeMacApp(appDir) {
+  const profile = process.env.NOTARY_PROFILE || 'community-captioner';
+  let auth = null;
+  const hasProfile = (() => {
+    try { execSync(`xcrun notarytool history --keychain-profile "${profile}"`, { stdio: 'pipe' }); return true; } catch { return false; }
+  })();
+  if (hasProfile) auth = `--keychain-profile "${profile}"`;
+  else if (process.env.APPLE_API_KEY && process.env.APPLE_API_KEY_ID && process.env.APPLE_API_ISSUER)
+    auth = `--key "${process.env.APPLE_API_KEY}" --key-id "${process.env.APPLE_API_KEY_ID}" --issuer "${process.env.APPLE_API_ISSUER}"`;
+  else if (process.env.APPLE_ID && process.env.APPLE_APP_SPECIFIC_PASSWORD && process.env.APPLE_TEAM_ID)
+    auth = `--apple-id "${process.env.APPLE_ID}" --password "${process.env.APPLE_APP_SPECIFIC_PASSWORD}" --team-id "${process.env.APPLE_TEAM_ID}"`;
+  if (!auth) {
+    throw new Error(
+      `No notarization credentials. Run once:\n` +
+      `    xcrun notarytool store-credentials ${profile} --apple-id <your Apple ID email> --team-id 6M536MV7GT --password <app-specific password>\n` +
+      `  (create the app-specific password at https://account.apple.com → Sign-In and Security → App-Specific Passwords),\n` +
+      `  or set APPLE_API_KEY/APPLE_API_KEY_ID/APPLE_API_ISSUER, or APPLE_ID/APPLE_APP_SPECIFIC_PASSWORD/APPLE_TEAM_ID.`
+    );
+  }
+
+  const tmpZip = path.join(BUILD, '_notarize-upload.zip');
+  if (fs.existsSync(tmpZip)) fs.rmSync(tmpZip);
+  execSync(`ditto -c -k --sequesterRsrc --keepParent "${appDir}" "${tmpZip}"`, { stdio: 'inherit' });
+  console.log(`  Submitting ${(fs.statSync(tmpZip).size / 1024 / 1024).toFixed(1)} MB to Apple notary service (usually 1–10 minutes)…`);
+
+  let submitOut = '';
+  try {
+    submitOut = execSync(`xcrun notarytool submit "${tmpZip}" ${auth} --wait --timeout 45m --output-format json`, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'inherit'] });
+  } catch (e) {
+    submitOut = (e.stdout || '').toString();
+    if (!submitOut) throw new Error(`notarytool submit failed: ${e.message}`);
+  } finally {
+    if (fs.existsSync(tmpZip)) fs.rmSync(tmpZip);
+  }
+
+  let result = {};
+  try { result = JSON.parse(submitOut); } catch { throw new Error(`Unexpected notarytool output: ${submitOut.slice(0, 400)}`); }
+  console.log(`  Submission ${result.id || '?'}: ${result.status || 'unknown'}`);
+  if (result.status !== 'Accepted') {
+    if (result.id) {
+      try {
+        const log = execSync(`xcrun notarytool log "${result.id}" ${auth}`, { encoding: 'utf8' });
+        console.error('  Notary log:\n' + log.split('\n').map(l => '    ' + l).join('\n'));
+      } catch {}
+    }
+    throw new Error(`Apple did not accept the build (status: ${result.status || 'unknown'})`);
+  }
+
+  execSync(`xcrun stapler staple "${appDir}"`, { stdio: 'inherit' });
+  execSync(`xcrun stapler validate "${appDir}"`, { stdio: 'inherit' });
+  try {
+    execSync(`spctl --assess --type execute --verbose=2 "${appDir}"`, { stdio: 'inherit' });
+    console.log('  Gatekeeper assessment: accepted (notarized + stapled)');
+  } catch { console.warn('  Gatekeeper assessment did not pass — the ticket is stapled but spctl rejected it; check the output above'); }
+  return true;
+}
+
+function zipMacApp(appDir, version, notarized = false) {
+  const zipPath = path.join(BUILD, `Community-Captioner-${version}-mac-arm64.zip`);
+  if (fs.existsSync(zipPath)) fs.rmSync(zipPath);
+  // Stage app + readme in a temp folder so the zip has both at the top level
+  const stage = path.join(BUILD, '_mac-stage');
+  if (fs.existsSync(stage)) fs.rmSync(stage, { recursive: true });
+  fs.mkdirSync(stage, { recursive: true });
+  fs.cpSync(appDir, path.join(stage, path.basename(appDir)), { recursive: true });
+  let readme = fs.readFileSync(path.join(BUILD, 'README-MAC.txt'), 'utf8');
+  if (notarized) {
+    readme = readme.replace(/FIRST LAUNCH[\s\S]*?\n\n/, 'FIRST LAUNCH\n  Double-click "Community Captioner.app". The app is signed and notarized by Apple,\n  so macOS opens it without a security prompt.\n\n');
+  }
+  fs.writeFileSync(path.join(stage, 'README-MAC.txt'), readme);
+  // ditto preserves symlinks, permissions and signatures (zip -r would not)
+  execSync(`ditto -c -k --sequesterRsrc --keepParent "${stage}" "${zipPath}"`, { stdio: 'inherit' });
+  // --keepParent nests under "_mac-stage/"; rebuild without the parent folder instead
+  fs.rmSync(zipPath);
+  execSync(`cd "${stage}" && ditto -c -k --sequesterRsrc . "${zipPath}"`, { stdio: 'inherit' });
+  fs.rmSync(stage, { recursive: true });
+  return zipPath;
 }
 
 // ---------------------------------------------------------------------------
@@ -376,11 +584,38 @@ import '../server/relay.js';
     );
 
     console.log('\n=== Creating .app bundle ===');
-    const appDir = buildMacApp(macBin, version);
+    const appDir = path.join(BUILD, 'Community Captioner.app');
+    if (fs.existsSync(appDir)) fs.rmSync(appDir, { recursive: true, force: true });
+    buildMacApp(macBin, version);
+
+    console.log('\n=== Signing .app ===');
+    const identityUsed = signMacApp(appDir);
+
+    let notarized = false;
+    if (notarize) {
+      console.log('\n=== Notarizing .app ===');
+      if (identityUsed === '-') {
+        console.error('  Cannot notarize an ad-hoc signed app — a "Developer ID Application" identity is required in the keychain.');
+        process.exit(1);
+      }
+      try {
+        notarized = notarizeMacApp(appDir);
+      } catch (e) {
+        console.error(`\n  Notarization failed: ${e.message}\n`);
+        process.exit(1);
+      }
+    } else {
+      console.log('\n  (Not notarized — pass --notarize or set NOTARIZE=1 to submit to Apple; first launch will need right-click → Open.)');
+    }
+
+    console.log('\n=== Zipping for release ===');
+    const zipPath = zipMacApp(appDir, version, notarized);
+
     const size = getTotalSize(appDir);
     console.log(`\n  Built: ${appDir} (${size})`);
+    console.log(`  Release zip: ${zipPath} (${(fs.statSync(zipPath).size / 1024 / 1024).toFixed(1)} MB)`);
     console.log(`\n  To use on macOS:`);
-    console.log(`    1. Double-click "Community Captioner.app"`);
+    console.log(`    1. Unzip, right-click "Community Captioner.app" → Open (first time only)`);
     console.log(`    2. Browser opens automatically to http://localhost:8080`);
     console.log(`    3. Close the terminal window or press Ctrl+C to stop\n`);
   }
@@ -420,18 +655,36 @@ import '../server/relay.js';
         }
       }
 
-      // Try to bundle a Windows-built decklink_addon.node if one exists
-      // locally (e.g. downloaded from the CI workflow). Otherwise leave it
-      // out — the in-app setup card explains how to fetch it.
+      // Bundle a Windows-built decklink_addon.node if one exists: built in-tree
+      // on this Windows machine (npm run build:native), dropped into prebuilt/,
+      // or downloaded from the CI workflow. Otherwise leave it out — the in-app
+      // setup card explains how to fetch it.
       const winAddonCandidates = [
+        process.platform === 'win32' ? path.join(ROOT, 'native', 'decklink', 'build', 'Release', 'decklink_addon.node') : null,
         path.join(ROOT, 'native', 'decklink', 'prebuilt', 'decklink_addon-windows-x64.node'),
         path.join(ROOT, 'decklink_addon-windows-x64.node'),
-      ];
+      ].filter(Boolean);
+      let bundledAddon = false;
       for (const c of winAddonCandidates) {
         if (fs.existsSync(c)) {
           fs.copyFileSync(c, path.join(winBundle, 'decklink_addon.node'));
           console.log(`  Bundled Windows DeckLink addon from ${c}`);
+          bundledAddon = true;
           break;
+        }
+      }
+      if (!bundledAddon) console.warn('  WARNING: no Windows DeckLink addon found — SDI caption injection will need setup-decklink.bat on the target machine.');
+
+      // Zip the bundle on Windows (Compress-Archive ships with PowerShell) so the
+      // release asset name matches utils/appLinks.ts. On other platforms, zip by hand.
+      const winZip = path.join(BUILD, `Community-Captioner-${version}-windows-x64.zip`);
+      if (process.platform === 'win32') {
+        if (fs.existsSync(winZip)) fs.rmSync(winZip);
+        try {
+          execSync(`powershell -NoProfile -Command "Compress-Archive -Path '${winBundle}\\*' -DestinationPath '${winZip}' -CompressionLevel Optimal"`, { stdio: 'inherit' });
+          console.log(`  Release zip: ${winZip} (${(fs.statSync(winZip).size / 1024 / 1024).toFixed(1)} MB)`);
+        } catch (e) {
+          console.warn('  Could not zip the bundle automatically:', e.message);
         }
       }
 
@@ -439,14 +692,14 @@ import '../server/relay.js';
       console.log(`\n  Built: ${winExe} (${size} MB)`);
       console.log(`  Staged bundle: ${winBundle}/`);
       console.log(`\n  To deploy on Windows:`);
-      console.log(`    1. Zip the windows-bundle/ folder`);
+      console.log(`    1. ${process.platform === 'win32' ? `Upload ${path.basename(winZip)} to the GitHub release` : 'Zip the windows-bundle/ folder as ' + path.basename(winZip)}`);
       console.log(`    2. Recipient unzips and double-clicks CommunityCaptioner.exe`);
-      console.log(`    3. For SDI injection: run setup-decklink.bat (downloads the prebuilt addon)\n`);
+      console.log(`    3. For SDI injection without a bundled addon: run setup-decklink.bat (downloads the prebuilt addon)\n`);
     }
   }
 
   // Cleanup intermediate files
-  for (const f of ['launcher.cjs', 'server.cjs', 'package.json']) {
+  for (const f of ['launcher.cjs', 'server.cjs', 'package.json', 'README-MAC.txt']) {
     const p = path.join(BUILD, f);
     if (fs.existsSync(p)) fs.unlinkSync(p);
   }

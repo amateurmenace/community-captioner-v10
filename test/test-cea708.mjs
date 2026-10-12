@@ -107,7 +107,7 @@ assert(packet[2] === packet.length, `Length byte matches actual length (${packet
 assert(packet[3] === 0x4F, `Frame rate byte = 0x4F for 29.97fps (got 0x${packet[3].toString(16)})`);
 
 // Flags
-assert(packet[4] === 0xFF, 'Caption service active flags = 0xFF');
+assert(packet[4] === 0x77, 'Flags = 0x77 (ccdata_present | svcinfo_present | svc_info_start | svc_info_complete | caption_service_active | reserved)');
 
 // Sequence starts at 0
 assert(packet[5] === 0x00 && packet[6] === 0x00, 'Initial sequence = 0');

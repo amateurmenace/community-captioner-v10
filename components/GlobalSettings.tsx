@@ -237,6 +237,29 @@ const GlobalSettings: React.FC<GlobalSettingsProps> = ({ isOpen, onClose, appSta
                             
                             <StatusIndicator status={cloudStatus} msg={statusMessage} />
                         </div>
+
+                        <div>
+                            <h3 className="text-lg font-bold text-forest-dark mb-2">Cloud Mode Recognizer</h3>
+                            <p className="text-sm text-stone-500 mb-4">Which Gemini Live model turns audio into captions when Cloud mode is selected on the dashboard. Takes effect the next time you press Start.</p>
+                            <div className="space-y-2">
+                                {([
+                                    { id: 'transcribe-live', title: 'Gemini Transcribe Live (recommended)', desc: 'Purpose-built live transcription model. Much better on names and places; each sentence appears when the speaker pauses.' },
+                                    { id: 'native-audio', title: 'Gemini native audio (legacy)', desc: 'Conversational audio model told to stay silent. Shows words as they are spoken but mishears proper nouns more often.' },
+                                ] as const).map(opt => {
+                                    const selected = (appState.cloudModel || 'transcribe-live') === opt.id;
+                                    return (
+                                        <button key={opt.id} onClick={() => setAppState(p => ({ ...p, cloudModel: opt.id }))}
+                                            className={`w-full text-left p-3 rounded-xl border-2 transition-all ${selected ? 'border-sage-500 bg-sage-50' : 'border-stone-200 bg-white hover:border-sage-300'}`}>
+                                            <div className="flex items-center gap-2">
+                                                <span className={`w-3 h-3 rounded-full border-2 ${selected ? 'border-sage-500 bg-sage-500' : 'border-stone-300'}`} />
+                                                <span className="text-sm font-bold text-forest-dark">{opt.title}</span>
+                                            </div>
+                                            <p className="text-xs text-stone-500 mt-1 ml-5">{opt.desc}</p>
+                                        </button>
+                                    );
+                                })}
+                            </div>
+                        </div>
                     </div>
                 )}
 

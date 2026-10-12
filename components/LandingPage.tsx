@@ -346,7 +346,7 @@ const LandingPage: React.FC<LandingPageProps> = ({ onStart, onChooseMode }) => {
                   <FeatureCard 
                     icon={Lock}
                     title="Privacy First" 
-                    desc="Run in 'Local Mode' to keep all audio on-device using WebSpeech, perfect for executive sessions or sensitive content."
+                    desc="Browser mode uses your browser's built-in speech service. For executive sessions or sensitive content, run Local Whisper mode so audio never leaves your machine."
                   />
                   <FeatureCard 
                     icon={BarChart3}
@@ -451,7 +451,7 @@ const LandingPage: React.FC<LandingPageProps> = ({ onStart, onChooseMode }) => {
                   />
                   <FaqItem 
                     q="How accurate is it?" 
-                    a="Local mode is about 90-95% accurate. Cloud mode with Gemini 1.5 Flash is 98%+ accurate, especially when using the Context Engine." 
+                    a="Browser mode is about 90-95% accurate. Cloud mode with Gemini 2.5 Flash is 98%+ accurate, especially when using the Context Engine."
                   />
                   <FaqItem 
                     q="Does it work with Zoom?" 
@@ -467,7 +467,7 @@ const LandingPage: React.FC<LandingPageProps> = ({ onStart, onChooseMode }) => {
                   />
                   <FaqItem 
                     q="Is my data private?" 
-                    a="In Local Mode, no audio leaves your browser. In Cloud Mode, audio is sent to Google's enterprise API which does not train on your data by default (unlike the free consumer version)." 
+                    a="It depends on the mode. Browser (Balanced) mode uses the Web Speech API: Chrome and Edge send microphone audio to Google's speech servers and return text. Cloud mode streams audio to Google's Gemini API, which does not train on API data. Local Whisper mode keeps all audio on your own machine. Caption text is only sent to Gemini when you add an API key (for polish, translation and the Context Engine)."
                   />
               </div>
           </div>

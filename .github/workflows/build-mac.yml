@@ -1,0 +1,186 @@
+name: Build macOS app (signed + notarized)
+
+# Builds the standalone "Community Captioner.app" (Apple Silicon), signs it
+# with a Developer ID certificate, notarizes it with Apple, staples the
+# ticket and attaches the zip to the GitHub Release.
+#
+# Triggers:
+#   - push of a v* tag (attaches to the release for that tag, creating a draft if needed)
+#   - manual "Run workflow" (uploads the zip as a workflow artifact; optional release tag)
+#
+# Repository secrets (Settings → Secrets and variables → Actions):
+#   MACOS_CERTIFICATE_P12         base64 of the "Developer ID Application" .p12 export
+#                                 (Keychain Access → My Certificates → right-click → Export…, then `base64 -i cert.p12 | pbcopy`)
+#   MACOS_CERTIFICATE_PASSWORD    password chosen when exporting the .p12
+#   APPLE_ID                      Apple ID email used for notarization
+#   APPLE_APP_SPECIFIC_PASSWORD   app-specific password (account.apple.com → Sign-In and Security → App-Specific Passwords)
+#   APPLE_TEAM_ID                 6M536MV7GT
+#   GEMINI_API_KEY   (optional)   written to .env.local so the bundle works out of the box
+#   BMD_SDK_URL      (optional)   zip of the DeckLink SDK; otherwise the draft release
+#                                 `sdk-internal-do-not-publish` is used (same as the Windows workflow).
+# Without the certificate secrets the app is built ad-hoc signed and not notarized.
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: 'Existing release tag to attach the zip to (e.g. v6.4.0). Leave blank to only upload an artifact.'
+        required: false
+        type: string
+      notarize:
+        description: 'Submit to Apple notary service (needs APPLE_* secrets)'
+        required: false
+        type: boolean
+        default: true
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: macos-14   # Apple Silicon runner
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+
+      - name: Install npm dependencies
+        run: npm ci
+
+      # ---------------------------------------------------------------
+      # DeckLink SDK headers → native addon (optional; app builds without it)
+      # ---------------------------------------------------------------
+      - name: Resolve DeckLink SDK source
+        id: sdk
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          BMD_SDK_URL: ${{ secrets.BMD_SDK_URL }}
+        run: |
+          if [ -n "$BMD_SDK_URL" ]; then
+            echo "source=external" >> "$GITHUB_OUTPUT"; echo "has_sdk=true" >> "$GITHUB_OUTPUT"
+          elif gh release view sdk-internal-do-not-publish --repo "${{ github.repository }}" --json tagName >/dev/null 2>&1; then
+            echo "source=draft" >> "$GITHUB_OUTPUT"; echo "has_sdk=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_sdk=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::No DeckLink SDK source configured — building the app without the SDI addon."
+          fi
+
+      - name: Download DeckLink SDK
+        if: steps.sdk.outputs.has_sdk == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          BMD_SDK_URL: ${{ secrets.BMD_SDK_URL }}
+        run: |
+          mkdir -p bmd-sdk
+          if [ "${{ steps.sdk.outputs.source }}" = "external" ]; then
+            curl -fsSL "$BMD_SDK_URL" -o bmd-sdk.zip
+          else
+            gh release download sdk-internal-do-not-publish --repo "${{ github.repository }}" --pattern "*.zip" --output bmd-sdk.zip
+          fi
+          unzip -q bmd-sdk.zip -d bmd-sdk
+          # Mac headers live in <SDK>/Mac/include (contains DeckLinkAPI.h + DeckLinkAPIDispatch.cpp)
+          INCLUDE_DIR=$(find bmd-sdk -type f -name DeckLinkAPIDispatch.cpp -path '*Mac*' | head -1 | xargs dirname)
+          if [ -z "$INCLUDE_DIR" ]; then echo "SDK zip has no Mac/include/DeckLinkAPIDispatch.cpp"; exit 1; fi
+          echo "BMD_SDK_DIR=$PWD/$INCLUDE_DIR" >> "$GITHUB_ENV"
+          echo "Using SDK headers at $INCLUDE_DIR"
+
+      - name: Build native DeckLink addon
+        if: steps.sdk.outputs.has_sdk == 'true'
+        run: |
+          # Desktop Video is not installed on the runner, so the framework is loaded at
+          # runtime by DeckLinkAPIDispatch.cpp instead of being linked (BMD_LINK_FRAMEWORK=OFF).
+          npx cmake-js compile --directory native/decklink --CDBMD_SDK_DIR="$BMD_SDK_DIR" --CDBMD_LINK_FRAMEWORK=OFF --config Release
+          ls -la native/decklink/build/Release/decklink_addon.node
+          node -e "const a=require('./native/decklink/build/Release/decklink_addon.node'); console.log('addon loads, exports:', Object.keys(a).join(','))"
+
+      # ---------------------------------------------------------------
+      # Signing identity (optional)
+      # ---------------------------------------------------------------
+      - name: Check which secrets are configured
+        id: secrets
+        env:
+          HAS_CERT: ${{ secrets.MACOS_CERTIFICATE_P12 != '' && secrets.MACOS_CERTIFICATE_PASSWORD != '' }}
+          HAS_NOTARY: ${{ secrets.APPLE_ID != '' && secrets.APPLE_APP_SPECIFIC_PASSWORD != '' && secrets.APPLE_TEAM_ID != '' }}
+          HAS_KEY: ${{ secrets.GEMINI_API_KEY != '' }}
+        run: |
+          echo "has_cert=$HAS_CERT" >> "$GITHUB_OUTPUT"
+          echo "has_notary=$HAS_NOTARY" >> "$GITHUB_OUTPUT"
+          echo "has_key=$HAS_KEY" >> "$GITHUB_OUTPUT"
+          echo "cert=$HAS_CERT notary=$HAS_NOTARY gemini_key=$HAS_KEY"
+          if [ "$HAS_CERT" != "true" ]; then echo "::warning::No MACOS_CERTIFICATE_P12 secret — the app will be ad-hoc signed and NOT attached to the release (a locally built signed zip would be overwritten)."; fi
+
+      - name: Import Developer ID certificate
+        id: cert
+        if: steps.secrets.outputs.has_cert == 'true'
+        env:
+          MACOS_CERTIFICATE_P12: ${{ secrets.MACOS_CERTIFICATE_P12 }}
+          MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+        run: |
+          KEYCHAIN="$RUNNER_TEMP/build.keychain-db"
+          KEYCHAIN_PASSWORD="$(openssl rand -hex 16)"
+          echo "$MACOS_CERTIFICATE_P12" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security import "$RUNNER_TEMP/cert.p12" -P "$MACOS_CERTIFICATE_PASSWORD" -A -t cert -f pkcs12 -k "$KEYCHAIN"
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security list-keychains -d user -s "$KEYCHAIN" login.keychain
+          rm -f "$RUNNER_TEMP/cert.p12"
+          security find-identity -v -p codesigning "$KEYCHAIN"
+
+      - name: Write .env.local (optional Gemini key)
+        if: steps.secrets.outputs.has_key == 'true'
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+        run: printf 'GEMINI_API_KEY=%s\n' "$GEMINI_API_KEY" > .env.local
+
+      # ---------------------------------------------------------------
+      # Build (+ sign + notarize) — scripts/build-app.js does all of it
+      # ---------------------------------------------------------------
+      - name: Build, sign and notarize
+        env:
+          NOTARIZE: ${{ (github.event_name == 'push' || github.event.inputs.notarize == 'true') && steps.secrets.outputs.has_cert == 'true' && steps.secrets.outputs.has_notary == 'true' }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          echo "Notarize: $NOTARIZE"
+          npm run build:mac
+
+      - name: Show result
+        run: |
+          ls -la build/*.zip
+          codesign -dv --verbose=2 "build/Community Captioner.app" 2>&1 | grep -E "Authority|flags" || true
+          spctl --assess --type execute --verbose=2 "build/Community Captioner.app" || echo "(not notarized — Gatekeeper will prompt on first launch)"
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: community-captioner-mac-arm64
+          path: build/Community-Captioner-*-mac-arm64.zip
+
+      - name: Resolve release tag
+        id: tag
+        run: |
+          if [ "${{ github.event_name }}" = "push" ]; then t="${{ github.ref_name }}"; else t="${{ github.event.inputs.release_tag }}"; fi
+          echo "tag=$t" >> "$GITHUB_OUTPUT"
+          echo "Release tag: ${t:-<none>}"
+
+      # Only a Developer-ID-signed build may replace the release asset; an ad-hoc
+      # CI build must never overwrite a signed/notarized zip uploaded by hand.
+      - name: Attach zip to GitHub Release
+        if: steps.tag.outputs.tag != '' && steps.secrets.outputs.has_cert == 'true'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.tag }}
+          draft: true
+          files: build/Community-Captioner-*-mac-arm64.zip
+          fail_on_unmatched_files: true

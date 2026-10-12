@@ -55,18 +55,33 @@ On launch: starts relay server on port 8080, opens system browser automatically.
 
 4. **Fallback**: If the addon wasn't compiled at build time, you can place a Windows-compiled `decklink_addon.node` next to `CommunityCaptioner.exe` and the server will load it from there (see fallback in `relay.js` line ~210).
 
+`npm run build:windows` on a Windows machine now bundles an in-tree `native/decklink/build/Release/decklink_addon.node` automatically and zips `build/windows-bundle/` to `build/Community-Captioner-<version>-windows-x64.zip`. The step-by-step brief for producing and verifying a Windows release (including the packaged-exe probes) is `WINDOWS-HANDOFF.md`.
+
 ### macOS .app Bundle Structure
 ```
 Community Captioner.app/
   Contents/
     Info.plist
-    MacOS/CommunityCaptioner  (pkg binary)
-    Resources/dist/           (frontend assets)
+    MacOS/CommunityCaptioner        (shell launcher: opens Terminal.app running the binary, falls back to exec)
+    MacOS/CommunityCaptioner-bin    (pkg binary: Node 20 + server.cjs + dist snapshot)
+    MacOS/decklink_addon.node       (macOS DeckLink addon, copied from native/decklink/build/Release — run build:native first)
+    Resources/dist/                 (frontend assets; DIST_PATH points here)
+    Resources/.env.local            (Gemini key, optional; relay.js checks <Resources>/.env.local and <exe dir>/.env.local)
 ```
+`npm run build:mac` also **codesigns** the bundle (inner Mach-O files first, then the bundle) with the "Developer ID Application" identity from the keychain when present — with the **hardened runtime** and `electron/entitlements.mac.plist` (allow-jit + unsigned-executable-memory for Node, disable-library-validation so the Blackmagic-signed DeckLinkAPI.framework can load, audio-input, network) — otherwise ad-hoc, and writes `build/Community-Captioner-<version>-mac-arm64.zip` (via `ditto`, with `README-MAC.txt`) ready to attach to a GitHub release. Non-code files must not live in `Contents/MacOS/` or codesign fails ("code object is not signed at all / In subcomponent …"); the script removes strays (e.g. a `.data` folder from a test launch) before signing. Packaged builds keep their data in `~/.community-captioner/data/` (`DATA_DIR` in context-learner.js) for the same reason — writing inside the bundle would break the seal.
+
+**Notarization** — `npm run build:mac:notarized` (= `--notarize` / `NOTARIZE=1`) submits the signed app with `xcrun notarytool submit --wait`, prints the notary log on rejection, staples the ticket and verifies with `spctl`. Credentials, first match wins: keychain profile `NOTARY_PROFILE` (default `community-captioner`) → `APPLE_API_KEY`/`APPLE_API_KEY_ID`/`APPLE_API_ISSUER` → `APPLE_ID`/`APPLE_APP_SPECIFIC_PASSWORD`/`APPLE_TEAM_ID`. One-time local setup:
+```bash
+xcrun notarytool store-credentials community-captioner --apple-id <apple id email> --team-id 6M536MV7GT --password <app-specific password>
+```
+Without credentials the build is signed only and first launch needs right-click → Open (the README in the zip explains; on macOS 15+ it is System Settings → Privacy & Security → Open Anyway).
+
+**CI** (`.github/workflows/build-mac.yml`, `macos-14` runner): builds the addon from the SDK headers with `BMD_LINK_FRAMEWORK=OFF` (DeckLinkAPIDispatch.cpp loads the framework at runtime, so Desktop Video isn't needed to compile), imports the Developer ID `.p12` from secrets into a temp keychain, runs `npm run build:mac` with `NOTARIZE=1`, uploads the zip as an artifact and attaches it to the (draft) release for `v*` tags. Secrets: `MACOS_CERTIFICATE_P12` (base64 .p12), `MACOS_CERTIFICATE_PASSWORD`, `APPLE_ID`, `APPLE_APP_SPECIFIC_PASSWORD`, `APPLE_TEAM_ID`, optional `GEMINI_API_KEY` (written to `.env.local`) and `BMD_SDK_URL` (else the `sdk-internal-do-not-publish` draft release is used).
 
 ### Important Notes
 
 - Each build wipes intermediate files but preserves other platform outputs in `build/`
+- **Server dependencies must be static `import`s.** Anything loaded via `createRequire(import.meta.url)('pkg')` at runtime is invisible to esbuild and cannot be resolved inside the pkg snapshot — multer and pdf-parse were loaded that way, which silently disabled uploads and PDF parsing in every packaged build while dev mode worked. After building, launch the binary on a spare port (`PORT=8090 "build/Community Captioner.app/Contents/MacOS/CommunityCaptioner-bin"`) and check `GET /api/context/capabilities` reports `upload:true, pdf:true` and `GET /api/inject/status` reports `addonLoaded:true`.
 - The `DIST_PATH` env var tells the server where to find frontend assets (set automatically by the launcher)
 - Browser globals (`DOMMatrix`, `ImageData`, `Path2D`) are polyfilled in the launcher for pdf-parse compatibility
 - The `@napi-rs/canvas` warning on startup is harmless (optional dep for PDF rendering)
@@ -86,8 +101,8 @@ SDI Output with CEA-708 VANC captions
 ### Caption Pipeline
 
 ```
-Audio → Gemini/Whisper/WebSpeech → Text
-  → Context Engine (dictionary substitutions, profanity filter, auto-learned corrections)
+Audio → Gemini Transcribe Live / Gemini native audio / Whisper / WebSpeech → Text
+  → Context Engine (shared/corrections.js: exact + phonetic dictionary matching, profanity filter, auto-learned corrections)
   → Caption Polisher (capitalize, punctuate, fix contractions, optional Gemini summarize)
   → Strategy Router (truncate / summarize / verbatim based on user config)
   → CEA-608 Encoder (text → CC byte pairs, configurable roll-up 2 or 3)
@@ -104,9 +119,14 @@ Audio → Gemini/Whisper/WebSpeech → Text
 
 | File | Purpose |
 |------|---------|
-| `server/relay.js` | Express + WebSocket relay, DeckLink REST API, caption config, encoder orchestration, local proper noun extraction fallback |
+| `server/relay.js` | Express + WebSocket relay, DeckLink REST API, caption config, encoder orchestration, Context Engine endpoints (SSE), local proper noun extraction fallback |
 | `server/caption-polisher.js` | Two-layer text cleanup: local rules (capitalize, contractions) + Gemini AI (grammar, summarize) |
-| `server/context-learner.js` | Auto-Learn engine: buffers live captions, extracts proper nouns via Gemini, manages suggestions with accept/dismiss |
+| `server/context-learner.js` | Auto-Learn engine (buffers live captions, extracts proper nouns via Gemini, accept/dismiss suggestions) + `extractDictionary()` (chunked Gemini extraction from document text) + `generateMishearings()` |
+| `server/context-sources.js` | Source ingestion for the Context Engine: pdf-parse v2 wrapper, DOCX reader, HTML→text, browser-like fetch, Google-grounding redirect resolution, link discovery, Municipality Wizard (`locateMunicipalitySources`, `researchMunicipality`), Gemini `urlContext` page reading for bot-blocked sites, `itemsToEntries()` (names → correction rules) |
+| `server/profiles.js` | Named Context Engine profiles stored as JSON under `DATA_DIR/profiles/` (list / save / merge / delete) |
+| `shared/corrections.js` | Correction engine used by **both** the browser and the relay: Metaphone-style `phoneticKey()`, `buildCorrectionIndex()`, `applyCorrections()` (exact pass, then sounds-like pass gated by sensitivity), `diffForRules()` (operator edit → proposed rules). Tests in `test/test-corrections.mjs` |
+| `utils/languages.ts` | The 15 translation languages (code, English name, native name, flag) shared by the Dashboard picker, the audience view and Gemini prompts. Mirror of `SUPPORTED_LANGUAGES` in `server/translation-service.js` |
+| `.github/workflows/build-mac.yml` | CI: builds the addon without Desktop Video (`BMD_LINK_FRAMEWORK=OFF`), signs with the Developer ID cert from secrets, notarizes, staples, attaches the zip to the release |
 | `server/translation-service.js` | Server-side Gemini translation with LRU cache and in-flight dedup for audience phone view |
 | `server/cea708/cea608-encoder.js` | CEA-608 Roll-Up 2/3 encoder with line breaking, dedup, configurable rows |
 | `server/cea708/dtvcc-encoder.js` | CEA-708 DTVCC Service 1 encoder (~200+ chars/sec throughput) |
@@ -116,9 +136,9 @@ Audio → Gemini/Whisper/WebSpeech → Text
 | `native/decklink/src/vanc_packet.cpp` | IDeckLinkAncillaryPacket impl (DID=0x61, SDID=0x01, line 9) |
 | `native/decklink/src/output_handler.cpp` | Standalone mode (black frames + captions, CDP queue) |
 | `native/decklink/src/passthrough.cpp` | SDI in → SDI out + captions (CDP queue) |
-| `components/Dashboard.tsx` | Main control center: recording, live preview, relay connection, QR code modal, Auto-Learn toggle + notification toasts |
+| `components/Dashboard.tsx` | Main control center: recording, live preview, relay connection, QR code modal, "Learn" pill (Auto-Learn toggle) + suggestion toasts with 10s auto-accept |
 | `components/OutputSettings.tsx` | Caption Output Designer: DeckLink/NDI config, Caption Processing settings |
-| `components/ContextEngine.tsx` | Context Engine UI: PDF upload, URL scraping, municipality wizard, dictionary management, settings with how-to guide |
+| `components/ContextEngine.tsx` | Context Engine UI: Municipality Wizard (SSE research with grouped, selectable results + optional deep scan of official pages), PDF/DOCX upload with preview, paste/URL extraction with preview, Quick Names, Meeting Body, dictionary management, settings with how-to guide |
 | `components/AudienceView.tsx` | Phone caption viewer: auto-reconnect, dark/light mode, font sizes, fullscreen |
 | `App.tsx` | Root component, audio capture, WebSocket connection, state management. Landing → deployment choice (cloud only) or straight to workflow picker (local). |
 | `electron/main.js` | Electron main process, DeckLink IPC, frame loop (filters to isFinal only) |
@@ -149,9 +169,20 @@ Audio → Gemini/Whisper/WebSpeech → Text
 | `/api/context/accept` | POST | Accept an auto-learned suggestion into dictionary |
 | `/api/context/dismiss` | POST | Dismiss/reject an auto-learned suggestion |
 | `/api/context/names` | POST | Generate STT mishearing entries from a list of names (uses Gemini, falls back to lowercase) |
-| `/api/context/scrape` | POST | Scrape a URL for proper nouns (requires Gemini API key) |
-| `/api/context/extract` | POST | Extract proper nouns from pasted text |
-| `/api/context/upload-pdf` | POST | Upload PDF/text file, extract proper nouns (multipart form) |
+| `/api/context/capabilities` | GET | What this server can do: `{pdf, docx, upload, geminiKey, model, researchGroups}` |
+| `/api/context/wizard/research` | POST (SSE) | Municipality Wizard: `{query}` → streams `status`, `sources`, `research_start`, `group` (items with ready-made entries), `done`/`error` |
+| `/api/context/search-municipality` | POST | Wizard phase 1 only (official site + useful pages), non-streaming |
+| `/api/context/scrape` | POST | Scrape a URL (HTML or PDF) for proper nouns; falls back to Gemini `urlContext` when the site returns 403 or is JS-only |
+| `/api/context/scrape-stream` | POST (SSE) | Same as scrape with per-phase progress (`fetching`→`parsed`→`extracting`/`ai_fetch`→`entries`→`done`) |
+| `/api/context/discover-links` | POST | List relevant same-site links (officials, departments, agendas…) on a page |
+| `/api/context/extract` | POST | Extract proper nouns from pasted text (chunked for long documents) |
+| `/api/context/upload-pdf` | POST | Upload PDF / DOCX / TXT / HTML (multipart `file`), returns entries + `preview`, `pages`, `kind` |
+| `/api/context/dictionary` | GET / POST | Server-side mirror of the active dictionary (the browser POSTs it + `sensitivity` on every change; rebuilds the relay's correction index) |
+| `/api/context/dictionary/export` `/import` `/delete` | GET / POST / POST | Download, merge/replace, remove one entry |
+| `/api/context/apply` | POST | `{text, sensitivity?}` → what the dictionary would do to that text (`{text, applied[]}`) |
+| `/api/context/profiles` | GET / POST | List named profiles / save `{name, entries, municipality?, merge?}` (name is slugified into the id) |
+| `/api/context/profiles/:id` | GET / DELETE | Load one profile with its entries / delete it |
+| `/api/inject/caption` | POST | `{text, isFinal?, applyDictionary?}` → feeds the SDI encoder; the relay applies the dictionary to REST-injected captions (Dashboard captions arrive already corrected) |
 | `/api/youtube/caption-url` | GET | Current YouTube caption ingestion URL + last-POST status |
 | `/api/youtube/caption-url` | POST | Set/clear YouTube caption ingestion URL (body: `{url: "..."}` or `{url: ""}` to clear) |
 
@@ -167,20 +198,36 @@ The Context Engine is a knowledge graph builder that teaches the captioning syst
 ### Tools Tab (Left Panel)
 Top-to-bottom layout organized by workflow priority:
 
-**Municipality Wizard** (inline at top)
-- Search for a municipality name — AI finds official web pages via Google Search grounding
-- Results appear inline with checkboxes and clickable source URLs
-- Scraping runs in background while user fills out Meeting Prep below
-- Capped at 8 sources max, progress shown with per-URL status
+**Municipality Wizard** (inline at top) — `POST /api/context/wizard/research` (SSE)
+- Type a municipality ("Brookline, MA") → the server runs two things concurrently:
+  1. **Locate** (≈8s): Gemini + Google Search grounding finds the official site. Grounding returns opaque `vertexaisearch…/grounding-api-redirect/…` URLs, so the server resolves each redirect (HEAD, manual redirect) to the real page, merges URLs the model wrote in its answer, picks the official host (most frequent .gov/.us/.org), crawls the homepage for officials/departments/agenda links, fetches real `<title>`s and dedupes. Emits a `sources` event.
+  2. **Research** (≈20–45s): four parallel Google-grounded Gemini calls (people, boards/organizations, places/schools, acronyms/terms) return JSON items `{name, category, detail, misheard[]}`. Each group streams as a `group` event the moment it finishes; items arrive with their dictionary `entries` already built by `itemsToEntries()`.
+- UI shows a step list (official site + 4 groups with live status/elapsed), then grouped results with checkboxes (select all / per-group), "N names · M correction rules", and one "Add … to dictionary" button. Dedupes against the existing dictionary.
+- "N pages" toggle reveals the official pages found; **Deep scan** runs `scrape-stream` on the selected pages 3 at a time (per-URL phase feed) for additional names from the pages themselves.
+- Many CivicPlus-hosted town sites (e.g. brooklinema.gov) sit behind Cloudflare and return **HTTP 403 to any server-side fetch**. The wizard still works because research is search-grounded, and deep scan / URL scrape fall back to Gemini's `urlContext` tool, which reads the page from Google's side (works on those sites; ≈10s per page).
+- Entry generation (`itemsToEntries`): lowercase form → correct form, each `misheard` variant → correct form, acronyms also get a spelled-out "d p w" variant and their expansion as a proper noun; single common English words are never used as a bare `original` (a rule "green → Greene" would rewrite every "green"); URL/domain/web-chrome names are dropped.
 
 **Meeting Prep**
 - **Quick Names**: Paste a list of names (one per line or comma-separated). AI generates STT mishearing corrections via Gemini (e.g., "Pham" → original: "fam"). Shows preview before adding to dictionary. Falls back to lowercase→original without API key.
 - **Meeting Body Setup**: Structured form with Body Name, Members list, and Acronyms (format: `CIP = Capital Improvement Plan`). Parses acronyms automatically into dictionary entries.
 
-**Document Ingestion**
-- **Paste Text**: Paste meeting agenda text for AI extraction. Now shows **preview** of found entries before adding — user can review and discard.
-- **PDF Upload**: Drag & drop agenda PDFs for extraction
-- **URL Scraper**: Paste a direct URL to scrape for proper nouns
+**Document Ingestion** (every tool shows a **preview** with Add All / Discard — nothing lands in the dictionary unreviewed, and no `alert()` dialogs)
+- **PDF / DOCX Upload**: Drag & drop or click. PDF via pdf-parse **v2** (`new PDFParse({data}).getText()` — the v1 `pdfParse(buffer)` call form throws "not a function"), DOCX via a built-in zip/XML reader, TXT/HTML as text. Scanned PDFs (no text layer) get a clear warning.
+- **Paste Text**: Paste agenda/minutes text for AI extraction.
+- **URL Scraper**: Any page or online PDF; 403/JS-only pages are read by Gemini `urlContext`.
+- Long documents are split into ~24k-char chunks (max 6) extracted in parallel (3 at a time) and merged.
+
+**Dictionary persistence**: the dictionary and engine name are saved in `localStorage` (`cc_dictionary`, `cc_context_name`) and mirrored to the relay (`POST /api/context/dictionary`, debounced) so reloads don't lose it and the learner can dedupe against it. Entries carry optional `note` (role/expansion, shown in the UI) and `source` (wizard, document, paste, url, names, manual, auto_learned, operator_edit, profile).
+
+**Named profiles** (header → Profiles): save the current rules under the engine name on the relay (`DATA_DIR/profiles/<slug>.json`), list/load (replace) / merge / delete. Profiles are server-side so every operator machine on the LAN sees "Brookline Select Board". Loading a profile sets the engine name and the active context name.
+
+### How corrections are applied (shared/corrections.js)
+`applyCorrections(text, index, { sensitivity })` runs in the browser for every final caption (`App.processText`) and in the relay for REST-injected captions:
+1. **Exact pass** — every rule's `original` as a case-insensitive word-boundary regex, longest first (the behaviour the app always had).
+2. **Phonetic pass** — tokens are keyed with a Metaphone-style `phoneticKey()` ("Greene"/"green" → `KRN`, "Pearlman"/"Perlman" → `PRLMN`); windows of 1–6 words are compared against the concatenated key of each rule's `original` **and** `replacement`, so word splits don't matter ("Weintraub" ≈ "wine troub"). Gated by **Correction Sensitivity** (Context Engine → Settings): `<30` exact only · `30–69` + multi-word names · `≥70` + single names. Single-word matches never touch common English words (`COMMON_WORDS`), acronyms, or words under 4 letters. Replaced text keeps the window's punctuation.
+3. Applied rules are reported as `{matched, replacement, mode: 'exact'|'phonetic'}` and shown in the Dashboard "Corrections Log" with "(sounds-like)" for phonetic hits. Settings has a "Try a sentence" box that previews the result live.
+
+**Learn from operator edits**: when the operator edits a caption on the Dashboard, `diffForRules(old, new)` finds replaced word spans (LCS diff, expanded to adjacent capitalized words so "Greene" becomes "Bernard Greene"), skips single common words and numbers, and proposes rules as toasts ("From your edit — add a rule?"). Accepted rules get `source: 'operator_edit'`.
 
 **Active Rules Panel** (right side)
 - Entry count badge, search bar (appears at 3+ entries), color-coded type filter pills (proper noun / place / acronym / correction)
@@ -199,12 +246,12 @@ Top-to-bottom layout organized by workflow priority:
 - **Tips for Best Results**: Practical advice for production use
 
 ### Auto-Learn System (server/context-learner.js)
-- Buffers live caption text in 30-second windows
+- Buffers live caption text in 30-second windows. The relay feeds every polished final caption (`learnerFeedText` in the WebSocket handler) — it used to be fed only inside the DeckLink encoder path, so Auto-Learn never saw text in browser mode.
 - Sends buffer to Gemini for proper noun extraction
 - Returns suggestions with original (misheard) and replacement (correct) forms
-- Dashboard shows toast notifications in bottom-right corner
-- Auto-approves after 10 seconds if user doesn't reject
-- "Learn" pill button in Dashboard top nav bar toggles on/off
+- Dashboard polls `/api/context/suggestions` every 5s while enabled and shows toast notifications in the bottom-right corner (Accept / Reject, countdown bar)
+- Auto-approves after 10 seconds unless rejected; the toast header has an "auto-accept on/paused" toggle
+- "Learn" pill button in Dashboard top nav bar toggles on/off (`POST /api/context/enable`) and shows the dictionary size
 - **Live status in Settings**: buffer progress bar, extraction count, pending suggestions, last extraction timestamp
 - Tracks `lastExtractionTime`, `extractionCount`, `isExtracting` in status API
 
@@ -215,9 +262,10 @@ Top-to-bottom layout organized by workflow priority:
 - Capped at 50 names per request, 8-second timeout
 
 ### PDF/Document Extraction
-- Uses `pdf-parse` npm package for PDF text extraction
-- Sends extracted text to Gemini for proper noun identification
-- **Local fallback extraction** (no API key needed): regex-based extraction of capitalized multi-word names, acronyms in parentheses, street addresses, organization names
+- Uses `pdf-parse` **v2** (`PDFParse` class) via `extractPdfText()` in `server/context-sources.js`; DOCX via `extractDocxText()`; dispatch by filename/mimetype in `extractUploadedText()`
+- Sends extracted text to Gemini (`extractDictionary`, chunked) for proper noun identification; items → entries via `itemsToEntries()`
+- API key resolution for every Context endpoint: body `apiKey` → `X-Api-Key` header → server key from `.env.local` (`resolveRequestKey()` in relay.js). The browser does not need its own key when the server has one.
+- **Local fallback extraction** (no API key anywhere): regex-based extraction of capitalized multi-word names, acronyms in parentheses, street addresses, organization names
 - CORS headers include `X-Api-Key` for cross-origin uploads from Vite dev server
 
 ### Dictionary Format
@@ -424,7 +472,7 @@ Always release IDeckLinkVideoBuffer after the access scope and BEFORE handing th
 - Queue cap at 60 CDPs / 200 bytes to prevent unbounded growth
 
 ### CEA-708 CDP (cea708-cdp-builder.js)
-- SMPTE 334 format: header 0x9669, flags byte 0x43
+- SMPTE 334 format: header 0x9669, flags byte **0x77** (ccdata_present | svcinfo_present | svc_info_start | svc_info_complete | caption_service_active | reserved) followed by a ccsvcinfo block declaring service 1 "eng" — without it common decoders treat the CDP as having no caption services
 - cc_count per rate: 23.98→25, 29.97→20, 59.94→10
 - `buildCDP(cc1, cc2)`: CEA-608 only — Field 1 data, Field 2 null, DTVCC null padding
 - `buildCDP_DTVCC(dtvccData, frameRate, cc1, cc2)`: Dual mode — CEA-608 in Field 1 for backward compat + DTVCC service data in remaining triplets
@@ -462,8 +510,33 @@ CEA-608 can only display ~60 chars/sec. Use Caption Processing settings to:
 ### Summarize mode not working
 Requires a Gemini API key. Enter it in Context Engine → Settings → Gemini API Key, or in Output Settings → Caption Processing → Gemini API Key. The key is sent to the relay via `POST /api/polisher/apikey`. Without a key, summarize falls back to truncation.
 
-### PDF upload says "No entries found"
-Most likely the Gemini API key is not set or invalid. Check Context Engine → Settings for the API key status badge. Without an API key, extraction falls back to local regex which finds fewer entries. The CORS headers must include `X-Api-Key` — this was fixed by adding it to the `Access-Control-Allow-Headers` in relay.js.
+### PDF upload says "No entries found" / "Upload failed"
+- "pdfParse is not a function" in the relay log means someone reverted to the pdf-parse v1 call form. pdf-parse ≥2 exports a `PDFParse` class — always go through `extractPdfText()` in `server/context-sources.js`.
+- A scanned PDF has no text layer; the endpoint returns a warning saying so. Export a text PDF from the agenda software or paste the text.
+- No Gemini key on the server **and** in the browser → extraction falls back to local regex which finds fewer entries. Check Context Engine → Settings for the key status badge. The CORS headers must include `X-Api-Key`.
+
+### Municipality Wizard finds the site but every page shows "403" / "AI read"
+Expected for Cloudflare-protected municipal sites (CivicPlus hosts like brooklinema.gov block all non-browser fetches). Research results are unaffected (they come from Google Search grounding, not from fetching the pages). Deep scan and the URL scraper automatically switch to Gemini's `urlContext` page reader for those URLs (≈10s each). If the wizard returns nothing at all, the Gemini key is missing/invalid or the query is too vague — include the state ("Needham, MA").
+
+### Auto-Learn never suggests anything in browser mode
+Fixed: the relay now feeds the learner from the WebSocket final-caption handler, not only from the DeckLink encoder path. Still requires a Gemini key, the Learn pill ON, and ≥100 chars of final captions per 30s window.
+
+### Which modes send data where
+- **Balanced (default)**: Web Speech API → Chrome/Edge stream microphone audio to Google's speech servers; Safari uses Apple's. Not local. Text then goes to the local relay, which sends each final line to Gemini for polish when a key is loaded and the polish toggle is on (both true by default with `.env.local`).
+- **Cloud**: audio streamed to Gemini Live. Two recognizers (Settings → Cloud → "Cloud Mode Recognizer", stored in `localStorage cc_cloud_model`):
+  - `transcribe-live` → **`gemini-3.5-transcribe-live`** (default). Purpose-built transcription model; config is just `{ inputAudioTranscription: {} }`. Streams `serverContent.interimInputTranscription.text` (cumulative text of the current segment, ~2/s → shown as interim) and emits `serverContent.inputTranscription.text` as a finished segment ~1.7 s after the speaker pauses (followed by `generationComplete`). Each finished segment becomes one caption line. In testing it transcribed "Brookline", "Bernard Greene" and "Coolidge Corner" correctly where the legacy model produced "Brooke Line", "Bernard Green", "coolage corner".
+  - `native-audio` → `gemini-2.5-flash-native-audio-preview-12-2025` (legacy). Conversational model told to stay silent; `inputTranscription` arrives as word fragments that are buffered until `turnComplete`.
+  - Batch `gemini-3.5-transcribe` returns its text in `candidates[0].content.parts[0].audioTranscription.text` (not `response.text`) and has no timestamps, so Prerecorded still uses `gemini-2.5-flash` with a JSON schema.
+- **Local / Fully Local**: audio to your own Whisper WebSocket server; nothing leaves the machine unless a Gemini key enables polish/translation/learning.
+The landing page copy reflects this (it used to claim Web Speech kept audio on-device, which is wrong).
+
+### Dashboard metrics are measured, not simulated
+- **Latency**: `App.startVad()` samples mic RMS every 60 ms (AnalyserNode) and records the last moment it exceeded 0.02; each final caption's latency = now − last speech. Shown as an EMA in seconds, "—" until the first measurement, red above 3 s. (It used to be `Math.random()`.)
+- **WPM**: `rollingWpm()` = words in the final captions of the last 60 s (sampled every 5 s so the chart decays in silence). (It used to be `words × 12`.)
+- **Confidence**: mean of recognizer confidences where the engine reports one (Web Speech). Gemini reports none → "—" (`confidenceSamples = 0`).
+
+### Translation languages
+`utils/languages.ts` holds the 15 languages. The Dashboard's picker (side-by-side translation of the operator's own captions, client-side `translateText` with the English language name in the prompt) and the audience view (server-side, cached) use the same list. The audience view also has a "Download transcript" button (plain text, translated + original when a language is selected).
 
 ### Auto-Learn not producing suggestions
 Requires: (1) Gemini API key set, (2) Auto-Learn toggled ON, (3) Active captioning session producing final captions. The learner buffers 30 seconds of text before extracting. Check relay logs for `[Learner]` messages.

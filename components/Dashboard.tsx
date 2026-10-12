@@ -2,7 +2,8 @@ import React, { useState, useEffect, useRef } from 'react';
 import { Mic, StopCircle, Home, Activity, Play, Globe, Layout, ShieldCheck, Zap, Lock, CloudLightning, Wifi, Info, Captions, ExternalLink, Link as LinkIcon, Copy, Monitor, Network, Check, Pause, X, Download, ShieldAlert, Edit2, Clock, Signal, AlertTriangle, Server, Video, QrCode, Eye, Terminal, ChevronRight, ChevronDown, WifiOff, Cloud } from 'lucide-react';
 import { Caption, DictionaryEntry, OperationMode, SessionStats, Notification, AudioDevice, UILanguage, OverlaySettings } from '../types';
 import { useTranslation } from '../utils/i18n';
-import GlobalSettings from './GlobalSettings'; 
+import { LANGUAGES } from '../utils/languages';
+import GlobalSettings from './GlobalSettings';
 
 interface DashboardProps {
   isRecording: boolean;
@@ -12,6 +13,7 @@ interface DashboardProps {
   interimText: string;
   setInterimText: (val: string) => void;
   dictionary: DictionaryEntry[];
+  setDictionary?: React.Dispatch<React.SetStateAction<DictionaryEntry[]>>;
   mode: OperationMode;
   setMode: (val: OperationMode) => void;
   stats: SessionStats;
@@ -32,7 +34,29 @@ interface DashboardProps {
   onEditCaption: (id: string, newText: string) => void;
   overlaySettings: OverlaySettings; // Added Prop
   cea708Enabled: boolean;
+  /** Rules proposed from the operator's caption edits (App.handleEditCaption) */
+  editSuggestions?: { id: string; original: string; replacement: string }[];
+  onAcceptEditSuggestion?: (id: string) => void;
+  onDismissEditSuggestion?: (id: string) => void;
 }
+
+// Relay URL (WebSocket). Vite dev ports 5170-5199 map to the relay on 8080;
+// a tunnel/cloud host with no explicit port keeps the default port.
+const getRelayWsUrl = () => {
+    const manual = localStorage.getItem('cc_relay_url');
+    if (manual) return manual;
+    const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+    const host = window.location.hostname;
+    const port = window.location.port;
+    const p = parseInt(port || '0');
+    if (p >= 5170 && p <= 5199) return `${protocol}//${host}:8080`;
+    const portSuffix = port ? `:${port}` : '';
+    return `${protocol}//${host}${portSuffix}`;
+};
+const getRelayHttpUrl = () => getRelayWsUrl().replace(/^wss:/, 'https:').replace(/^ws:/, 'http:');
+
+type LearnToast = { id: string; original: string; replacement: string; type: string; createdAt: number; expiresAt: number };
+const LEARN_TOAST_TTL_MS = 10000;
 
 const BrandLogo = () => (
     <div className="flex items-center gap-2">
@@ -296,6 +320,8 @@ const Dashboard: React.FC<DashboardProps> = ({
   captions,
   setCaptions,
   interimText,
+  dictionary,
+  setDictionary,
   mode,
   setMode,
   stats,
@@ -315,7 +341,10 @@ const Dashboard: React.FC<DashboardProps> = ({
   onEditCaption,
   notifications,
   overlaySettings,
-  cea708Enabled
+  cea708Enabled,
+  editSuggestions = [],
+  onAcceptEditSuggestion,
+  onDismissEditSuggestion
 }) => {
   const t = useTranslation(uiLanguage);
   const scrollRef = useRef<HTMLDivElement>(null);
@@ -345,21 +374,7 @@ const Dashboard: React.FC<DashboardProps> = ({
 
   // 2. Establish Connection to Relay Server (Robust Reconnect)
   useEffect(() => {
-      // Logic to determine WS URL dynamically if not set
-      const getWsUrl = () => {
-        const manual = localStorage.getItem('cc_relay_url');
-        if (manual) return manual;
-        const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-        const host = window.location.hostname;
-        const port = window.location.port;
-        // DEV MODE: Vite dev server → relay on 8080
-        if (port === '5173') return `${protocol}//${host}:8080`;
-        // CLOUD/TUNNEL: No port (default 80/443) → don't append colon
-        const portSuffix = port ? `:${port}` : '';
-        return `${protocol}//${host}${portSuffix}`;
-      };
-
-      const relayUrl = getWsUrl();
+      const relayUrl = getRelayWsUrl();
       let retryTimeout: any;
       let active = true;
 
@@ -397,6 +412,91 @@ const Dashboard: React.FC<DashboardProps> = ({
           clearTimeout(retryTimeout);
       };
   }, []);
+
+  // 2b. Auto-Learn: poll the relay for learned-name suggestions while it is enabled
+  //     and surface them as toasts. Each toast auto-accepts after 10s unless rejected
+  //     (or auto-accept is paused). Accepted entries go straight into the dictionary.
+  const [learnEnabled, setLearnEnabled] = useState(false);
+  const [learnKeyReady, setLearnKeyReady] = useState(true);
+  const [learnToasts, setLearnToasts] = useState<LearnToast[]>([]);
+  const [learnAutoAccept, setLearnAutoAccept] = useState(true);
+  const [learnFlash, setLearnFlash] = useState<string | null>(null);
+  const seenSuggestionIds = useRef<Set<string>>(new Set());
+  const learnToastsRef = useRef<LearnToast[]>([]);
+  useEffect(() => { learnToastsRef.current = learnToasts; }, [learnToasts]);
+
+  const addToDictionary = (entry: { original: string; replacement: string; type?: string }) => {
+      if (!setDictionary) return;
+      setDictionary(prev => {
+          const k = `${entry.original.toLowerCase()}→${entry.replacement.toLowerCase()}`;
+          if (prev.some(e => `${e.original.toLowerCase()}→${e.replacement.toLowerCase()}` === k)) return prev;
+          return [...prev, { original: entry.original, replacement: entry.replacement, type: (entry.type as any) || 'proper_noun', source: 'auto_learned' }];
+      });
+  };
+
+  const acceptLearnToast = async (t: LearnToast, silent = false) => {
+      setLearnToasts(prev => prev.filter(x => x.id !== t.id));
+      try {
+          const res = await fetch(`${getRelayHttpUrl()}/api/context/accept`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ id: t.id }) });
+          const data = await res.json();
+          if (data.ok && data.entry) addToDictionary(data.entry);
+          else addToDictionary(t);
+          if (!silent) { setLearnFlash(`Learned: ${t.replacement}`); setTimeout(() => setLearnFlash(null), 2500); }
+      } catch { addToDictionary(t); }
+  };
+
+  const rejectLearnToast = (t: LearnToast) => {
+      setLearnToasts(prev => prev.filter(x => x.id !== t.id));
+      fetch(`${getRelayHttpUrl()}/api/context/dismiss`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ id: t.id }) }).catch(() => {});
+  };
+
+  const toggleLearn = async () => {
+      const next = !learnEnabled;
+      setLearnEnabled(next);
+      try {
+          await fetch(`${getRelayHttpUrl()}/api/context/enable`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ enabled: next }) });
+      } catch { setLearnEnabled(!next); }
+  };
+
+  useEffect(() => {
+      let active = true;
+      const poll = async () => {
+          if (!relayConnected) return;
+          try {
+              const status = await fetch(`${getRelayHttpUrl()}/api/context/status`).then(r => r.json());
+              if (!active) return;
+              setLearnEnabled(!!status.enabled);
+              setLearnKeyReady(!!status.geminiKeySet);
+              if (!status.enabled) return;
+              const list = await fetch(`${getRelayHttpUrl()}/api/context/suggestions`).then(r => r.json());
+              if (!active || !Array.isArray(list)) return;
+              const now = Date.now();
+              const fresh = list.filter((s: any) => s?.id && !seenSuggestionIds.current.has(s.id));
+              if (fresh.length) {
+                  fresh.forEach((s: any) => seenSuggestionIds.current.add(s.id));
+                  setLearnToasts(prev => [...prev, ...fresh.map((s: any) => ({ id: s.id, original: s.original, replacement: s.replacement, type: s.type || 'proper_noun', createdAt: now, expiresAt: now + LEARN_TOAST_TTL_MS }))].slice(-6));
+              }
+          } catch {}
+      };
+      poll();
+      const interval = setInterval(poll, 5000);
+      return () => { active = false; clearInterval(interval); };
+  }, [relayConnected]);
+
+  // Countdown ticker: auto-accept (or quietly drop) expired toasts
+  const [, forceTick] = useState(0);
+  useEffect(() => {
+      const t = setInterval(() => {
+          const now = Date.now();
+          const expired = learnToastsRef.current.filter(x => x.expiresAt <= now);
+          if (expired.length) {
+              if (learnAutoAccept) expired.forEach(x => acceptLearnToast(x, true));
+              else setLearnToasts(prev => prev.filter(x => x.expiresAt > now));
+          }
+          forceTick(n => n + 1);
+      }, 250);
+      return () => clearInterval(t);
+  }, [learnAutoAccept]);
 
   // 3. Transmit Data (Interim)
   useEffect(() => {
@@ -599,9 +699,9 @@ const Dashboard: React.FC<DashboardProps> = ({
           </Tooltip>
           <div id="metrics" className="hidden lg:flex items-center bg-stone-50 rounded-xl p-2 border border-stone-100 shadow-inner">
                <MetricCard label="Duration" value={formatDuration(stats.durationSeconds)} colorClass="text-stone-800" icon={Clock} />
-               <MetricCard label={t.latency} value={`${stats.latencyMs}ms`} colorClass={stats.latencyMs > 400 ? "text-red-500 animate-pulse" : "text-stone-800"} icon={Signal} />
+               <MetricCard label={t.latency} value={stats.latencySamples ? `${(stats.latencyMs / 1000).toFixed(1)}s` : '—'} colorClass={stats.latencySamples && stats.latencyMs > 3000 ? "text-red-500 animate-pulse" : stats.latencySamples && stats.latencyMs > 1500 ? "text-yellow-600" : "text-stone-800"} icon={Signal} />
                <MetricCard label={t.wpm} value={`${stats.wpmHistory.length > 0 ? Math.round(stats.wpmHistory[stats.wpmHistory.length - 1].wpm) : 0}`} colorClass="text-stone-800" />
-               <MetricCard label={t.confidence} value={`${(stats.averageConfidence * 100).toFixed(0)}%`} colorClass={stats.averageConfidence > 0.9 ? "text-green-600" : "text-yellow-600"} />
+               <MetricCard label={t.confidence} value={stats.confidenceSamples ? `${(stats.averageConfidence * 100).toFixed(0)}%` : '—'} colorClass={!stats.confidenceSamples ? "text-stone-400" : stats.averageConfidence > 0.9 ? "text-green-600" : "text-yellow-600"} />
           </div>
         </div>
 
@@ -618,11 +718,23 @@ const Dashboard: React.FC<DashboardProps> = ({
            )}
 
            <div className="flex flex-col items-end gap-1">
-                <Tooltip text="Manage dictionary definitions, scrape websites for context, and configure engine settings.">
-                    <button id="context-btn" onClick={onOpenContext} className="flex items-center gap-2 px-6 py-2.5 bg-sage-200 hover:bg-sage-300 text-forest-dark text-sm font-bold rounded-xl border border-sage-400 transition-all shadow-sm active:scale-95">
-                        <ShieldCheck size={16} /> Context Engine
-                    </button>
-                </Tooltip>
+                <div className="flex items-center gap-2">
+                    <Tooltip text={!learnKeyReady ? 'Auto-Learn needs a Gemini API key (Context Engine → Settings).' : learnEnabled ? 'Auto-Learn is ON: new names heard in live captions are suggested as toasts and added after 10s unless rejected.' : 'Auto-Learn is OFF. Turn on to learn names, places and acronyms from live speech.'}>
+                        <button
+                            onClick={toggleLearn}
+                            className={`flex items-center gap-1.5 px-3 py-2.5 text-xs font-bold rounded-xl border transition-all active:scale-95 ${learnEnabled ? 'bg-green-50 text-green-700 border-green-300' : 'bg-white text-stone-500 border-stone-200 hover:bg-stone-50'}`}
+                        >
+                            <Zap size={14} className={learnEnabled ? 'text-green-600' : 'text-stone-400'} /> Learn
+                            <span className={`w-1.5 h-1.5 rounded-full ${learnEnabled ? 'bg-green-500 animate-pulse' : 'bg-stone-300'}`} />
+                            {dictionary.length > 0 && <span className="text-[10px] font-mono text-stone-400 ml-0.5">{dictionary.length}</span>}
+                        </button>
+                    </Tooltip>
+                    <Tooltip text="Manage dictionary definitions, scrape websites for context, and configure engine settings.">
+                        <button id="context-btn" onClick={onOpenContext} className="flex items-center gap-2 px-6 py-2.5 bg-sage-200 hover:bg-sage-300 text-forest-dark text-sm font-bold rounded-xl border border-sage-400 transition-all shadow-sm active:scale-95">
+                            <ShieldCheck size={16} /> Context Engine
+                        </button>
+                    </Tooltip>
+                </div>
                 {activeContextName && (
                     <button onClick={() => setShowCorrections(!showCorrections)} className="flex items-center gap-1.5 bg-white text-forest-dark px-2 py-1 rounded border border-stone-200 text-[10px] font-bold hover:bg-stone-50 transition-colors shadow-sm">
                         <span className="w-1.5 h-1.5 rounded-full bg-green-500 animate-pulse"></span>
@@ -634,10 +746,8 @@ const Dashboard: React.FC<DashboardProps> = ({
            <div id="output-btn" className="hidden md:flex items-center gap-2 bg-stone-100 rounded-xl p-1.5 border border-stone-200">
               <div className="px-2 flex items-center gap-1 border-r border-stone-300/50">
                   <Globe size={14} className="text-stone-500" />
-                  <select value={targetLanguage} onChange={(e) => setTargetLanguage(e.target.value)} className="bg-transparent text-xs font-bold text-stone-700 outline-none cursor-pointer py-1 w-20">
-                      <option value="en">English</option>
-                      <option value="es">Español</option>
-                      <option value="fr">Français</option>
+                  <select value={targetLanguage} onChange={(e) => setTargetLanguage(e.target.value)} className="bg-transparent text-xs font-bold text-stone-700 outline-none cursor-pointer py-1 w-24" title="Show a live translation next to the English captions (needs a Gemini key)">
+                      {LANGUAGES.map(l => <option key={l.code} value={l.code}>{l.flag} {l.native}</option>)}
                   </select>
               </div>
               
@@ -800,6 +910,55 @@ const Dashboard: React.FC<DashboardProps> = ({
           </div>
         </div>
       </div>
+      {/* Auto-Learn + operator-edit toasts (bottom-right, above the floating settings button) */}
+      {(learnToasts.length > 0 || learnFlash || editSuggestions.length > 0) && (
+          <div className="fixed bottom-24 right-6 z-40 w-80 space-y-2 pointer-events-none">
+              {editSuggestions.map(s => (
+                  <div key={s.id} className="pointer-events-auto bg-white border border-sage-300 rounded-xl shadow-xl overflow-hidden animate-slide-up">
+                      <div className="p-3 flex items-center gap-3">
+                          <div className="flex-1 min-w-0">
+                              <p className="text-[10px] uppercase tracking-wider font-bold text-sage-600 flex items-center gap-1"><Edit2 size={10} /> From your edit — add a rule?</p>
+                              <p className="text-sm truncate"><span className="text-red-400 line-through">{s.original}</span> <span className="text-stone-300">→</span> <span className="font-bold text-forest-dark">{s.replacement}</span></p>
+                          </div>
+                          <button onClick={() => onAcceptEditSuggestion?.(s.id)} className="px-2.5 py-1.5 rounded-lg bg-forest-dark hover:bg-forest-light text-white text-[10px] font-bold">Add rule</button>
+                          <button onClick={() => onDismissEditSuggestion?.(s.id)} className="px-2.5 py-1.5 rounded-lg bg-stone-100 hover:bg-stone-200 text-stone-600 text-[10px] font-bold">No</button>
+                      </div>
+                  </div>
+              ))}
+              {learnFlash && (
+                  <div className="pointer-events-auto bg-forest-dark text-white text-xs font-bold px-4 py-2 rounded-xl shadow-lg flex items-center gap-2 animate-fade-in">
+                      <Check size={14} className="text-sage-300" /> {learnFlash}
+                  </div>
+              )}
+              {learnToasts.length > 0 && (
+                  <div className="pointer-events-auto flex items-center justify-between text-[10px] font-bold text-stone-500 px-1">
+                      <span className="flex items-center gap-1"><Zap size={11} className="text-green-600" /> Auto-Learn suggestions</span>
+                      <button onClick={() => setLearnAutoAccept(a => !a)} className={`px-2 py-0.5 rounded-full border ${learnAutoAccept ? 'bg-green-50 text-green-700 border-green-200' : 'bg-stone-100 text-stone-500 border-stone-200'}`}>
+                          {learnAutoAccept ? 'auto-accept on' : 'auto-accept paused'}
+                      </button>
+                  </div>
+              )}
+              {learnToasts.map(t => {
+                  const remaining = Math.max(0, t.expiresAt - Date.now());
+                  const pct = Math.round((remaining / LEARN_TOAST_TTL_MS) * 100);
+                  return (
+                      <div key={t.id} className="pointer-events-auto bg-white border border-stone-200 rounded-xl shadow-xl overflow-hidden animate-slide-up">
+                          <div className="p-3 flex items-center gap-3">
+                              <div className="flex-1 min-w-0">
+                                  <p className="text-[10px] uppercase tracking-wider font-bold text-stone-400">Heard in captions</p>
+                                  <p className="text-sm truncate"><span className="text-red-400 line-through">{t.original}</span> <span className="text-stone-300">→</span> <span className="font-bold text-forest-dark">{t.replacement}</span></p>
+                              </div>
+                              <button onClick={() => acceptLearnToast(t)} className="px-2.5 py-1.5 rounded-lg bg-green-500 hover:bg-green-600 text-white text-[10px] font-bold">Accept</button>
+                              <button onClick={() => rejectLearnToast(t)} className="px-2.5 py-1.5 rounded-lg bg-stone-100 hover:bg-stone-200 text-stone-600 text-[10px] font-bold">Reject</button>
+                          </div>
+                          <div className="h-1 bg-stone-100">
+                              <div className={`h-1 ${learnAutoAccept ? 'bg-green-500' : 'bg-stone-300'}`} style={{ width: `${pct}%`, transition: 'width 250ms linear' }} />
+                          </div>
+                      </div>
+                  );
+              })}
+          </div>
+      )}
       {showQrModal && <QrModal onClose={() => setShowQrModal(false)} />}
       {showLinkModal && <LinkModal onClose={() => setShowLinkModal(false)} />}
       <GlobalSettings isOpen={!!openSettingsTab} onClose={() => setOpenSettingsTab(null)} initialTab={openSettingsTab === 'cloud' ? 'cloud' : 'local'} appState={{...stats, ...{apiKey: localStorage.getItem('cc_api_key'), localServerUrl: localStorage.getItem('cc_local_url')}} as any} setAppState={() => {}} />

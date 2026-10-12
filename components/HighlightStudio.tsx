@@ -193,7 +193,7 @@ const HighlightStudio: React.FC<HighlightStudioProps> = ({ clips, sourceFile, lo
             await ffmpeg.exec(['-f', 'concat', '-safe', '0', '-i', 'concat_list.txt', '-c', 'copy', 'output.mp4']);
 
             const data = await ffmpeg.readFile('output.mp4');
-            const url = URL.createObjectURL(new Blob([(data as Uint8Array).buffer], { type: 'video/mp4' }));
+            const url = URL.createObjectURL(new Blob([(data as Uint8Array).buffer as ArrayBuffer], { type: 'video/mp4' }));
             setOutputUrl(url);
 
         } catch (e) {

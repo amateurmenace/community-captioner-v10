@@ -16,6 +16,25 @@ import { Mic, FileVideo, Settings, Loader2, Server, Globe, Download, Monitor, Ch
 import { GITHUB_REPO_URL, GITHUB_CLONE_URL, RELEASES_URL, MAC_DOWNLOAD_URL, WINDOWS_DOWNLOAD_URL } from './utils/appLinks';
 import { GoogleGenAI, LiveServerMessage, Modality } from "@google/genai";
 import { translateText } from './services/geminiService';
+import { buildCorrectionIndex, applyCorrections, diffForRules } from './shared/corrections.js';
+
+// Cloud-mode recognizers. "transcribe-live" is Google's purpose-built live
+// transcription model (far better on proper nouns); "native-audio" is the
+// conversational model the app used before, kept as a fallback.
+const CLOUD_MODELS = {
+    'transcribe-live': 'gemini-3.5-transcribe-live',
+    'native-audio': 'gemini-2.5-flash-native-audio-preview-12-2025',
+} as const;
+
+/** Rolling words-per-minute over the last 60 s of final captions. */
+const rollingWpm = (captions: Caption[], now = Date.now()): number => {
+    const windowMs = 60000;
+    const recent = captions.filter(c => c.isFinal && now - c.timestamp <= windowMs);
+    if (recent.length === 0) return 0;
+    const words = recent.reduce((n, c) => n + c.text.split(/\s+/).filter(Boolean).length, 0);
+    const spanMs = Math.max(now - recent[0].timestamp, 10000); // avoid huge WPM from a single early line
+    return Math.round(words / (Math.min(spanMs, windowMs) / 60000));
+};
 
 // --- Helper Functions for Audio ---
 function base64Encode(bytes: Uint8Array) {
@@ -54,24 +73,43 @@ const getRelayUrl = () => {
     // CLOUD FIX: If no port (standard 80/443), don't append a colon
     const portSuffix = port ? `:${port}` : '';
     
-    // DEV MODE FIX: If running in Vite Dev (5173), assume relay is on 8080 locally
-    if (port === '5173') {
+    // DEV MODE FIX: If running in Vite Dev (5173-5199), assume relay is on 8080 locally
+    const p = parseInt(port || '0');
+    if (p >= 5170 && p <= 5199) {
         return `${protocol}//${host}:8080`;
     }
 
     return `${protocol}//${host}${portSuffix}`;
 };
 
+// HTTP base URL of the relay (REST API), derived the same way as the WebSocket URL
+const getRelayHttpUrl = () => {
+    const ws = getRelayUrl();
+    return ws.replace(/^wss:/, 'https:').replace(/^ws:/, 'http:');
+};
+
+// Dictionary persistence — survives reloads and is mirrored to the relay so the
+// server-side learner can dedupe against it.
+const loadSavedDictionary = (): DictionaryEntry[] => {
+    try {
+        const raw = localStorage.getItem('cc_dictionary');
+        const parsed = raw ? JSON.parse(raw) : [];
+        return Array.isArray(parsed) ? parsed.filter(e => e && e.original && e.replacement) : [];
+    } catch { return []; }
+};
+
 const initialStats: SessionStats = {
     durationSeconds: 0,
     totalWords: 0,
-    averageConfidence: 0.95,
+    averageConfidence: 0,
+    confidenceSamples: 0,
     confidenceHistory: [],
     correctionsMade: 0,
     wpmHistory: [],
     recentCorrections: [],
     systemHealth: 'healthy',
-    latencyMs: 150,
+    latencyMs: 0,
+    latencySamples: 0,
     modeSwitches: []
 };
 
@@ -99,7 +137,7 @@ function App() {
         isRecording: false,
         captions: [],
         interimText: '',
-        dictionary: [],
+        dictionary: loadSavedDictionary(),
         stats: initialStats,
         mode: 'balanced',
         audioSourceId: '',
@@ -108,7 +146,7 @@ function App() {
         overlaySettings,
         learningEnabled: true,
         notifications: [],
-        activeContextName: null,
+        activeContextName: localStorage.getItem('cc_context_name') || null,
         profanityFilter: false,
         partialResults: true,
         speakerLabels: false,
@@ -119,6 +157,7 @@ function App() {
         apiKey: localStorage.getItem('cc_api_key') || process.env.API_KEY || '',
         localServerUrl: localStorage.getItem('cc_local_url') || 'ws://localhost:9000',
         localLlmUrl: 'http://localhost:11434',
+        cloudModel: (localStorage.getItem('cc_cloud_model') as any) || 'transcribe-live',
         
         // Video Studio
         uploadedVideoFile: null,
@@ -163,8 +202,20 @@ function App() {
   const keepAliveAudioRef = useRef<HTMLAudioElement | null>(null);
   const resilienceStrategyRef = useRef<string>('browser');
 
+  // Real-metrics refs: a tiny voice-activity detector marks the last moment the
+  // mic carried speech, so latency = (final caption arrives) − (speech stopped).
+  const vadContextRef = useRef<AudioContext | null>(null);
+  const vadIntervalRef = useRef<any>(null);
+  const lastVoiceTsRef = useRef<number>(0);
+  const latencyEmaRef = useRef<number | null>(null);
+
+  // Proposed rules from operator edits (shown as toasts on the Dashboard)
+  const [editSuggestions, setEditSuggestions] = useState<{ id: string; original: string; replacement: string }[]>([]);
+
   const [currentStream, setCurrentStream] = useState<MediaStream | null>(null);
   const dictionaryRef = useRef(appState.dictionary);
+  const correctionIndexRef = useRef(buildCorrectionIndex(appState.dictionary));
+  const contextSettingsRef = useRef(appState.contextSettings);
   const targetLanguageRef = useRef(appState.targetLanguage);
   const profanityRef = useRef(appState.profanityFilter);
   const activeModeRef = useRef(appState.mode);
@@ -174,7 +225,9 @@ function App() {
   const apiKeyRef = useRef(appState.apiKey);
 
   // Sync refs
-  useEffect(() => { dictionaryRef.current = appState.dictionary; }, [appState.dictionary]);
+  useEffect(() => { dictionaryRef.current = appState.dictionary; correctionIndexRef.current = buildCorrectionIndex(appState.dictionary); }, [appState.dictionary]);
+  useEffect(() => { contextSettingsRef.current = appState.contextSettings; }, [appState.contextSettings]);
+  useEffect(() => { if (appState.cloudModel) localStorage.setItem('cc_cloud_model', appState.cloudModel); }, [appState.cloudModel]);
   useEffect(() => { targetLanguageRef.current = appState.targetLanguage; }, [appState.targetLanguage]);
   useEffect(() => { profanityRef.current = appState.profanityFilter; }, [appState.profanityFilter]);
   useEffect(() => { activeModeRef.current = appState.mode; }, [appState.mode]);
@@ -192,6 +245,26 @@ function App() {
            setAppState(p => ({...p, targetLanguage: 'en'})); // Reset to avoid stuck state
       }
   }, [appState.targetLanguage]);
+
+  // Persist the Context Engine dictionary locally and mirror it to the relay (debounced)
+  useEffect(() => {
+      try { localStorage.setItem('cc_dictionary', JSON.stringify(appState.dictionary)); } catch {}
+      const timer = setTimeout(() => {
+          fetch(`${getRelayHttpUrl()}/api/context/dictionary`, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ dictionary: appState.dictionary, sensitivity: appState.contextSettings.sensitivity }),
+          }).catch(() => {});
+      }, 600);
+      return () => clearTimeout(timer);
+  }, [appState.dictionary, appState.contextSettings.sensitivity]);
+
+  useEffect(() => {
+      try {
+          if (appState.activeContextName) localStorage.setItem('cc_context_name', appState.activeContextName);
+          else localStorage.removeItem('cc_context_name');
+      } catch {}
+  }, [appState.activeContextName]);
 
   // Persist Overlay Settings & Broadcast Change
   useEffect(() => {
@@ -340,22 +413,22 @@ function App() {
   }, [appState.isRecording]);
 
 
-  // Timer Effect
+  // Timer Effect — session clock + a rolling-WPM sample every 5 s (so the chart
+  // decays when nobody is speaking). Latency is measured per caption, not here.
   useEffect(() => {
     let interval: any;
     if (appState.isRecording) {
       interval = setInterval(() => {
         setAppState(prev => {
-            const lastWpm = prev.stats.wpmHistory.length > 0 ? prev.stats.wpmHistory[prev.stats.wpmHistory.length - 1].wpm : 0;
+            const nextSeconds = prev.stats.durationSeconds + 1;
             return {
                 ...prev,
                 stats: {
                     ...prev.stats,
-                    durationSeconds: prev.stats.durationSeconds + 1,
-                    wpmHistory: prev.stats.durationSeconds % 5 === 0 
-                      ? [...prev.stats.wpmHistory, { time: prev.stats.durationSeconds, wpm: lastWpm }]
+                    durationSeconds: nextSeconds,
+                    wpmHistory: nextSeconds % 5 === 0
+                      ? [...prev.stats.wpmHistory, { time: nextSeconds, wpm: rollingWpm(prev.captions) }].slice(-720)
                       : prev.stats.wpmHistory,
-                    latencyMs: Math.floor(100 + Math.random() * 200)
                 }
             };
         });
@@ -372,16 +445,27 @@ function App() {
       setAppState(prev => ({ ...prev, dictionary: typeof val === 'function' ? val(prev.dictionary) : val }));
   }, []);
 
-  const updateStats = useCallback((newWordCount: number, confidence: number, correctionDetail?: string) => {
+  /**
+   * Update session statistics with one final caption.
+   *   confidence   recognizer confidence 0–1, or null when the engine doesn't report one (Gemini)
+   *   latencyMs    measured end-of-speech → caption delay, or null when no speech was detected
+   */
+  const updateStats = useCallback((newWordCount: number, confidence: number | null, correctionDetail?: string, latencyMs?: number | null) => {
       setAppState(prev => {
-          const totalConfidence = (prev.stats.averageConfidence * prev.captions.length) + confidence;
-          const newAvg = totalConfidence / (prev.captions.length + 1);
-          const currentWpm = newWordCount * 12; 
-          
+          const now = Date.now();
+          const samples = prev.stats.confidenceSamples || 0;
+          const hasConf = typeof confidence === 'number' && confidence > 0;
+          const newAvg = hasConf ? ((prev.stats.averageConfidence * samples) + confidence) / (samples + 1) : prev.stats.averageConfidence;
+          const currentWpm = rollingWpm(prev.captions, now);
+
           let newNotifications = [...prev.notifications];
           if (correctionDetail) {
-             newNotifications.push({ id: Date.now().toString(), message: `Fixed: ${correctionDetail}`, type: 'correction', timestamp: Date.now() });
+             newNotifications.push({ id: Date.now().toString(), message: `Fixed: ${correctionDetail}`, type: 'correction', timestamp: now });
           }
+
+          const latSamples = prev.stats.latencySamples || 0;
+          const hasLat = typeof latencyMs === 'number' && latencyMs >= 0;
+          const newLatency = hasLat ? (latSamples === 0 ? latencyMs : Math.round(prev.stats.latencyMs * 0.7 + latencyMs * 0.3)) : prev.stats.latencyMs;
 
           const newRecentCorrections = correctionDetail ? [`${correctionDetail}`, ...prev.stats.recentCorrections].slice(0, 10) : prev.stats.recentCorrections;
           return {
@@ -390,37 +474,59 @@ function App() {
                   ...prev.stats,
                   totalWords: prev.stats.totalWords + newWordCount,
                   averageConfidence: newAvg,
-                  confidenceHistory: [...prev.stats.confidenceHistory, { time: prev.stats.durationSeconds, score: newAvg }],
+                  confidenceSamples: hasConf ? samples + 1 : samples,
+                  confidenceHistory: hasConf ? [...prev.stats.confidenceHistory, { time: prev.stats.durationSeconds, score: newAvg }] : prev.stats.confidenceHistory,
                   correctionsMade: correctionDetail ? prev.stats.correctionsMade + 1 : prev.stats.correctionsMade,
-                  wpmHistory: [...prev.stats.wpmHistory, { time: prev.stats.durationSeconds, wpm: currentWpm }],
+                  wpmHistory: [...prev.stats.wpmHistory, { time: prev.stats.durationSeconds, wpm: currentWpm }].slice(-720),
                   recentCorrections: newRecentCorrections,
-                  systemHealth: newAvg < 0.7 ? 'degraded' : 'healthy'
+                  latencyMs: newLatency,
+                  latencySamples: hasLat ? latSamples + 1 : latSamples,
+                  systemHealth: (hasConf && newAvg < 0.7) || (hasLat && newLatency > 4000) ? 'degraded' : 'healthy'
               },
               notifications: newNotifications
           };
       });
   }, []);
 
+  // Operator edited a caption on the Dashboard: keep the edit, and propose
+  // dictionary rules from the changed word spans ("Learn from operator edits").
   const handleEditCaption = (id: string, newText: string) => {
+    const old = captionsRef.current.find(c => c.id === id);
+    const cleaned = newText.trim();
+    if (old && cleaned && cleaned !== old.text) {
+        const rules = diffForRules(old.text, cleaned);
+        if (rules.length) {
+            const existing = new Set(dictionaryRef.current.map(e => `${e.original.toLowerCase()}→${e.replacement.toLowerCase()}`));
+            const novel = rules.filter(r => !existing.has(`${r.original.toLowerCase()}→${r.replacement.toLowerCase()}`));
+            if (novel.length) setEditSuggestions(prev => [...prev, ...novel.map((r, i) => ({ id: `${Date.now()}-${i}`, ...r }))].slice(-6));
+        }
+    }
     setAppState(prev => ({
         ...prev,
-        captions: prev.captions.map(c => c.id === id ? { ...c, text: newText, isFinal: true, corrected: true } : c)
+        captions: prev.captions.map(c => c.id === id ? { ...c, text: cleaned || c.text, isFinal: true, corrected: true } : c)
     }));
   };
 
-  const processText = (text: string): { final: string, detail: string | null } => {
-    let processed = text;
-    let detail = null;
+  const acceptEditSuggestion = (id: string) => {
+      const s = editSuggestions.find(x => x.id === id);
+      setEditSuggestions(prev => prev.filter(x => x.id !== id));
+      if (!s) return;
+      setDictionary(prev => {
+          const k = `${s.original.toLowerCase()}→${s.replacement.toLowerCase()}`;
+          if (prev.some(e => `${e.original.toLowerCase()}→${e.replacement.toLowerCase()}` === k)) return prev;
+          return [...prev, { original: s.original, replacement: s.replacement, type: 'correction', source: 'operator_edit' }];
+      });
+  };
+  const dismissEditSuggestion = (id: string) => setEditSuggestions(prev => prev.filter(x => x.id !== id));
 
-    const sortedDict = [...dictionaryRef.current].sort((a, b) => b.original.length - a.original.length);
-    for (const entry of sortedDict) {
-        const escapedOriginal = entry.original.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-        const regex = new RegExp(`\\b${escapedOriginal}\\b`, 'gi');
-        if (regex.test(processed)) {
-            processed = processed.replace(regex, entry.replacement);
-            detail = `${entry.original} → ${entry.replacement}`;
-        }
-    }
+  const processText = (text: string): { final: string, detail: string | null } => {
+    // Dictionary: exact word-boundary matches, then phonetic ("sounds-like") matches
+    // gated by the Correction Sensitivity setting. See shared/corrections.js.
+    const { text: corrected, applied } = applyCorrections(text, correctionIndexRef.current, { sensitivity: contextSettingsRef.current?.sensitivity ?? 80 });
+    let processed = corrected;
+    const detail = applied.length
+        ? applied.map(a => `${a.matched} → ${a.replacement}${a.mode === 'phonetic' ? ' (sounds-like)' : ''}`).join(', ')
+        : null;
 
     if (profanityRef.current) {
         const badWords = ['damn', 'hell', 'crap', 'shit', 'fuck'];
@@ -431,16 +537,20 @@ function App() {
     return { final: processed, detail };
   };
 
-  // Exposed so audio callbacks can reach it
-  const finalizeCaption = (text: string, confidence: number = 0.95) => {
+  // Exposed so audio callbacks can reach it. `confidence` is null for engines
+  // that don't report one (Gemini); latency is measured against the VAD.
+  const finalizeCaption = (text: string, confidence: number | null = null) => {
         const { final, detail } = processText(text);
         if (!final.trim()) return;
 
+        const now = Date.now();
+        const latencyMs = lastVoiceTsRef.current ? Math.min(8000, Math.max(0, now - lastVoiceTsRef.current)) : null;
+
         const newCaption: Caption = {
-            id: `${Date.now()}-${Math.random().toString(36).substr(2, 9)}`,
+            id: `${now}-${Math.random().toString(36).substr(2, 9)}`,
             text: final,
-            timestamp: Date.now(),
-            confidence: confidence,
+            timestamp: now,
+            confidence: typeof confidence === 'number' && confidence > 0 ? confidence : 1,
             isFinal: true,
             corrected: !!detail
         };
@@ -458,7 +568,7 @@ function App() {
         }
 
         setCaptions(prev => [...prev, newCaption]);
-        updateStats(final.split(' ').length, confidence, detail || undefined);
+        updateStats(final.split(/\s+/).filter(Boolean).length, confidence, detail || undefined, latencyMs);
         setAppState(prev => ({...prev, interimText: ''}));
         
         // RTMP Simulation Emit
@@ -486,8 +596,35 @@ function App() {
         if (recognitionRef.current) try { recognitionRef.current.stop(); } catch(e) {}
         if (localWs) localWs.close();
         if (geminiSession) try { geminiSession.close(); } catch(e) {}
-        
+        if (vadIntervalRef.current) { clearInterval(vadIntervalRef.current); vadIntervalRef.current = null; }
+        if (vadContextRef.current) { try { vadContextRef.current.close(); } catch(e) {} vadContextRef.current = null; }
+        lastVoiceTsRef.current = 0;
+
         setAppState(p => ({...p, interimText: ''}));
+    };
+
+    // Voice-activity detector: samples mic RMS every 60 ms and remembers the
+    // last moment it exceeded the speech threshold. Used for the latency metric.
+    const startVad = (mediaStream: MediaStream) => {
+        try {
+            const ctx = new AudioContext();
+            const src = ctx.createMediaStreamSource(mediaStream);
+            const analyser = ctx.createAnalyser();
+            analyser.fftSize = 512;
+            src.connect(analyser);
+            const buf = new Float32Array(analyser.fftSize);
+            vadIntervalRef.current = setInterval(() => {
+                analyser.getFloatTimeDomainData(buf);
+                let sum = 0;
+                for (let i = 0; i < buf.length; i++) sum += buf[i] * buf[i];
+                const rms = Math.sqrt(sum / buf.length);
+                if (rms > 0.02) lastVoiceTsRef.current = Date.now();
+            }, 60);
+            vadContextRef.current = ctx;
+            if (ctx.state === 'suspended') ctx.resume().catch(() => {});
+        } catch (e) {
+            console.warn('VAD unavailable', e);
+        }
     };
 
     if (!appState.isRecording) {
@@ -514,6 +651,7 @@ function App() {
             });
             if (!mounted) return;
             setCurrentStream(stream);
+            startVad(stream);
 
             // 2. Initialize Strategy
             
@@ -589,7 +727,8 @@ function App() {
                     let interim = '';
                     for (let i = event.resultIndex; i < event.results.length; ++i) {
                         if (event.results[i].isFinal) {
-                            finalizeCaption(event.results[i][0].transcript, event.results[i][0].confidence);
+                            const conf = event.results[i][0].confidence;
+                            finalizeCaption(event.results[i][0].transcript, typeof conf === 'number' && conf > 0 ? conf : null);
                         } else {
                             interim += event.results[i][0].transcript;
                         }
@@ -638,34 +777,55 @@ function App() {
 
                 // Cloud Mode Transcript Buffer to prevent race conditions
                 let cloudTranscriptBuffer = '';
+                const cloudModelKey = (appState.cloudModel && CLOUD_MODELS[appState.cloudModel]) ? appState.cloudModel : 'transcribe-live';
+                const isTranscribeModel = cloudModelKey === 'transcribe-live';
 
                 const initGeminiLive = async () => {
                     try {
                         const ai = new GoogleGenAI({ apiKey: appState.apiKey });
                         const sessionPromise = ai.live.connect({
-                            model: 'gemini-2.5-flash-native-audio-preview-12-2025',
-                            config: {
-                                responseModalities: [Modality.AUDIO], // Audio output required for conversation model
-                                inputAudioTranscription: {}, // Enabled without specific model to get user transcript
-                                systemInstruction: { parts: [{ text: "You are a transcriber. Listen silently and do not speak." }] }
-                            },
+                            model: CLOUD_MODELS[cloudModelKey],
+                            config: isTranscribeModel
+                                ? {
+                                    // Purpose-built live transcription model: no spoken reply, just
+                                    // inputTranscription segments finalized by its own VAD.
+                                    inputAudioTranscription: {},
+                                  }
+                                : {
+                                    responseModalities: [Modality.AUDIO], // Audio output required for conversation model
+                                    inputAudioTranscription: {}, // Enabled without specific model to get user transcript
+                                    systemInstruction: { parts: [{ text: "You are a transcriber. Listen silently and do not speak." }] }
+                                  },
                             callbacks: {
-                                onopen: () => console.log("Gemini Live Connected"),
+                                onopen: () => console.log(`Gemini Live Connected (${CLOUD_MODELS[cloudModelKey]})`),
                                 onmessage: (msg: LiveServerMessage) => {
-                                    // Handle Real-time Transcription from Gemini
-                                    const transcript = msg.serverContent?.inputTranscription?.text;
+                                    const sc: any = msg.serverContent || {};
+
+                                    if (isTranscribeModel) {
+                                        // Transcribe Live: `interimInputTranscription` carries the cumulative
+                                        // text of the segment being spoken (~2/s); `inputTranscription` is the
+                                        // finished segment, emitted ~1.7 s after the speaker pauses.
+                                        const interim = sc.interimInputTranscription?.text;
+                                        if (interim) setAppState(prev => ({...prev, interimText: interim}));
+                                        const segment = sc.inputTranscription?.text;
+                                        if (segment && segment.trim()) {
+                                            finalizeCaption(segment);
+                                            setAppState(p => ({...p, interimText: ''}));
+                                        }
+                                        return;
+                                    }
+
+                                    // Native-audio model: word fragments arrive as inputTranscription and
+                                    // the turn completes after a pause.
+                                    const transcript = sc.inputTranscription?.text;
                                     if (transcript) {
                                         cloudTranscriptBuffer += transcript;
                                         setAppState(prev => ({...prev, interimText: cloudTranscriptBuffer}));
                                     }
-                                    
-                                    // If turn completes, flush accumulated buffer to final
-                                    if (msg.serverContent?.turnComplete) {
-                                        if (cloudTranscriptBuffer.trim()) {
-                                            finalizeCaption(cloudTranscriptBuffer);
-                                            cloudTranscriptBuffer = ''; // Reset buffer
-                                            setAppState(p => ({...p, interimText: ''}));
-                                        }
+                                    if (sc.turnComplete && cloudTranscriptBuffer.trim()) {
+                                        finalizeCaption(cloudTranscriptBuffer);
+                                        cloudTranscriptBuffer = ''; // Reset buffer
+                                        setAppState(p => ({...p, interimText: ''}));
                                     }
                                 },
                                 onclose: () => {
@@ -716,7 +876,7 @@ function App() {
 
     startRecording();
     return cleanup;
-  }, [appState.isRecording, appState.mode, appState.audioSourceId, appState.apiKey, appState.localServerUrl]);
+  }, [appState.isRecording, appState.mode, appState.audioSourceId, appState.apiKey, appState.localServerUrl, appState.cloudModel]);
 
   const getLastCaptionText = () => {
     const lastCaption = appState.captions.length > 0 ? appState.captions[appState.captions.length - 1] : null;
@@ -976,26 +1136,20 @@ function App() {
                       <p className="text-stone-500 leading-relaxed text-sm">Real-time captioning. Browser or Cloud mode.</p>
                   </div>
 
-                  {/* New: Caption Injection workflow */}
+                  {/* Caption Injection workflow (same card style as the others) */}
                   <div
                       onClick={() => setAppState(p => ({...p, view: 'caption_injection'}))}
-                      className="bg-gradient-to-br from-purple-500 to-pink-500 text-white p-7 rounded-2xl border-2 border-purple-400 hover:shadow-2xl hover:shadow-purple-200 cursor-pointer transition-all group relative overflow-hidden"
+                      className="bg-white p-7 rounded-2xl border-2 border-stone-200 hover:border-sage-500 hover:shadow-xl cursor-pointer transition-all group"
                   >
-                      <div className="absolute -top-4 -right-4 w-24 h-24 bg-white/15 rounded-full blur-2xl"></div>
-                      <div className="relative z-10">
-                          <div className="bg-white/20 w-14 h-14 rounded-full flex items-center justify-center mb-5 group-hover:scale-110 transition-transform"><Zap size={28} /></div>
-                          <div className="flex items-center gap-2 mb-2">
-                              <h2 className="text-xl font-bold">Caption Injection</h2>
-                              <span className="text-[9px] bg-white/25 px-1.5 py-0.5 rounded font-bold uppercase">New</span>
+                      <div className="bg-sage-100 w-14 h-14 rounded-full flex items-center justify-center text-forest-dark mb-5 group-hover:scale-110 transition-transform"><Zap size={28} /></div>
+                      <h2 className="text-xl font-bold text-stone-800 mb-2">Caption Injection</h2>
+                      <p className="text-stone-500 leading-relaxed text-sm">Embed CEA-608/708 into your SDI feed for web-presenter passthrough to YouTube.</p>
+                      {addonStatus && !addonStatus.loaded && (
+                          <div className="mt-3 px-2.5 py-1.5 bg-amber-50 border border-amber-200 text-amber-800 rounded-lg text-[11px] font-medium flex items-center gap-1.5">
+                              <span className="w-1.5 h-1.5 rounded-full bg-amber-500" />
+                              Setup required — DeckLink driver not loaded{addonStatus.platform === 'windows' ? ' on Windows' : ''}
                           </div>
-                          <p className="text-purple-50 leading-relaxed text-sm">Embed CEA-608/708 into your SDI feed for web-presenter passthrough to YouTube.</p>
-                          {addonStatus && !addonStatus.loaded && (
-                              <div className="mt-3 px-2.5 py-1.5 bg-amber-300/30 border border-amber-200/40 rounded-lg text-[11px] font-medium flex items-center gap-1.5">
-                                  <span className="w-1.5 h-1.5 rounded-full bg-amber-200" />
-                                  Setup required — DeckLink driver not loaded{addonStatus.platform === 'windows' ? ' on Windows' : ''}
-                              </div>
-                          )}
-                      </div>
+                      )}
                   </div>
 
                   <div onClick={() => setAppState(p => ({...p, view: 'prerecorded'}))} className="bg-white p-7 rounded-2xl border-2 border-stone-200 hover:border-sage-500 hover:shadow-xl cursor-pointer transition-all group">
@@ -1048,6 +1202,7 @@ function App() {
             interimText={appState.interimText}
             setInterimText={(v) => setAppState(p => ({...p, interimText: v}))}
             dictionary={appState.dictionary}
+            setDictionary={setDictionary}
             mode={appState.mode}
             setMode={(v) => setAppState(p => ({...p, mode: v}))}
             audioSourceId={appState.audioSourceId}
@@ -1068,6 +1223,9 @@ function App() {
             onEditCaption={handleEditCaption}
             overlaySettings={appState.overlaySettings}
             cea708Enabled={appState.cea708Enabled}
+            editSuggestions={editSuggestions}
+            onAcceptEditSuggestion={acceptEditSuggestion}
+            onDismissEditSuggestion={dismissEditSuggestion}
         />
       )}
 
@@ -1142,6 +1300,8 @@ function App() {
             speakerLabels={appState.speakerLabels}
             setSpeakerLabels={(v) => setAppState(p => ({...p, speakerLabels: v}))}
             apiKey={appState.apiKey}
+            contextSettings={appState.contextSettings}
+            setContextSettings={(v) => setAppState(p => ({...p, contextSettings: v}))}
           />
       )}
 

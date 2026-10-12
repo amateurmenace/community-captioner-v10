@@ -1,24 +1,10 @@
 import React, { useEffect, useState, useRef, useCallback } from 'react';
 import { Globe, MessageSquare, Sun, Moon, Maximize, Minimize, Type } from 'lucide-react';
 import { Caption } from '../types';
+import { LANGUAGES as SHARED_LANGUAGES } from '../utils/languages';
+import { Download } from 'lucide-react';
 
-const LANGUAGES = [
-    { code: 'en', name: 'English', flag: '🇺🇸' },
-    { code: 'es', name: 'Español', flag: '🇪🇸' },
-    { code: 'zh', name: '中文', flag: '🇨🇳' },
-    { code: 'fr', name: 'Français', flag: '🇫🇷' },
-    { code: 'pt', name: 'Português', flag: '🇧🇷' },
-    { code: 'ht', name: 'Kreyòl', flag: '🇭🇹' },
-    { code: 'ru', name: 'Русский', flag: '🇷🇺' },
-    { code: 'ar', name: 'العربية', flag: '🇸🇦' },
-    { code: 'vi', name: 'Tiếng Việt', flag: '🇻🇳' },
-    { code: 'ko', name: '한국어', flag: '🇰🇷' },
-    { code: 'ja', name: '日本語', flag: '🇯🇵' },
-    { code: 'de', name: 'Deutsch', flag: '🇩🇪' },
-    { code: 'it', name: 'Italiano', flag: '🇮🇹' },
-    { code: 'pl', name: 'Polski', flag: '🇵🇱' },
-    { code: 'tl', name: 'Tagalog', flag: '🇵🇭' },
-];
+const LANGUAGES = SHARED_LANGUAGES.map(l => ({ code: l.code, name: l.native, flag: l.flag }));
 
 const FONT_SIZES = ['normal', 'large', 'xl'] as const;
 type FontSize = typeof FONT_SIZES[number];
@@ -56,7 +42,8 @@ const AudienceView: React.FC<AudienceViewProps> = ({ onBack }) => {
             const protocol = window.location.protocol;
             const host = window.location.hostname;
             const port = window.location.port;
-            if (port === '5173') return `${protocol}//${host}:8080`;
+            const p = parseInt(port || '0');
+            if (p >= 5170 && p <= 5199) return `${protocol}//${host}:8080`;
             const portSuffix = port ? `:${port}` : '';
             return `${protocol}//${host}${portSuffix}`;
         };
@@ -77,7 +64,8 @@ const AudienceView: React.FC<AudienceViewProps> = ({ onBack }) => {
             const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
             const host = window.location.hostname;
             const port = window.location.port;
-            if (port === '5173') return `${protocol}//${host}:8080`;
+            const p = parseInt(port || '0');
+            if (p >= 5170 && p <= 5199) return `${protocol}//${host}:8080`;
             const portSuffix = port ? `:${port}` : '';
             return `${protocol}//${host}${portSuffix}`;
         };
@@ -163,6 +151,20 @@ const AudienceView: React.FC<AudienceViewProps> = ({ onBack }) => {
         setFontSize(FONT_SIZES[(idx + 1) % FONT_SIZES.length]);
     };
 
+    // Download what this viewer has seen as a plain-text transcript
+    const downloadTranscript = () => {
+        const lines = captions.map(c => (lang !== 'en' && c.translatedText) ? `${c.translatedText}\n  (${c.text})` : c.text);
+        const blob = new Blob([lines.join('\n\n') + '\n'], { type: 'text/plain;charset=utf-8' });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = `captions-${new Date().toISOString().slice(0, 16).replace(/[:T]/g, '-')}.txt`;
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        setTimeout(() => URL.revokeObjectURL(url), 1000);
+    };
+
     // Toggle fullscreen
     const toggleFullscreen = () => {
         if (!document.fullscreenElement) {
@@ -206,6 +208,9 @@ const AudienceView: React.FC<AudienceViewProps> = ({ onBack }) => {
                     </button>
                     <button onClick={toggleFullscreen} className={`p-2 rounded-full transition-colors ${btnBg}`} title="Fullscreen">
                         {isFullscreen ? <Minimize size={16} /> : <Maximize size={16} />}
+                    </button>
+                    <button onClick={downloadTranscript} disabled={captions.length === 0} className={`p-2 rounded-full transition-colors disabled:opacity-40 ${btnBg}`} title="Download transcript">
+                        <Download size={16} />
                     </button>
                     <button onClick={() => setShowLangPicker(!showLangPicker)} className={`p-2 rounded-full transition-colors ${showLangPicker ? 'bg-blue-600 text-white' : btnBg}`} title="Language">
                         <Globe size={16} />

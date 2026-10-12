@@ -1,6 +1,7 @@
 
 import { GoogleGenAI, Type } from "@google/genai";
 import { DictionaryEntry, Caption } from "../types";
+import { languageName } from "../utils/languages";
 
 // Helper to get client with dynamic key
 const getClient = (apiKey?: string) => {
@@ -16,8 +17,9 @@ export const translateText = async (text: string, targetLang: string, apiKey?: s
   try {
     const ai = getClient(apiKey);
     const response = await ai.models.generateContent({
-        model: "gemini-3-flash-preview",
-        contents: `Translate the following text to ${targetLang}. Return ONLY the translated text.\n\nText: "${text}"`,
+        model: "gemini-2.5-flash-lite",
+        contents: `Translate the following live caption to ${languageName(targetLang)}. Return ONLY the translated text, no quotes or explanation.\n\nText: "${text}"`,
+        config: { temperature: 0.1 },
     });
     return response.text?.trim() || text;
   } catch (e) { 
@@ -31,7 +33,7 @@ export const transcribeFile = async (base64Data: string, mimeType: string, apiKe
     
     try {
         const response = await ai.models.generateContent({
-            model: "gemini-2.5-flash-latest", // Updated to 2.5 Flash for better multimedia handling
+            model: "gemini-2.5-flash", // "-latest" alias was removed from the API (404)
             contents: {
                 parts: [
                     { inlineData: { mimeType, data: base64Data } },

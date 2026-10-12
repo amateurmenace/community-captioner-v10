@@ -16,16 +16,20 @@
 import { readFileSync, writeFileSync, mkdirSync, existsSync } from 'fs';
 import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
+import { itemsToEntries, mapLimit, GEMINI_TEXT_MODEL } from './context-sources.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 
-// In pkg builds, __dirname is inside a read-only snapshot.
-// Use the directory next to the executable for writable data.
-const BASE_DIR = typeof process.pkg !== 'undefined'
-  ? dirname(process.execPath)
-  : join(__dirname, '..');
-const DATA_DIR = join(BASE_DIR, '.data');
+// In pkg builds, __dirname is inside a read-only snapshot and the executable
+// lives inside a code-signed .app bundle — writing next to it would break the
+// signature (Gatekeeper then reports the app as damaged). Packaged builds keep
+// their data in ~/.community-captioner/data (same folder cloudflared uses);
+// dev keeps using <repo>/.data.
+import { homedir } from 'os';
+export const DATA_DIR = typeof process.pkg !== 'undefined'
+  ? join(homedir(), '.community-captioner', 'data')
+  : join(__dirname, '..', '.data');
 const DICTIONARY_FILE = join(DATA_DIR, 'dictionary.json');
 
 let geminiApiKey = null;
@@ -176,73 +180,125 @@ ${text.slice(0, 15000)}`;
  * Extract dictionary entries from arbitrary text (for scraping/paste).
  * Returns entries directly (used by scrape endpoint).
  */
-export async function extractDictionary(text, apiKeyOverride) {
+const EXTRACT_CHUNK_CHARS = 24000;   // ~6k tokens per request keeps latency low
+const EXTRACT_MAX_CHUNKS = 6;        // ~144k chars of document text (very long agendas)
+const EXTRACT_MAX_ENTRIES = 400;
+
+/** Split text on paragraph/line boundaries into chunks of roughly `size` chars. */
+function splitTextIntoChunks(text, size) {
+    const chunks = [];
+    let rest = text;
+    while (rest.length > size) {
+        let cut = rest.lastIndexOf('\n\n', size);
+        if (cut < size * 0.5) cut = rest.lastIndexOf('\n', size);
+        if (cut < size * 0.5) cut = rest.lastIndexOf('. ', size);
+        if (cut < size * 0.5) cut = size;
+        chunks.push(rest.slice(0, cut));
+        rest = rest.slice(cut).trim();
+    }
+    if (rest) chunks.push(rest);
+    return chunks;
+}
+
+function parseItemsArray(raw) {
+    if (!raw) return [];
+    let s = String(raw).trim().replace(/^```(?:json)?\s*/i, '').replace(/```\s*$/i, '').trim();
+    let v = null;
+    try { v = JSON.parse(s); } catch {
+        const start = s.indexOf('['), end = s.lastIndexOf(']');
+        if (start !== -1 && end > start) { try { v = JSON.parse(s.slice(start, end + 1)); } catch {} }
+    }
+    if (v && !Array.isArray(v) && Array.isArray(v.entries)) v = v.entries;
+    return Array.isArray(v) ? v : [];
+}
+
+/**
+ * Extract dictionary entries from document text (agenda, minutes, roster,
+ * scraped web page). Long documents are chunked and processed in parallel.
+ *
+ * Returns dictionary entries: [{ original, replacement, type, note? }].
+ * The `original` forms are the lowercase spelling plus plausible speech-to-text
+ * mishearings, so the live caption regex substitution catches both.
+ */
+export async function extractDictionary(text, apiKeyOverride, { domainHint = '' } = {}) {
     const key = apiKeyOverride || geminiApiKey;
-    console.log(`[Learner] extractDictionary called: text=${text?.length || 0} chars, keyOverride=${!!apiKeyOverride}, globalKey=${!!geminiApiKey}, effectiveKey=${!!key} (${key?.slice(0,8)}...)`);
-    if (!key || !text) {
-        console.warn(`[Learner] extractDictionary: BAILING - key=${!!key}, text=${!!text}`);
+    if (!key || !text || !text.trim()) {
+        if (!key) console.warn('[Learner] extractDictionary: no Gemini API key available');
         return [];
     }
 
+    const cleaned = text.replace(/\r\n?/g, '\n').replace(/[ \t]+/g, ' ').replace(/\n{3,}/g, '\n\n').trim();
+    const chunks = splitTextIntoChunks(cleaned, EXTRACT_CHUNK_CHARS).slice(0, EXTRACT_MAX_CHUNKS);
+    console.log(`[Learner] extractDictionary: ${cleaned.length} chars → ${chunks.length} chunk(s), model=${GEMINI_TEXT_MODEL}`);
+
+    let ai;
     try {
-        // Use the @google/genai SDK — same as the frontend — to avoid REST API model availability issues
         const { GoogleGenAI } = await import('@google/genai');
-        const ai = new GoogleGenAI({ apiKey: key });
+        ai = new GoogleGenAI({ apiKey: key });
+    } catch (e) {
+        console.warn('[Learner] Gemini SDK unavailable:', e.message);
+        return [];
+    }
 
-        const prompt = `You are a caption accuracy assistant for live broadcast captioning. Extract all proper nouns, place names, organization names, people's names, titles, and acronyms from this document.
+    const started = Date.now();
+    const perChunk = await mapLimit(chunks, 3, async (chunk, i) => {
+        const prompt = `You are preparing a correction dictionary for live closed captions of ${domainHint || 'a public meeting'}.
+From the document text below, extract every proper noun a speech-to-text engine could get wrong:
+- people's full names (put their title/role in "detail")
+- boards, committees, commissions, departments and organizations
+- places: streets, squares, neighborhoods, parks, buildings, schools, neighboring towns
+- project, program and plan names; ordinances and warrant articles by name
+- acronyms and abbreviations (put the expansion in "detail")
+Skip generic words, lone first names, dates, dollar amounts, URLs, domain names, email addresses, website navigation labels and other page furniture.
 
-For each, provide a JSON object with:
-- "original": how a speech-to-text engine might mishear this word (common phonetic misspellings)
-- "replacement": the correct spelling
-- "type": one of "proper_noun", "place", "acronym", "correction"
+Return ONLY a JSON array of objects:
+{"name": "<exact spelling as written in the document>", "category": "<elected_official|staff|board_or_committee|department|organization|place|school|acronym|term>", "detail": "<role, expansion or short context>", "misheard": ["<1-3 plausible lowercase speech-to-text errors; empty if it sounds like it is spelled>"]}
 
-Return ONLY a JSON array of objects. Include ONLY entries where STT is likely to make errors.
-
-Document:
-${text.slice(0, 30000)}`;
-
-        const response = await ai.models.generateContent({
-            model: 'gemini-2.5-flash',
-            contents: prompt,
-            config: {
-                maxOutputTokens: 4096,
-                temperature: 0.2,
-                responseMimeType: 'application/json',
-            }
-        });
-
-        const rawText = response?.text?.trim();
-        if (!rawText) {
-            console.warn('[Learner] extractDictionary: Gemini returned no text');
+Document${chunks.length > 1 ? ` (part ${i + 1} of ${chunks.length})` : ''}:
+${chunk}`;
+        try {
+            const response = await Promise.race([
+                ai.models.generateContent({
+                    model: GEMINI_TEXT_MODEL,
+                    contents: prompt,
+                    config: { maxOutputTokens: 8192, temperature: 0.1, responseMimeType: 'application/json' },
+                }),
+                new Promise((_, reject) => setTimeout(() => reject(new Error('timeout after 60s')), 60000)),
+            ]);
+            return parseItemsArray(response?.text);
+        } catch (e) {
+            console.warn(`[Learner] extractDictionary chunk ${i + 1} failed:`, e.message);
             return [];
         }
+    });
 
-        console.log(`[Learner] extractDictionary: Got ${rawText.length} chars from Gemini`);
-
-        let entries;
-        try {
-            entries = JSON.parse(rawText);
-        } catch {
-            // Find JSON array in response
-            const start = rawText.indexOf('[');
-            const end = rawText.lastIndexOf(']');
-            if (start !== -1 && end > start) {
-                try {
-                    entries = JSON.parse(rawText.slice(start, end + 1));
-                } catch (e2) {
-                    console.warn('[Learner] extractDictionary: JSON parse failed. Length:', rawText.length);
-                    return [];
-                }
-            } else {
-                console.warn('[Learner] extractDictionary: No JSON array found in response');
-                return [];
+    // Merge items across chunks (first occurrence wins, but keep the richer detail)
+    const byName = new Map();
+    for (const items of perChunk) {
+        if (!Array.isArray(items)) continue;
+        for (const it of items) {
+            if (!it || typeof it.name !== 'string') continue;
+            const name = it.name.trim().replace(/\s+/g, ' ');
+            if (name.length < 2) continue;
+            const k = name.toLowerCase();
+            const existing = byName.get(k);
+            const item = {
+                name,
+                category: typeof it.category === 'string' ? it.category : 'proper_noun',
+                detail: typeof it.detail === 'string' ? it.detail.trim().slice(0, 140) : '',
+                misheard: Array.isArray(it.misheard) ? it.misheard.filter(m => typeof m === 'string').map(m => m.trim().toLowerCase()).filter(Boolean).slice(0, 3) : [],
+            };
+            if (!existing) byName.set(k, item);
+            else {
+                if (!existing.detail && item.detail) existing.detail = item.detail;
+                for (const m of item.misheard) if (!existing.misheard.includes(m) && existing.misheard.length < 3) existing.misheard.push(m);
             }
         }
-        return Array.isArray(entries) ? entries : [];
-    } catch (e) {
-        console.warn('[Learner] extractDictionary error:', e.message);
-        return [];
     }
+
+    const entries = itemsToEntries([...byName.values()]).slice(0, EXTRACT_MAX_ENTRIES);
+    console.log(`[Learner] extractDictionary: ${byName.size} names → ${entries.length} entries in ${Date.now() - started}ms`);
+    return entries;
 }
 
 /**

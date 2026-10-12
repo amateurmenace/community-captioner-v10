@@ -1,7 +1,7 @@
 {
   "name": "community-captioner",
   "private": true,
-  "version": "6.3.2",
+  "version": "6.4.0",
   "type": "module",
   "main": "electron/main.js",
   "description": "AI-powered live captioning for community media.",
@@ -20,7 +20,8 @@
     "dist": "npm run build && npm run build:native && electron-builder",
     "build:app": "node scripts/build-app.js",
     "build:mac": "node scripts/build-app.js --platform mac",
-    "build:windows": "node scripts/build-app.js --platform win"
+    "build:windows": "node scripts/build-app.js --platform win",
+    "build:mac:notarized": "node scripts/build-app.js --platform mac --notarize"
   },
   "dependencies": {
     "@ffmpeg/ffmpeg": "^0.12.10",
@@ -31,6 +32,7 @@
     "lucide-react": "^0.378.0",
     "multer": "^2.1.1",
     "pdf-parse": "^2.4.5",
+    "pdfjs-dist": "5.4.296",
     "react": "^18.3.1",
     "react-dom": "^18.3.1",
     "react-dropzone": "^14.2.3",

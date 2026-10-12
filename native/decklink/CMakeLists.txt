@@ -35,8 +35,20 @@ if(APPLE)
     endif()
     include_directories(${BMD_SDK_DIR})
 
-    # DeckLink framework (system-installed by Desktop Video)
-    find_library(DECKLINK_FRAMEWORK DeckLinkAPI PATHS /Library/Frameworks)
+    # DeckLink framework (system-installed by Desktop Video). Linking it is
+    # optional: DeckLinkAPIDispatch.cpp loads /Library/Frameworks/DeckLinkAPI.framework
+    # at runtime via CFBundle, so CI machines without Desktop Video can still
+    # build the addon from the SDK headers alone (BMD_LINK_FRAMEWORK=OFF).
+    option(BMD_LINK_FRAMEWORK "Link DeckLinkAPI.framework directly (requires Desktop Video installed)" ON)
+    set(DECKLINK_LINK "")
+    if(BMD_LINK_FRAMEWORK)
+        find_library(DECKLINK_FRAMEWORK DeckLinkAPI PATHS /Library/Frameworks)
+        if(DECKLINK_FRAMEWORK)
+            set(DECKLINK_LINK ${DECKLINK_FRAMEWORK})
+        else()
+            message(STATUS "DeckLinkAPI.framework not found — relying on DeckLinkAPIDispatch.cpp to load it at runtime")
+        endif()
+    endif()
 
     add_library(${PROJECT_NAME} SHARED
         ${COMMON_SOURCES}
@@ -45,7 +57,7 @@ if(APPLE)
 
     target_link_libraries(${PROJECT_NAME}
         ${CMAKE_JS_LIB}
-        ${DECKLINK_FRAMEWORK}
+        ${DECKLINK_LINK}
         "-framework CoreFoundation"
     )
 

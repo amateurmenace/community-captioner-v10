@@ -15,6 +15,10 @@ export interface DictionaryEntry {
   replacement: string;
   type: 'proper_noun' | 'place' | 'correction' | 'acronym';
   sensitivity?: number; // 0-1
+  /** Role, expansion or context shown in the UI (e.g. "Select Board Chair", "Department of Public Works") */
+  note?: string;
+  /** Where the entry came from: wizard, pdf, paste, url, names, auto_learned, manual */
+  source?: string;
 }
 
 export interface Notification {
@@ -27,15 +31,24 @@ export interface Notification {
 export interface SessionStats {
   durationSeconds: number;
   totalWords: number;
+  /** Mean of the recognizer's confidence scores (only engines that report one, e.g. Web Speech) */
   averageConfidence: number;
+  /** How many captions contributed a real confidence score; 0 → show "—" */
+  confidenceSamples?: number;
   confidenceHistory: { time: number; score: number }[];
   correctionsMade: number;
+  /** Rolling words-per-minute over the last 60 seconds, sampled every 5 s */
   wpmHistory: { time: number; wpm: number }[];
   recentCorrections: string[];
   systemHealth: 'healthy' | 'degraded' | 'offline';
+  /** Measured end-of-speech → final caption delay (EMA, ms); 0 until the first measurement */
   latencyMs: number;
+  latencySamples?: number;
   modeSwitches?: { from: string; to: string; time: number }[];
 }
+
+/** Which Gemini Live model Cloud mode uses */
+export type CloudModel = 'transcribe-live' | 'native-audio';
 
 export interface Session {
   id: string;
@@ -107,6 +120,7 @@ export interface AppState {
   apiKey?: string;
   localServerUrl?: string; // Whisper
   localLlmUrl?: string; // Ollama (new)
+  cloudModel?: CloudModel; // Cloud mode recognizer (default: transcribe-live)
   
   // Video Studio
   uploadedVideoFile: File | null;
@@ -139,9 +153,10 @@ export interface DeckLinkDisplayMode {
 
 export interface DeckLinkStatus {
     running: boolean;
-    mode: 'standalone' | 'passthrough' | 'stopped';
+    mode: 'standalone' | 'passthrough' | 'ndi_passthrough' | 'stopped';
     framesOutput: number;
     droppedFrames: number;
+    frameRate?: string;
 }
 
 // Declare window.decklink (injected by Electron preload)
