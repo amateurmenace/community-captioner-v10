@@ -190,41 +190,36 @@ let youtubeCaptionState = {
     lastError: null,
 };
 
-function formatYouTubeTimecode(ms) {
-    // YouTube accepts "HH:MM:SS.mmm" relative to stream start.
-    const totalMs = Math.max(0, ms);
-    const hours = Math.floor(totalMs / 3600000);
-    const minutes = Math.floor((totalMs % 3600000) / 60000);
-    const seconds = Math.floor((totalMs % 60000) / 1000);
-    const millis = totalMs % 1000;
-    const pad = (n, w = 2) => n.toString().padStart(w, '0');
-    return `${pad(hours)}:${pad(minutes)}:${pad(seconds)}.${pad(millis, 3)}`;
-}
-
 async function forwardToYouTube(text) {
     if (!youtubeCaptionState.url || !text) return;
     try {
         const now = Date.now();
         if (!youtubeCaptionState.sessionStartMs) youtubeCaptionState.sessionStartMs = now;
-        const offset = now - youtubeCaptionState.sessionStartMs;
-        const seq = youtubeCaptionState.sequence++;
+        // YouTube's ingestion endpoint wants the caption's absolute UTC time
+        // (YYYY-MM-DDTHH:MM:SS.mmm, no "Z", within about a minute of its clock) and a
+        // sequence number that only ever increases for the stream. A relative
+        // "HH:MM:SS.mmm" clock, or a counter restarting at 1 after the URL is re-saved,
+        // is answered with HTTP 400 "Can't parse HTTP POST body" (verified 2026-10-12).
+        const seq = Math.max(youtubeCaptionState.sequence, Math.floor(now / 1000));
+        youtubeCaptionState.sequence = seq + 1;
         // Build URL with &seq= appended (replace if already present)
         const baseUrl = youtubeCaptionState.url.replace(/[?&]seq=\d+/, '');
         const sep = baseUrl.includes('?') ? '&' : '?';
         const url = `${baseUrl}${sep}seq=${seq}`;
-        const body = `${formatYouTubeTimecode(offset)}\n${text}\n`;
+        const body = `${new Date(now).toISOString().replace('Z', '')}\n${text}\n`;
         const controller = new AbortController();
         const timer = setTimeout(() => controller.abort(), 2000);
         const resp = await fetch(url, {
             method: 'POST',
-            headers: { 'Content-Type': 'text/plain' },
+            headers: { 'Content-Type': 'text/plain' },  // no charset: YouTube rejects it
             body,
             signal: controller.signal,
         });
         clearTimeout(timer);
         if (!resp.ok) {
-            youtubeCaptionState.lastError = `HTTP ${resp.status}`;
-            console.warn(`[YouTube CC] POST failed: ${resp.status} ${resp.statusText}`);
+            const detail = (await resp.text().catch(() => '')).replace(/\s+/g, ' ').trim().slice(0, 120);
+            youtubeCaptionState.lastError = `HTTP ${resp.status}${detail ? ': ' + detail : ''}`;
+            console.warn(`[YouTube CC] POST failed: ${resp.status} ${detail || resp.statusText}`);
         } else {
             youtubeCaptionState.lastError = null;
             youtubeCaptionState.lastPostMs = now;
@@ -849,6 +844,9 @@ app.post('/api/inject/caption', (req, res) => {
         processed = r.text; applied = r.applied;
     }
     feedCaptionToEncoder({ type: 'caption', isFinal: !!isFinal, payload: { text: processed } });
+    // Same backup path as Dashboard captions: when a YouTube caption-ingestion URL is
+    // set, every final line is POSTed to YouTube directly (bypasses the SDI encoder).
+    if (isFinal) forwardToYouTube(processed);
     res.json({ ok: true, text: processed, applied });
 });
 
@@ -1036,7 +1034,9 @@ app.post('/api/youtube/caption-url', (req, res) => {
         }
         youtubeCaptionState.url = trimmed;
         youtubeCaptionState.sessionStartMs = Date.now();
-        youtubeCaptionState.sequence = 1;
+        // Epoch seconds, so a re-saved URL never sends a sequence number below one
+        // YouTube has already accepted for this stream.
+        youtubeCaptionState.sequence = Math.floor(Date.now() / 1000);
         youtubeCaptionState.lastError = null;
         console.log(`[YouTube CC] Ingestion URL set, session start ${new Date(youtubeCaptionState.sessionStartMs).toISOString()}`);
     } else {
