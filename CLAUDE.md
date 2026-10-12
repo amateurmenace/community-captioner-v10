@@ -514,6 +514,8 @@ Several gotchas that don't apply on macOS:
 
 9. **Verifying SDI output: `tools/sdi-verify/`.** `ndi_testsrc` (NDI source with 75% bars, a moving box, 1 kHz left / 440 Hz right at NDI reference level), `decklink_probe` (reads a DeckLink input: bars match, tone levels per channel, CDP packets decoded to CEA-608 text, PASS/FAIL against ndi_testsrc) and `ndi-sdi-run.mjs` (drives NDI → SDI injection through the relay API). Built and run on Windows; the README has the on-site loopback procedure and the macOS build.
 
+10. **DeckLink strings on Windows were freed twice (fixed 2026-10-12).** `BMDStringToStd()` in `platform.h` attached the BSTR with `_bstr_t(s, false)`, which takes ownership and frees it, and `device_manager.cpp` then called `BMDStringFree()` on it again: every device name and every display-mode name (~800 per `enumerateDevices()` on the 13-device rig) was double-freed. The OLE BSTR cache hid it; with `OANOCACHE=1` 50 enumerations killed node with STATUS_HEAP_CORRUPTION (0xC0000374). It now copies (`_bstr_t(s, true)`), so the caller frees once, the same contract as the macOS CFString version; the same test then completes (41 300 strings, exit 0) and the packaged exe answered 20 device-list requests with the cache off. macOS was never affected.
+
 ### Frame & buffer access pattern (Windows)
 
 ```cpp

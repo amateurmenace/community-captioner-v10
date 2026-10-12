@@ -38,13 +38,10 @@ static const uint8_t BARS[8][3] = {
 };
 static const char* BAR_NAMES[8] = { "white", "yellow", "cyan", "green", "magenta", "red", "blue", "black" };
 
-// platform.h's BMDStringToStd already releases the string on Windows (_bstr_t takes
-// ownership); on macOS the CFString still has to be released.
+// BMDStringToStd copies; the caller releases the DeckLink string on both platforms.
 static std::string TakeString(BMDString s) {
     std::string out = BMDStringToStd(s);
-#ifndef _WIN32
     BMDStringFree(s);
-#endif
     return out;
 }
 

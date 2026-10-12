@@ -18,9 +18,13 @@
 
     using BMDString = BSTR;
 
+    // Copies the string; the caller still owns `s` and releases it with BMDStringFree,
+    // the same contract as the macOS CFString version. (Attaching with _bstr_t(s, false)
+    // took ownership and freed it here, so the callers' BMDStringFree freed every name
+    // twice: STATUS_HEAP_CORRUPTION in enumerateDevices once the BSTR cache is off.)
     inline std::string BMDStringToStd(BMDString s) {
         if (!s) return "";
-        _bstr_t b(s, false);
+        _bstr_t b(s, true);
         std::string out((const char*)b);
         return out;
     }
