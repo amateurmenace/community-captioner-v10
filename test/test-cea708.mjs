@@ -268,6 +268,21 @@ console.log('\n═══ CEA-708 DTVCC Encoder ═══');
     for (let f = 0; f < 120; f++) { const d = e13.drainFrame(35); if (d) { dec13.feedFrame(dtvccFromCdp(b13.buildCDP_DTVCC(d, '29.97', 0x80, 0x80, false))); shown13.push(dec13.display()[0]); } }
     assert([...new Set(shown13)].join('|') === 'First caption part one,|first caption part two|Second caption arrives', `parts are shown in order, nothing cut off (got ${JSON.stringify([...new Set(shown13)])})`);
 
+    // Atomic queue under fast speech: captions arriving faster than parts can be shown replace the waiting parts
+    const e14 = new DtvccEncoder(); e14.setRows(2); e14.setRepaint(30); e14.setRedraw({ style: 'atomic', atomicDelete: true, repeat: 2, repeatGap: 3, keepAlive: false, atomicHoldFrames: 30 });
+    e14.setFrameCapacity(35);
+    const dec14 = new DtvccDecoder(); const b14 = new Cea708CdpBuilder();
+    const shown14 = []; let f14 = 0;
+    const tick = (n) => { for (let i = 0; i < n; i++, f14++) { const d = e14.drainFrame(35); if (d) { dec14.feedFrame(dtvccFromCdp(b14.buildCDP_DTVCC(d, '29.97', 0x80, 0x80, false))); shown14.push(`${f14}:${dec14.display()[0]}`); } } };
+    e14.enqueueText('Caption A part one and A part two here'); tick(10);
+    e14.enqueueText('Caption B part one and B part two here'); tick(10);
+    e14.enqueueText('Caption C part one and C part two here'); tick(200);
+    const order14 = [...new Set(shown14.map(x => x.split(':')[1]))];
+    assert(order14[0] === 'Caption A part one and' && order14[order14.length - 1] === 'C part two here' && !order14.includes('Caption B part one and') && e14.atomicDropped >= 2,
+        `the part on screen finishes, waiting parts are replaced by the newest caption (shown ${JSON.stringify(order14)}, dropped ${e14.atomicDropped})`);
+    const gaps14 = shown14.map(x => +x.split(':')[0]); let minGap = 999; for (let i = 1; i < gaps14.length; i++) { const g = gaps14[i] - gaps14[i - 1]; if (g > 1 && g < minGap) minGap = g; }
+    assert(minGap >= 3, `copies keep their spacing under load (min gap ${minGap} frames)`);
+
     // Two-window atomic: rows A and B in windows 0 and 1, each packet self-contained; a lone row hides window 0
     const e12 = new DtvccEncoder(); e12.setRows(2); e12.setRepaint(30); e12.setRedraw({ style: 'atomic', atomicDelete: true, atomicWindows: 2, repeat: 2, repeatGap: 10, keepAlive: false });
     e12.setFrameCapacity(35);

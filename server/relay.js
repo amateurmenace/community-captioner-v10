@@ -188,13 +188,13 @@ let captionConfig = {
     // wrong row and recovers a lost row at the next copy or keep-alive.
     dtvccRepaintFrames: 30,     // keep-alive interval when dtvccKeepAlive is on (1 = continuous, the decoder preset)
     dtvccRepeat: 6,             // the one-frame default: six copies four frames apart (measured 29-30/30 on YouTube through a Web Presenter)
-    dtvccRepeatGap: 4,
+    dtvccRepeatGap: 3,
     dtvccKeepAlive: false,      // false = burst only (YouTube's converter shows a re-sent window for a moment per 5 s segment)
     dtvccStyle: 'atomic',       // 'rollup' | 'popon' | 'youtube' | 'atomic' (see dtvcc-encoder.js); atomic = one-frame captions, the default since 6.13.3
     dtvccCcCount: 0,            // cc_data triplets per frame: 0 = standard for the rate (20 at 29.97). The Web Presenter re-packs to 20 and a 31 wedges it: leave 0.
     dtvccAtomicDelete: true,    // atomic style: DeleteWindow + DefineWindow (23 characters) instead of Hide + pen + HCR (19)
     dtvccAtomicWindows: 1,      // atomic style: 2 = two rows per caption, each row its own window and one-frame packet
-    dtvccAtomicHoldFrames: 60,  // atomic style: frames each part of a long caption stays before the next part
+    dtvccAtomicHoldFrames: 45,  // atomic style: frames each part of a long caption stays before the next part (1.5 s; later captions replace waiting parts)
     // Experiments (API only): service blocks per packet (1|2), row erase ('pad'|'hcr'),
     // fixed row width (0 = one packet per row), DefineWindow with every caption.
     dtvccBlocks: 1,

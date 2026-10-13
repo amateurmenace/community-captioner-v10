@@ -163,7 +163,7 @@ const CaptionInjection: React.FC<CaptionInjectionProps> = ({ onBack, apiKey }) =
     const [dtvccStyle, setDtvccStyle] = useState('atomic');
     // Transport presets (see dtvcc-encoder.js); the preset shown is derived from the live config
     const DTVCC_PRESETS: Record<string, Record<string, unknown>> = {
-        webpresenter: { dtvccStyle: 'atomic', dtvccAtomicDelete: true, dtvccAtomicWindows: 1, dtvccAtomicHoldFrames: 60, dtvccRepaintFrames: 30, dtvccKeepAlive: false, dtvccRepeat: 6, dtvccRepeatGap: 4, dtvccRowErase: 'hcr' },
+        webpresenter: { dtvccStyle: 'atomic', dtvccAtomicDelete: true, dtvccAtomicWindows: 1, dtvccAtomicHoldFrames: 45, dtvccRepaintFrames: 30, dtvccKeepAlive: false, dtvccRepeat: 6, dtvccRepeatGap: 3, dtvccRowErase: 'hcr' },
         youtube:    { dtvccStyle: 'popon',   dtvccRepaintFrames: 30, dtvccKeepAlive: false, dtvccRepeat: 3, dtvccRepeatGap: 3, dtvccRowErase: 'hcr' },
         immediate:  { dtvccStyle: 'youtube', dtvccRepaintFrames: 30, dtvccKeepAlive: false, dtvccRepeat: 3, dtvccRepeatGap: 4, dtvccRowErase: 'hcr' },
         continuous: { dtvccStyle: 'rollup',  dtvccRepaintFrames: 1,  dtvccKeepAlive: true,  dtvccRepeat: 1, dtvccRepeatGap: 3, dtvccRowErase: 'pad' },

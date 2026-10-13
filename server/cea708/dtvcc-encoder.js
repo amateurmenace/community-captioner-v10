@@ -88,6 +88,7 @@ export class DtvccEncoder {
         this._atomicDelete = false; // atomic: DeleteWindow + DefineWindow instead of HideWindow + SetPenLocation + HCR (4 more characters)
         this._atomicWindows = 1;    // atomic: 1 = one row per caption; 2 = two rows, each its own window and packet
         this._atomicHoldFrames = 45;// atomic: frames a part stays before the next part of a long caption goes out
+        this.atomicDropped = 0;     // atomic: parts replaced by newer captions before they were sent
         this._atomicQueue = [];     // atomic: parts (one-row texts) waiting to be sent, in order
         this._capacity = DEFAULT_CAPACITY;
         this._framesSinceRepaint = 0;
@@ -359,6 +360,7 @@ export class DtvccEncoder {
         if (this._atomicWindows === 2) {
             // two rows at a time: row A in window 0 (85 % down), row B in window 1 (90 % down);
             // a lone row goes into window 1 and its packet also hides window 0
+            this._packets = [];
             const pairs = [];
             for (let i = 0; i < parts.length; i += 2) pairs.push(parts.slice(i, i + 2));
             pairs.forEach((pair, k) => {
@@ -372,27 +374,36 @@ export class DtvccEncoder {
                 }
             });
         } else {
-            // One-row parts go through a queue so that a caption arriving while an earlier
-            // caption's parts are still being shown appends instead of cutting them off. Each
-            // part is sent `copies` times `repeatGap` frames apart and then held until
-            // atomicHoldFrames have passed since its first packet. When the queue is behind
-            // by more than three parts the hold shrinks to the copies themselves (catch-up).
-            if (newCaption) this._atomicQueue.push(...parts);
-            const packetsPerPart = copies + (copies - 1) * this._repeatGap;
-            const hold = Math.max(this._atomicHoldFrames, packetsPerPart);
-            const catchUp = this._atomicQueue.length > 3;
-            while (this._atomicQueue.length) {
-                const text = this._atomicQueue.shift();
-                for (let copy = 0; copy < copies; copy++) {
-                    if (copy > 0) for (let g = 0; g < this._repeatGap; g++) this._packets.push(null);
-                    this._packets.push(packetFor(text, 0, 0x01, 90));
-                }
-                if (this._atomicQueue.length) for (let g = packetsPerPart; g < (catchUp ? packetsPerPart : hold); g++) this._packets.push(null);
+            // One-row parts wait in a queue; only the part on screen is in _packets (its copies,
+            // then idle frames until atomicHoldFrames have passed since its first packet), and
+            // the next part starts when those run out (see drainFrame). A caption that arrives
+            // while older parts are still waiting replaces them: the viewer gets the newest text
+            // at the normal pace instead of a backlog flashing by (which a caption converter such
+            // as YouTube's would mostly drop anyway). At most two parts wait at any time.
+            if (newCaption) {
+                this._atomicQueue.push(...parts);
+                if (this._atomicQueue.length > 2) { this.atomicDropped = (this.atomicDropped || 0) + this._atomicQueue.length - 2; this._atomicQueue = this._atomicQueue.slice(-2); }
             }
+            if (this._packets.length === 0) this._startAtomicPart(packetFor);
         }
         this._windowDefined = true;
         if (newCaption) this._repaintCount++;
         this._framesSinceRepaint = 0;
+    }
+
+    /** Schedule the next waiting part: its copies, then idle frames up to the hold time. */
+    _startAtomicPart(packetFor) {
+        if (!this._atomicQueue.length) return;
+        const text = this._atomicQueue.shift();
+        const copies = this._repeat;
+        const span = copies + (copies - 1) * this._repeatGap;
+        const hold = Math.max(this._atomicHoldFrames, span);
+        for (let copy = 0; copy < copies; copy++) {
+            if (copy > 0) for (let g = 0; g < this._repeatGap; g++) this._packets.push(null);
+            this._packets.push(packetFor(text, 0, 0x01, 90));
+        }
+        for (let g = span; g < hold; g++) this._packets.push(null);
+        this._atomicPacketFor = packetFor;
     }
 
     // ---------------------------------------------------------------- public API
@@ -417,11 +428,9 @@ export class DtvccEncoder {
             // (pop-on: each caption stands alone), then the whole window is re-sent.
             const rows = wrapRows(trimmed, this.columns);
             if (this._style === 'atomic') {
-                // long captions become consecutive one-row parts; keep whatever is still queued
+                // long captions become consecutive one-row parts; the part on screen finishes its hold
                 this._atomicParts = rows; this._lines = rows.slice(-1);
-                const pending = this._packets;
-                this._queueRedraw(true, true);
-                if (pending.length) this._packets = pending.concat(this._packets);
+                this._queueAtomic(true);
                 return;
             }
             else if (this._style === 'popon') this._lines = rows.slice(-this._rows);
@@ -475,6 +484,7 @@ export class DtvccEncoder {
             if (this._style === 'popon' || this._style === 'youtube' || this._style === 'atomic') {
                 // hide the window(s), repeated for the copies
                 this._packets = [];
+                this._atomicQueue = [];
                 for (let copy = 0; copy < this._repeat; copy++) {
                     if (copy > 0) for (let g = 0; g < this._repeatGap; g++) this._packets.push(null);
                     this._packets.push(this._blocks([0x8A, 0x03, CMD.ETX]));
@@ -516,6 +526,7 @@ export class DtvccEncoder {
                     this._queueRedraw(false);
                 }
             }
+            if (this._packets.length === 0 && this._style === 'atomic' && this._atomicQueue.length && this._atomicPacketFor) this._startAtomicPart(this._atomicPacketFor);
             if (this._packets.length === 0) return null;
             const pkt = this._packets.shift();
             if (!pkt) return null;                 // deliberate idle frame between copies
@@ -585,5 +596,6 @@ export class DtvccEncoder {
         this._repaintCount = 0;
         this._classicRowsWritten = 0;
         this._win = 1;
+        this._atomicQueue = [];
     }
 }
