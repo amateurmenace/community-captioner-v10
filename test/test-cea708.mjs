@@ -182,6 +182,46 @@ console.log('\n═══ CEA-708 DTVCC Encoder ═══');
     const seq7 = []; for (let f = 0; f < 9; f++) { const p = e7.drainFrame(CAP); seq7.push(p ? (p[1] === 0x98 ? 'D' : String(p[2])) : '-'); }
     assert(seq7.join('') === 'D01010101', `Continuous: DefineWindow then row 0, row 1, row 0, row 1 … every frame (got ${seq7.join('')})`);
 
+    // Burst mode (keepAlive false): DefineWindow + the rows `repeat` times, then silence
+    const e8 = new DtvccEncoder(); e8.setRows(2); e8.setRepaint(30); e8.setRedraw({ repeat: 5, repeatGap: 4, keepAlive: false, rowErase: 'hcr' });
+    e8.enqueueText('Burst mode rows');
+    const seq8 = []; for (let f = 0; f < 120; f++) { const p = e8.drainFrame(CAP); seq8.push(p ? (p[1] === 0x98 ? 'D' : String(p[2])) : '-'); }
+    assert(seq8.join('').replace(/-+$/, '') === 'D01----01----01----01----01' && !seq8.slice(27).some(x => x !== '-'), `Burst: DFW, 5 copies 4 frames apart, then nothing for the rest of the window (got ${seq8.join('').slice(0, 40)})`);
+    const b8 = new Cea708CdpBuilder(); const dec8 = new DtvccDecoder(); const e8b = new DtvccEncoder(); e8b.setRows(2); e8b.setRepaint(30); e8b.setRedraw({ repeat: 5, repeatGap: 4, keepAlive: false, rowErase: 'hcr' });
+    e8b.enqueueText('Burst mode rows');
+    for (let f = 0; f < 30; f++) { const d = e8b.drainFrame(CAP); dec8.feedFrame(f >= 1 && f <= 15 ? null : dtvccFromCdp(b8.buildCDP_DTVCC(d, '29.97', 0x80, 0x80, false))); }
+    assert(dec8.display().join('|') === 'Burst mode rows|', `Burst with the first three copies lost still displays the caption (got "${dec8.display().join('|')}")`);
+    assert(dec8.events.some(e => e.kind === 'hcr'), 'HCR row erase used instead of space padding');
+
+    // Pop-on style: hidden window per caption, rows name their window, DisplayWindow/HideWindow swap
+    const e9 = new DtvccEncoder(); e9.setRows(2); e9.setRepaint(30); e9.setRedraw({ style: 'popon', repeat: 2, repeatGap: 4, keepAlive: false, rowErase: 'hcr' });
+    const b9 = new Cea708CdpBuilder(); const dec9 = new DtvccDecoder();
+    const feed9 = (n, drop = () => false) => { for (let f = 0; f < n; f++) { const d = e9.drainFrame(CAP); dec9.feedFrame(drop(f) ? null : dtvccFromCdp(b9.buildCDP_DTVCC(d, '29.97', 0x80, 0x80, false))); } };
+    assert(e9.columns === 26, `Pop-on rows are 26 columns (SetCurrentWindow byte) (got ${e9.columns})`);
+    e9.enqueueText('First pop-on caption');
+    const p9 = e9.drainFrame(CAP);
+    assert(p9[1] === 0x98 && p9[2] === 0x00, `First caption defines window 0 hidden (got ${p9.slice(1, 3).map(b => b.toString(16)).join(' ')})`);
+    dec9.feedFrame(dtvccFromCdp(b9.buildCDP_DTVCC(p9, '29.97', 0x80, 0x80, false)));
+    // layout for 2 copies: DFW, idle, DFW, rows ×2 (4 packets), show, gap 4, show
+    feed9(2 + 4);
+    assert(dec9.display().join('|') === '', 'Rows written while the window is still hidden show nothing');
+    feed9(1);
+    assert(dec9.display().join('|') === 'First pop-on caption|' && dec9.windows[0].visible && !dec9.windows[1].visible, `First show packet displays window 0 (got "${dec9.display().join('|')}")`);
+    feed9(12);
+    e9.enqueueText('Second pop-on caption');
+    feed9(8, (f) => f === 7);   // the first show packet of the second caption is lost
+    assert(dec9.display().join('|') === 'First pop-on caption|', 'Lost show packet: the first caption stays on screen');
+    feed9(6);
+    assert(dec9.display().join('|') === 'Second pop-on caption|' && dec9.windows[1].visible && !dec9.windows[0].visible, `Second show swaps to window 1 (got "${dec9.display().join('|')}")`);
+    e9.enqueueClear(); feed9(3);
+    assert(dec9.display().join('|') === '', 'Clear hides both windows');
+
+    // YouTube style: every copy = HideWindow + DefineWindow, rows, first row again; no keep-alive
+    const e10 = new DtvccEncoder(); e10.setRows(2); e10.setRepaint(30); e10.setRedraw({ style: 'youtube', repeat: 2, repeatGap: 4, keepAlive: false, rowErase: 'hcr' });
+    e10.enqueueText('YouTube style rows');
+    const seq10 = []; for (let f = 0; f < 60; f++) { const p = e10.drainFrame(CAP); seq10.push(p ? (p[1] === 0x8A && p[3] === 0x98 ? 'H' : String(p[2])) : '-'); }
+    assert(seq10.join('').replace(/-+$/, '') === 'H010----H010', `YouTube style: hide+define, row 0, row 1, row 0 again, twice (got ${seq10.join('').slice(0, 20)})`);
+
     // Classic roll-up (repaint 0): CW0, text, ETX as a byte stream; CR BEFORE every later row
     const e5 = new DtvccEncoder(); e5.setRows(2); e5.setRepaint(0);
     e5.enqueueText('Hi');

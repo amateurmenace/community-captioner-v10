@@ -31,7 +31,9 @@ async function post(path, body) {
 }
 async function get(path) { return (await fetch(BASE + path)).json(); }
 
-const WORDS = ['the quick brown fox jumps over the lazy dog', 'select board meeting of the town of brookline', 'public comment on the capital improvement plan', 'all those in favor say aye the motion carries', 'report from the town administrator on water', 'the next item is the school budget for next year', 'thank you very much madam chair for that update', 'we will now take a short recess of five minutes'];
+// two rows of at most 26 characters, both unique per caption: "<TAG>nn <first>" and "<second> <nn>"
+const FIRST = ['quick brown fox jumps', 'select board of the', 'public comment on the', 'all those in favor', 'report from the town', 'the next item is the', 'thank you madam chair', 'we now take a short'];
+const SECOND = ['over the lazy dog', 'town of brookline', 'capital plan tonight', 'say aye motion carries', 'administrator on water', 'school budget for next', 'for that update today', 'recess of five minutes'];
 
 const st = await get('/api/inject/status');
 if (!st.running) { console.error(`${stamp()} injection is not running on ${BASE} — start Caption Injection first`); process.exit(1); }
@@ -50,7 +52,8 @@ for (let i = 1; i <= N; i++) {
     // wait for the frame counter to reach the next slot
     let s;
     for (;;) { s = await get('/api/inject/status'); if (s.framesOutput >= next) break; await sleep(20); }
-    const text = `${TAG}${String(i).padStart(2, '0')} ${WORDS[i % WORDS.length]}.`;
+    const nn = String(i).padStart(2, '0');
+    const text = `${TAG}${nn} ${FIRST[i % FIRST.length]} ${SECOND[i % SECOND.length]} ${nn}.`;
     const t0 = Date.now();
     await post('/api/inject/caption', { text, isFinal: true, applyDictionary: false });
     captions.push({ frame: s.framesOutput, text });

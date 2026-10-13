@@ -74,6 +74,13 @@ export class DtvccEncoder {
         this._repaintFrames = 30;
         this._repeat = 2;           // copies of every row packet per caption / keep-alive
         this._repeatGap = 3;        // idle frames between copies
+        this._keepAlive = true;     // false = burst only: the rows go out `repeat` times after a caption and never again
+        this._style = 'rollup';     // 'rollup' = one visible window 0 rewritten in place; 'popon' = two windows, the new
+                                    // caption is written into the hidden one and shown with DisplayWindow + HideWindow;
+                                    // 'youtube' = window 0, every copy starts with HideWindow + DefineWindow (YouTube's
+                                    // converter emits the pending cue on HideWindow, restarts it on DefineWindow or
+                                    // DisplayWindow, and ignores text re-writes that follow a few idle frames)
+        this._win = 1;              // pop-on: window of the caption on screen (the next caption uses the other one)
         this._maxBlocks = 1;        // service blocks per packet (2 = 29-column rows at 29.97, needs decoder support)
         this._rowErase = 'pad';     // 'pad' = rows padded with spaces, 'hcr' = HCR then text (no padding)
         this._defineOnChange = true;
@@ -95,14 +102,20 @@ export class DtvccEncoder {
 
     /**
      * Redraw-mode transport options (all optional):
-     *   repeat     1–3 copies of every row packet (default 2)
+     *   repeat     1–6 copies of every row packet (default 2)
      *   repeatGap  idle frames between copies (default 3)
+     *   keepAlive  re-send the window every repaintFrames frames (default true); false = burst only,
+     *              for destinations whose caption converter restarts the caption on every write
+     *              (YouTube keeps only the last identical cue of each 5 s segment, so a window that
+     *              is re-sent every second is shown for one second in five)
      *   maxBlocks  1 or 2 service blocks per packet (default 1)
      *   rowErase   'pad' | 'hcr' (default 'pad')
      *   defineOnChange  send DefineWindow with every new caption (default true)
      */
     setRedraw(opts = {}) {
-        if (opts.repeat !== undefined) this._repeat = Math.max(1, Math.min(3, Math.round(opts.repeat) || 1));
+        if (opts.repeat !== undefined) this._repeat = Math.max(1, Math.min(6, Math.round(opts.repeat) || 1));
+        if (opts.keepAlive !== undefined) this._keepAlive = !!opts.keepAlive;
+        if (opts.style !== undefined) { this._style = ['popon', 'youtube'].includes(opts.style) ? opts.style : 'rollup'; this._windowDefined = false; }
         if (opts.repeatGap !== undefined) this._repeatGap = Math.max(0, Math.min(15, Math.round(opts.repeatGap) || 0));
         if (opts.maxBlocks !== undefined) this._maxBlocks = opts.maxBlocks === 2 ? 2 : 1;
         if (opts.rowErase !== undefined) this._rowErase = opts.rowErase === 'hcr' ? 'hcr' : 'pad';
@@ -111,7 +124,7 @@ export class DtvccEncoder {
     }
 
     get redrawOptions() {
-        return { repeat: this._repeat, repeatGap: this._repeatGap, maxBlocks: this._maxBlocks, rowErase: this._rowErase, defineOnChange: this._defineOnChange, columns: this.columns };
+        return { style: this._style, repeat: this._repeat, repeatGap: this._repeatGap, keepAlive: this._keepAlive, maxBlocks: this._maxBlocks, rowErase: this._rowErase, defineOnChange: this._defineOnChange, columns: this.columns };
     }
 
     /** Service-data bytes available per frame (from Cea708CdpBuilder.dtvccCapacity(frameRate)). */
@@ -128,7 +141,7 @@ export class DtvccEncoder {
     get chunkChars() {
         const blocks = this._maxBlocks;
         const data = Math.min(blocks * MAX_BLOCK, this._capacity - blocks);  // minus one header byte per block
-        return Math.max(1, data - 3 - 1);                                     // SPL(3) + ETX(1)
+        return Math.max(1, data - 3 - 1 - (this._style === 'popon' ? 1 : 0)); // SPL(3) + ETX(1) [+ SetCurrentWindow(1)]
     }
 
     /**
@@ -155,7 +168,7 @@ export class DtvccEncoder {
      * Build a DefineWindow command for Window 0.
      * Bottom of screen, full width, configured rows.
      */
-    _buildDefineWindow() {
+    _buildDefineWindow(id = 0, visible = true) {
         // DefineWindow (CEA-708 §8.4.5), six parameter bytes:
         //   1: reserved(2) visible(1) row_lock(1) column_lock(1) priority(3)
         //   2: relative_positioning(1) anchor_vertical(7)
@@ -167,8 +180,8 @@ export class DtvccEncoder {
         // saw "anchor 1 (top-centre), 1 row" at the left edge: the window was centred on
         // the screen's left edge (half of it offscreen) and showed one row.
         const block = [];
-        block.push(CMD.DFW | 0);                         // DefineWindow 0
-        block.push(1 << 5);                              // visible, no locks, priority 0
+        block.push(CMD.DFW | (id & 7));                  // DefineWindow id
+        block.push((visible ? 1 : 0) << 5);              // visible flag, no locks, priority 0
         block.push(0x80 | 90);                           // relative positioning, 90 % down
         block.push(50);                                  // 50 % across
         block.push((7 << 4) | ((this._rows - 1) & 0x0F)); // anchor 7 = bottom-centre; rows − 1
@@ -192,7 +205,7 @@ export class DtvccEncoder {
     }
 
     /** Packets that draw every row (and chunk) of the window, top to bottom. */
-    _rowPackets() {
+    _rowPackets(win = 0) {
         const packets = [];
         const width = this.columns;
         const chunk = this.chunkChars;
@@ -201,7 +214,8 @@ export class DtvccEncoder {
             const useHcr = this._rowErase === 'hcr' && chunk >= width;
             for (let col = 0; col < width; col += chunk) {
                 const piece = text.slice(col, col + chunk);
-                const data = [CMD.SPL, r & 0x0F, col & 0x3F];
+                const data = this._style === 'popon' ? [CMD.CW0 | (win & 7)] : [];
+                data.push(CMD.SPL, r & 0x0F, col & 0x3F);
                 if (useHcr) data.push(CMD.HCR);
                 const padded = useHcr ? piece : piece.padEnd(Math.min(chunk, width - col), ' ');
                 for (let i = 0; i < padded.length; i++) {
@@ -216,20 +230,84 @@ export class DtvccEncoder {
     }
 
     /** Queue a full redraw: [DefineWindow] + rows, then `repeat − 1` more copies of the rows after `repeatGap` idle frames. */
-    _queueRedraw(withDefine) {
+    _queueRedraw(withDefine, newCaption = false) {
         this._packets = [];
+        if (this._style === 'popon') return this._queuePopon(withDefine, newCaption);
+        if (this._style === 'youtube') return this._queueYoutube(newCaption);
         if (withDefine) {
             this._packets.push(this._blocks(this._buildDefineWindow()));
             this._windowDefined = true;
             this._repaintCount++;
         }
         const rows = this._rowPackets();
-        // extra copies only pay off when the keep-alive is slower than the copy gap
-        const copies = this._repaintFrames <= this._repeatGap + rows.length ? 1 : this._repeat;
+        // extra copies only pay off when there is no keep-alive or it is slower than the copy gap
+        const copies = (this._keepAlive && this._repaintFrames <= this._repeatGap + rows.length) ? 1 : this._repeat;
         for (let copy = 0; copy < copies; copy++) {
             if (copy > 0) for (let g = 0; g < this._repeatGap; g++) this._packets.push(null);
             this._packets.push(...rows);
         }
+        this._framesSinceRepaint = 0;
+    }
+
+    /**
+     * Pop-on style: a new caption goes into the hidden window (the other of 0/1), every row
+     * packet names its window (SetCurrentWindow) so a lost DefineWindow cannot send text into
+     * the visible one, and a "show" packet (DisplayWindow new + HideWindow old + ETX) swaps
+     * them; copies and keep-alives repeat rows + show, all idempotent. Caption converters
+     * that key cues on window visibility (YouTube) get one cue per caption, from the first
+     * show to the next caption's swap.
+     */
+    _queuePopon(withDefine, newCaption) {
+        const prev = this._win;
+        const win = newCaption ? 1 - prev : prev;
+        if (newCaption) this._win = win;
+        const showPacket = this._blocks([0x89, 1 << win, 0x8A, 1 << (1 - win), CMD.ETX]);   // DSW new, HDW old
+        const rows = this._rowPackets(win);
+        const copies = (this._keepAlive && this._repaintFrames <= this._repeatGap + rows.length + 1) ? 1 : this._repeat;
+        if (newCaption) {
+            // Front-loaded redundancy, all into the still-hidden window: `copies` DefineWindows
+            // one frame apart, then the rows `copies` times back to back, then the show packet
+            // `copies` times `repeatGap` frames apart. YouTube's converter freezes a cue's text at
+            // the first DisplayWindow it receives (later ones only restart the cue), so the rows
+            // must be complete before any show command can arrive; on a decoder nothing is
+            // visible until the first show, so the extra copies cost no blink.
+            for (let c = 0; c < copies; c++) { if (c > 0) this._packets.push(null); this._packets.push(this._blocks(this._buildDefineWindow(win, false))); }
+            for (let c = 0; c < copies; c++) this._packets.push(...rows);
+            for (let c = 0; c < copies; c++) { if (c > 0) for (let g = 0; g < this._repeatGap; g++) this._packets.push(null); this._packets.push(showPacket); }
+            this._windowDefined = true;
+            this._repaintCount++;
+        } else {
+            // keep-alive: rows again (+ show, idempotent) for the window on screen
+            if (withDefine) this._packets.push(this._blocks(this._buildDefineWindow(win, false)));
+            for (let copy = 0; copy < copies; copy++) {
+                if (copy > 0) for (let g = 0; g < this._repeatGap; g++) this._packets.push(null);
+                this._packets.push(...rows, showPacket);
+            }
+        }
+        this._framesSinceRepaint = 0;
+    }
+
+    /**
+     * YouTube style: for a new caption, `repeat` copies of [HideWindow 0 + DefineWindow 0
+     * (visible)] + the rows, `repeatGap` idle frames apart. The HideWindow closes the previous
+     * caption's cue, the DefineWindow opens the new one; a repeated pair just closes and
+     * reopens an identical cue, so the caption starts with the first copy that arrives and
+     * ends with the next caption's first HideWindow. Keep-alives (if enabled) send rows only.
+     */
+    _queueYoutube(newCaption) {
+        // rows, then the first row once more: YouTube's pending cue holds the window as it was
+        // before the last write, so a cue cut at a segment boundary would miss the last row
+        const rows = this._rowPackets();
+        if (rows.length > 1) rows.push(rows[0]);
+        const head = this._blocks([0x8A, 0x01, ...this._buildDefineWindow(0, true)]);
+        const copies = newCaption ? this._repeat : 1;
+        for (let copy = 0; copy < copies; copy++) {
+            if (copy > 0) for (let g = 0; g < this._repeatGap; g++) this._packets.push(null);
+            if (newCaption) this._packets.push(head);
+            this._packets.push(...rows);
+        }
+        this._windowDefined = true;
+        if (newCaption) this._repaintCount++;
         this._framesSinceRepaint = 0;
     }
 
@@ -251,13 +329,16 @@ export class DtvccEncoder {
         this._lastEnqueuedTime = now;
 
         if (this._repaintFrames > 0) {
-            // Redraw mode: new rows scroll in at the bottom, then the whole window is re-sent.
-            for (const row of wrapRows(trimmed, this.columns)) {
+            // Redraw mode: new rows scroll in at the bottom (roll-up) or replace the window
+            // (pop-on: each caption stands alone), then the whole window is re-sent.
+            const rows = wrapRows(trimmed, this.columns);
+            if (this._style === 'popon') this._lines = rows.slice(-this._rows);
+            else for (const row of rows) {
                 this._lines.push(row);
                 while (this._lines.length > this._rows) this._lines.shift();
             }
             this._blankRedrawsLeft = 0;
-            this._queueRedraw(this._defineOnChange || !this._windowDefined);
+            this._queueRedraw(this._defineOnChange || !this._windowDefined, true);
             return;
         }
 
@@ -299,6 +380,16 @@ export class DtvccEncoder {
     enqueueClear() {
         this._lines = [];
         if (this._repaintFrames > 0) {
+            if (this._style === 'popon' || this._style === 'youtube') {
+                // hide the window(s), repeated for the copies
+                this._packets = [];
+                for (let copy = 0; copy < this._repeat; copy++) {
+                    if (copy > 0) for (let g = 0; g < this._repeatGap; g++) this._packets.push(null);
+                    this._packets.push(this._blocks([0x8A, 0x03, CMD.ETX]));
+                }
+                this._windowDefined = false;
+                return;
+            }
             // Blank rows, re-sent for a few keep-alive cycles so a lossy path still clears.
             this._blankRedrawsLeft = 3;
             this._queueRedraw(false);
@@ -326,7 +417,7 @@ export class DtvccEncoder {
     drainFrame(maxBytes = DEFAULT_CAPACITY) {
         if (this._repaintFrames > 0) {
             this.setFrameCapacity(maxBytes);
-            if (this._packets.length === 0) {
+            if (this._packets.length === 0 && this._keepAlive) {
                 const showing = this._lines.some(Boolean) || this._blankRedrawsLeft > 0;
                 if (++this._framesSinceRepaint >= this._repaintFrames && showing) {
                     if (this._blankRedrawsLeft > 0) this._blankRedrawsLeft--;
@@ -406,5 +497,6 @@ export class DtvccEncoder {
         this._blankRedrawsLeft = 0;
         this._repaintCount = 0;
         this._classicRowsWritten = 0;
+        this._win = 1;
     }
 }

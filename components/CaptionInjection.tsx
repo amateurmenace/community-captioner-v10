@@ -159,6 +159,34 @@ const CaptionInjection: React.FC<CaptionInjectionProps> = ({ onBack, apiKey }) =
     const [cea608InDtvcc, setCea608InDtvcc] = useState(true);
     const [dtvccRepaintFrames, setDtvccRepaintFrames] = useState(30);
     const [dtvccRepeat, setDtvccRepeat] = useState(2);
+    const [dtvccKeepAlive, setDtvccKeepAlive] = useState(true);
+    const [dtvccStyle, setDtvccStyle] = useState('rollup');
+    // Transport presets (see dtvcc-encoder.js); the preset shown is derived from the live config
+    const DTVCC_PRESETS: Record<string, Record<string, unknown>> = {
+        youtube:    { dtvccStyle: 'popon',   dtvccRepaintFrames: 30, dtvccKeepAlive: false, dtvccRepeat: 3, dtvccRepeatGap: 3, dtvccRowErase: 'hcr' },
+        immediate:  { dtvccStyle: 'youtube', dtvccRepaintFrames: 30, dtvccKeepAlive: false, dtvccRepeat: 3, dtvccRepeatGap: 4, dtvccRowErase: 'hcr' },
+        continuous: { dtvccStyle: 'rollup',  dtvccRepaintFrames: 1,  dtvccKeepAlive: true,  dtvccRepeat: 1, dtvccRepeatGap: 3, dtvccRowErase: 'pad' },
+        halfsec:    { dtvccStyle: 'rollup',  dtvccRepaintFrames: 15, dtvccKeepAlive: true,  dtvccRepeat: 2, dtvccRepeatGap: 3, dtvccRowErase: 'pad' },
+        second:     { dtvccStyle: 'rollup',  dtvccRepaintFrames: 30, dtvccKeepAlive: true,  dtvccRepeat: 2, dtvccRepeatGap: 3, dtvccRowErase: 'pad' },
+        classic:    { dtvccStyle: 'rollup',  dtvccRepaintFrames: 0 },
+    };
+    const dtvccPreset = dtvccRepaintFrames === 0 ? 'classic'
+        : dtvccStyle === 'popon' ? 'youtube'
+        : dtvccStyle === 'youtube' ? 'immediate'
+        : !dtvccKeepAlive ? 'custom'
+        : dtvccRepaintFrames === 1 ? 'continuous'
+        : dtvccRepaintFrames === 15 && dtvccRepeat === 2 ? 'halfsec'
+        : dtvccRepaintFrames === 30 && dtvccRepeat === 2 ? 'second'
+        : 'custom';
+    const applyDtvccPreset = (name: string) => {
+        const cfg = DTVCC_PRESETS[name];
+        if (!cfg) return;
+        if (typeof cfg.dtvccRepaintFrames === 'number') setDtvccRepaintFrames(cfg.dtvccRepaintFrames);
+        if (typeof cfg.dtvccKeepAlive === 'boolean') setDtvccKeepAlive(cfg.dtvccKeepAlive);
+        if (typeof cfg.dtvccRepeat === 'number') setDtvccRepeat(cfg.dtvccRepeat);
+        if (typeof cfg.dtvccStyle === 'string') setDtvccStyle(cfg.dtvccStyle);
+        postCaptionConfig(cfg);
+    };
     const postCaptionConfig = useCallback((patch: Record<string, unknown>) => {
         fetch(`${getRelayUrl()}/api/caption/config`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(patch) }).catch(() => {});
     }, []);
@@ -167,6 +195,8 @@ const CaptionInjection: React.FC<CaptionInjectionProps> = ({ onBack, apiKey }) =
             if (typeof c.cea608InDtvcc === 'boolean') setCea608InDtvcc(c.cea608InDtvcc);
             if (typeof c.dtvccRepaintFrames === 'number') setDtvccRepaintFrames(c.dtvccRepaintFrames);
             if (typeof c.dtvccRepeat === 'number') setDtvccRepeat(c.dtvccRepeat);
+            if (typeof c.dtvccKeepAlive === 'boolean') setDtvccKeepAlive(c.dtvccKeepAlive);
+            if (typeof c.dtvccStyle === 'string') setDtvccStyle(c.dtvccStyle);
         }).catch(() => {});
     }, []);
     const [ndiSources, setNdiSources] = useState<{name: string; url: string}[]>([]);
@@ -785,29 +815,19 @@ const CaptionInjection: React.FC<CaptionInjectionProps> = ({ onBack, apiKey }) =
                                     Also send CEA-608 (CC1) for older decoders
                                 </label>
                                 <label className="flex items-center gap-2 text-xs text-stone-700">
-                                    Re-send the caption window
-                                    <select value={dtvccRepaintFrames} className="px-2 py-1 rounded border border-stone-200 text-xs"
-                                        onChange={e => { const v = parseInt(e.target.value); setDtvccRepaintFrames(v); postCaptionConfig({ dtvccRepaintFrames: v }); }}>
-                                        <option value={0}>never (classic roll-up)</option>
-                                        <option value={1}>continuously (every frame)</option>
-                                        <option value={5}>every 5 frames</option>
-                                        <option value={15}>every ½ second</option>
-                                        <option value={30}>every second</option>
-                                        <option value={60}>every 2 seconds</option>
+                                    Transport
+                                    <select value={dtvccPreset} className="px-2 py-1 rounded border border-stone-200 text-xs"
+                                        onChange={e => applyDtvccPreset(e.target.value)}>
+                                        <option value="youtube">YouTube / web encoder: pop-on, 3 copies (recommended)</option>
+                                        <option value="immediate">YouTube / web encoder: immediate (decoders blink)</option>
+                                        <option value="continuous">SDI decoder behind a lossy encoder: continuous</option>
+                                        <option value="halfsec">re-send every ½ second</option>
+                                        <option value="second">re-send every second</option>
+                                        <option value="classic">classic roll-up (no redraw)</option>
+                                        <option value="custom">custom (set by API)</option>
                                     </select>
                                 </label>
-                                {dtvccRepaintFrames >= 8 && (
-                                    <label className="flex items-center gap-2 text-xs text-stone-700">
-                                        Send every row
-                                        <select value={dtvccRepeat} className="px-2 py-1 rounded border border-stone-200 text-xs"
-                                            onChange={e => { const v = parseInt(e.target.value); setDtvccRepeat(v); postCaptionConfig({ dtvccRepeat: v }); }}>
-                                            <option value={1}>once</option>
-                                            <option value={2}>twice (recommended)</option>
-                                            <option value={3}>three times</option>
-                                        </select>
-                                    </label>
-                                )}
-                                <p className="text-[11px] text-stone-500">Each row goes out as its own self-contained packet, so an encoder that drops caption frames (a Blackmagic Web Presenter 4K loses 13–60 % of them, mostly one or two at a time) can never put text on the wrong row; a lost row is repaired by the second copy a few frames later or by the next re-send. Rows are 27 characters wide in this mode. For YouTube switch CEA-608 off: YouTube prefers 608 when both are present and renders it as single characters, while its 708 rendering is correct. Keep 608 on for SDI decoders that only read 608.</p>
+                                <p className="text-[11px] text-stone-500">Each row goes out as its own self-contained packet (27 characters wide), so an encoder that drops caption frames (a Blackmagic Web Presenter 4K loses 20–40 % of them, one or two at a time) can never put text on the wrong row. <b>YouTube</b>: its caption converter closes a caption on HideWindow, opens one on DefineWindow or DisplayWindow, and keeps only the last of identical re-sends in each 5-second segment, so a re-sent window is shown for a moment and then vanishes. The YouTube preset uses pop-on: each caption is written into a hidden window and shown with one display command, sent three times within half a second and never again; the caption appears with the last copy that gets through (about half a second after it was spoken) and lasts until the next caption, with no flicker on any decoder. "Immediate" sends hide + define + rows three times instead: the caption appears with the first copy, but an SDI decoder on the same feed blinks briefly at each copy. <b>TV or decoder behind the encoder</b>: re-sending continuously repairs any lost row within a frame or two and is invisible on a real decoder. For YouTube also switch CEA-608 off: YouTube prefers 608 when both are present and renders it as single characters. Keep 608 on for SDI decoders that only read 608.</p>
                             </div>
                         )}
                     </section>

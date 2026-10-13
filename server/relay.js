@@ -189,6 +189,8 @@ let captionConfig = {
     dtvccRepaintFrames: 30,
     dtvccRepeat: 2,
     dtvccRepeatGap: 3,
+    dtvccKeepAlive: true,       // false = burst only (YouTube's converter shows a re-sent window for a moment per 5 s segment)
+    dtvccStyle: 'rollup',       // 'rollup' | 'popon' | 'youtube' (see dtvcc-encoder.js)
     // Experiments (API only): service blocks per packet (1|2), row erase ('pad'|'hcr'),
     // fixed row width (0 = one packet per row), DefineWindow with every caption.
     dtvccBlocks: 1,
@@ -203,6 +205,8 @@ function applyDtvccTransport() {
     dtvccEncoder.setRedraw({
         repeat: captionConfig.dtvccRepeat,
         repeatGap: captionConfig.dtvccRepeatGap,
+        keepAlive: captionConfig.dtvccKeepAlive,
+        style: captionConfig.dtvccStyle,
         maxBlocks: captionConfig.dtvccBlocks,
         rowErase: captionConfig.dtvccRowErase,
         columns: captionConfig.dtvccColumns,
@@ -938,7 +942,7 @@ app.get('/api/caption/config', (req, res) => {
 app.post('/api/caption/config', (req, res) => {
     const { encodingMode, captionStrategy, maxCharsPerLine, rollupRows, polishEnabled, profanityFilter,
             cea608PaceFrames, cea608Repeat, cea608InDtvcc, vancLine, dtvccRepaintFrames,
-            dtvccRepeat, dtvccRepeatGap, dtvccBlocks, dtvccRowErase, dtvccColumns, dtvccDefineOnChange } = req.body;
+            dtvccRepeat, dtvccRepeatGap, dtvccKeepAlive, dtvccStyle, dtvccBlocks, dtvccRowErase, dtvccColumns, dtvccDefineOnChange } = req.body;
 
     if (encodingMode && ['cea608', 'dtvcc'].includes(encodingMode)) {
         captionConfig.encodingMode = encodingMode;
@@ -956,7 +960,9 @@ app.post('/api/caption/config', (req, res) => {
     }
     let transportChanged = false;
     if (dtvccRepaintFrames !== undefined) { captionConfig.dtvccRepaintFrames = Math.max(0, Math.min(300, parseInt(dtvccRepaintFrames) || 0)); transportChanged = true; }
-    if (dtvccRepeat !== undefined) { captionConfig.dtvccRepeat = Math.max(1, Math.min(3, parseInt(dtvccRepeat) || 1)); transportChanged = true; }
+    if (dtvccRepeat !== undefined) { captionConfig.dtvccRepeat = Math.max(1, Math.min(6, parseInt(dtvccRepeat) || 1)); transportChanged = true; }
+    if (dtvccKeepAlive !== undefined) { captionConfig.dtvccKeepAlive = !!dtvccKeepAlive; transportChanged = true; }
+    if (dtvccStyle !== undefined) { captionConfig.dtvccStyle = ['popon', 'youtube'].includes(dtvccStyle) ? dtvccStyle : 'rollup'; transportChanged = true; }
     if (dtvccRepeatGap !== undefined) { captionConfig.dtvccRepeatGap = Math.max(0, Math.min(15, parseInt(dtvccRepeatGap) || 0)); transportChanged = true; }
     if (dtvccBlocks !== undefined) { captionConfig.dtvccBlocks = parseInt(dtvccBlocks) === 2 ? 2 : 1; transportChanged = true; }
     if (dtvccRowErase !== undefined) { captionConfig.dtvccRowErase = dtvccRowErase === 'hcr' ? 'hcr' : 'pad'; transportChanged = true; }

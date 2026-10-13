@@ -1,5 +1,18 @@
 # Embedded captions — rethink brief (hand-off from the Windows session of 12 Oct 2026)
 
+> **Outcome (night of 12 Oct 2026, build 6.13.0).** Worked through in the order below; the measurements
+> and the verdict are in CLAUDE.md addon notes 17–18 and `tools/sdi-verify/captions/README.md`.
+> In short: (1) window placement is right (YouTube renders anchor 7 at `line:85%`, bottom-centre;
+> padding spaces survive into YouTube's cue text, so rows are erased with HCR there); (2) the
+> redraw was rebuilt as one self-positioned packet per frame and, re-sent continuously, shows
+> 100 % correct captions on a decoder through the Web Presenter at 35–40 % frame loss; (3) YouTube's
+> converter keys cues on window events (HideWindow closes, DefineWindow discards, DisplayWindow
+> restarts, text at the first DisplayWindow is frozen) and keeps only the last identical cue per
+> 5 s segment, so no transport that survives the Web Presenter's loss can also deliver every
+> caption to YouTube — the caption-ingestion POST remains the YouTube path; embedded CEA-708 is
+> the in-room/decoder path. The YouTube 608 question (item 3) was not pursued: 608 is not needed
+> for YouTube at all.
+
 **Mandate for the new session:** decide, with evidence, whether embedded CEA-608/708 captions from
 Community Captioner can be made broadcast-reliable on the path *DeckLink SDI → Blackmagic Web
 Presenter 4K → YouTube* (and on SDI in general), and either make it so or state plainly that it is
