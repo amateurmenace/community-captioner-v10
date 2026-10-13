@@ -21,6 +21,7 @@ const INTERVAL = +opt('--interval', 75);
 const TAG = opt('--tag', 'R');
 const OUT = opt('--out', `schedule-${TAG}.json`);
 const extra = JSON.parse(opt('--config', '{}'));
+const SHORT = +opt('--short', 0);   // max caption length (0 = the two-row captions); e.g. 40 or 18 for the atomic style
 
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 const stamp = () => new Date().toISOString().slice(11, 23);
@@ -44,7 +45,7 @@ console.log(`${stamp()} config: mode=${cfg.encodingMode} 608=${cfg.cea608InDtvcc
 await sleep(1500);
 const after = await get('/api/inject/status');
 const columns = after.dtvccTransport?.columns || 27;
-const rows = cfg.rollupRows || 2;
+const rows = cfg.dtvccStyle === 'atomic' ? 1 : (cfg.rollupRows || 2);
 
 const captions = [];
 let next = (await get('/api/inject/status')).framesOutput + 10;
@@ -53,7 +54,8 @@ for (let i = 1; i <= N; i++) {
     let s;
     for (;;) { s = await get('/api/inject/status'); if (s.framesOutput >= next) break; await sleep(20); }
     const nn = String(i).padStart(2, '0');
-    const text = `${TAG}${nn} ${FIRST[i % FIRST.length]} ${SECOND[i % SECOND.length]} ${nn}.`;
+    const BRIEF = ['quick fox', 'town hall', 'public say', 'all in favor', 'water main', 'next item', 'thank you', 'recess now'];
+    const text = SHORT ? `${TAG}${nn} ${(SHORT >= 30 ? FIRST : BRIEF)[i % 8]} ${nn}`.slice(0, SHORT) : `${TAG}${nn} ${FIRST[i % FIRST.length]} ${SECOND[i % SECOND.length]} ${nn}.`;
     const t0 = Date.now();
     await post('/api/inject/caption', { text, isFinal: true, applyDictionary: false });
     captions.push({ frame: s.framesOutput, text });

@@ -190,14 +190,20 @@ export class Cea708CdpBuilder {
      * @param {number} cc2 - CEA-608 byte 2 (parity bit set)
      */
     /** DTVCC payload bytes that fit in one frame at this rate (one packet: header + odd payload). */
-    dtvccCapacity(frameRate = '29.97') {
-        const triplets = (FULL_CC_COUNT_BY_RATE[frameRate] || 20) - 2;
-        return triplets * 2 - 2;
+    dtvccCapacity(frameRate = '29.97', ccCount = 0) {
+        const triplets = (ccCount || FULL_CC_COUNT_BY_RATE[frameRate] || 20) - 2;
+        return triplets * 2 - 1;   // packet header takes one byte; an odd payload needs no padding
     }
 
-    buildCDP_DTVCC(dtvccData, frameRate = '29.97', cc1 = 0x80, cc2 = 0x80, cc608Valid = true) {
+    /**
+     * `ccCount` overrides the standard triplet count for the frame rate (20 at 29.97): the A/53
+     * field allows up to 31, which gives a DTVCC packet of 58 bytes per frame — enough for a
+     * whole one-row caption with its window commands in one frame (the "atomic" transport).
+     * Unused triplets are padded with cc_valid = 0, so the real data rate does not change.
+     */
+    buildCDP_DTVCC(dtvccData, frameRate = '29.97', cc1 = 0x80, cc2 = 0x80, cc608Valid = true, ccCount = 0) {
         const frCode = FRAME_RATE_CODES[frameRate] || 0x04;
-        const totalTriplets = FULL_CC_COUNT_BY_RATE[frameRate] || 20;
+        const totalTriplets = Math.max(3, Math.min(31, ccCount || FULL_CC_COUNT_BY_RATE[frameRate] || 20));
         const dtvccTriplets = totalTriplets - 2; // F1 + F2 fixed; remainder is DTVCC
 
         // Build the DTVCC packet (header byte + service-block payload, padded

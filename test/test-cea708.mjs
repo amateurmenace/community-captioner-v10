@@ -114,7 +114,7 @@ console.log('\n═══ CEA-708 DTVCC Encoder ═══');
     const { DtvccEncoder } = await import('../server/cea708/dtvcc-encoder.js');
     const { DtvccDecoder, dtvccFromCdp } = await import('../tools/sdi-verify/captions/dtvcc-model.mjs');
     const CAP = new Cea708CdpBuilder().dtvccCapacity('29.97');
-    assert(CAP === 34, `DTVCC capacity at 29.97 is 34 service bytes (got ${CAP})`);
+    assert(CAP === 35, `DTVCC capacity at 29.97 is 35 service bytes (got ${CAP})`);
 
     // DefineWindow layout (CEA-708 §8.4.5): anchor point 7 (bottom-centre), relative 50 %/90 %, rows − 1, columns − 1
     const d = new DtvccEncoder();
@@ -222,6 +222,64 @@ console.log('\n═══ CEA-708 DTVCC Encoder ═══');
     e10.enqueueText('YouTube style rows');
     const seq10 = []; for (let f = 0; f < 60; f++) { const p = e10.drainFrame(CAP); seq10.push(p ? (p[1] === 0x8A && p[3] === 0x98 ? 'H' : String(p[2])) : '-'); }
     assert(seq10.join('').replace(/-+$/, '') === 'H010----H010', `YouTube style: hide+define, row 0, row 1, row 0 again, twice (got ${seq10.join('').slice(0, 20)})`);
+
+    // cc_count 31: a 115-byte CDP with 29 DTVCC triplets (56 service bytes per frame), valid checksum
+    const b31 = new Cea708CdpBuilder();
+    assert(b31.dtvccCapacity('29.97', 31) === 57, `capacity with cc_count 31 = 57 service bytes (got ${b31.dtvccCapacity('29.97', 31)})`);
+    const cdp31 = b31.buildCDP_DTVCC([0x3F, 0x92, 0, 0, 0x41, 0x03], '29.97', 0x80, 0x80, false, 31);
+    let sum31 = 0; for (const x of cdp31) sum31 += x;
+    assert(cdp31.length === 115 && cdp31[2] === 115 && cdp31[8] === 0xFF && sum31 % 256 === 0, `cc_count 31 CDP: 115 bytes, cc_count byte 0xFF, checksum ok (got ${cdp31.length}/${cdp31[8].toString(16)}/${sum31 % 256})`);
+
+    // Atomic style: the whole caption in one packet; 18 characters at the standard 20 triplets, 40 at cc_count 31
+    const e11 = new DtvccEncoder(); e11.setRows(2); e11.setRepaint(30); e11.setRedraw({ style: 'atomic', repeat: 3, repeatGap: 20, keepAlive: false });
+    e11.setFrameCapacity(34);
+    assert(e11.atomicChars === 18 && e11.columns === 18, `atomic at 34 bytes: 18 characters (got ${e11.atomicChars})`);
+    e11.setFrameCapacity(35);
+    assert(e11.atomicChars === 19, `atomic at 35 bytes: 19 characters (got ${e11.atomicChars})`);
+    e11.setRedraw({ atomicDelete: true });
+    assert(e11.atomicChars === 23, `atomic with DeleteWindow + DefineWindow at 35 bytes: 23 characters (got ${e11.atomicChars})`);
+    e11.enqueueText('Twenty-three chars here');
+    const pd = e11.drainFrame(35);
+    assert(pd.length <= 35 && pd[1] === 0x8C && pd[2] === 0x01 && pd[3] === 0x98, `delete-and-define packet fits a frame and starts with DeleteWindow 0 + DefineWindow 0 (got ${pd.length} bytes)`);
+    e11.setRedraw({ atomicDelete: false });
+    e11.setFrameCapacity(56);
+    assert(e11.atomicChars === 40 && e11.columns === 40, `atomic at 56 bytes: 40 characters (got ${e11.atomicChars})`);
+    e11.enqueueText('Atomic caption of forty characters here!');
+    const pk11 = []; for (let f = 0; f < 60; f++) { const p = e11.drainFrame(56); pk11.push(p ? p.length : 0); }
+    const sentAt = pk11.map((n, i) => n ? i : -1).filter(i => i >= 0);
+    assert(sentAt.join() === '0,21,42' && pk11[0] <= 56, `three identical copies 20 idle frames apart, each within the frame (sent at ${sentAt.join()}, ${pk11[0]} bytes)`);
+    const dec11 = new DtvccDecoder(); const b11 = new Cea708CdpBuilder();
+    const e11b = new DtvccEncoder(); e11b.setRows(2); e11b.setRepaint(30); e11b.setRedraw({ style: 'atomic', repeat: 3, repeatGap: 20, keepAlive: false }); e11b.setFrameCapacity(56);
+    e11b.enqueueText('Atomic caption of forty characters here!');
+    for (let f = 0; f < 60; f++) { const d = e11b.drainFrame(56); dec11.feedFrame(f < 42 ? null : dtvccFromCdp(b11.buildCDP_DTVCC(d, '29.97', 0x80, 0x80, false, 31))); }
+    assert(dec11.display().join('|') === 'Atomic caption of forty characters here!' && dec11.windows[0].rowCount === 1, `two lost copies, the third shows the whole caption in a one-row window (got "${dec11.display().join('|')}")`);
+    e11b.enqueueText('A longer caption that does not fit in forty characters at all');
+    const parts = []; for (let f = 0; f < 200; f++) { const d = e11b.drainFrame(56); if (d) { dec11.feedFrame(dtvccFromCdp(b11.buildCDP_DTVCC(d, '29.97', 0x80, 0x80, false, 31))); parts.push(dec11.display()[0]); } }
+    assert([...new Set(parts)].join('|') === 'A longer caption that does not fit in|forty characters at all', `a long caption goes out as consecutive one-row captions (got ${JSON.stringify([...new Set(parts)])})`);
+
+    // Atomic queue: a second caption arriving mid-way appends its parts after the first caption's parts
+    const e13 = new DtvccEncoder(); e13.setRows(2); e13.setRepaint(30); e13.setRedraw({ style: 'atomic', atomicDelete: true, repeat: 2, repeatGap: 5, keepAlive: false, atomicHoldFrames: 20 });
+    e13.setFrameCapacity(35);
+    const dec13 = new DtvccDecoder(); const b13 = new Cea708CdpBuilder();
+    e13.enqueueText('First caption part one, first caption part two');   // 2 parts of ≤ 23
+    for (let f = 0; f < 3; f++) { const d = e13.drainFrame(35); if (d) dec13.feedFrame(dtvccFromCdp(b13.buildCDP_DTVCC(d, '29.97', 0x80, 0x80, false))); }
+    e13.enqueueText('Second caption arrives');
+    const shown13 = [];
+    for (let f = 0; f < 120; f++) { const d = e13.drainFrame(35); if (d) { dec13.feedFrame(dtvccFromCdp(b13.buildCDP_DTVCC(d, '29.97', 0x80, 0x80, false))); shown13.push(dec13.display()[0]); } }
+    assert([...new Set(shown13)].join('|') === 'First caption part one,|first caption part two|Second caption arrives', `parts are shown in order, nothing cut off (got ${JSON.stringify([...new Set(shown13)])})`);
+
+    // Two-window atomic: rows A and B in windows 0 and 1, each packet self-contained; a lone row hides window 0
+    const e12 = new DtvccEncoder(); e12.setRows(2); e12.setRepaint(30); e12.setRedraw({ style: 'atomic', atomicDelete: true, atomicWindows: 2, repeat: 2, repeatGap: 10, keepAlive: false });
+    e12.setFrameCapacity(35);
+    const dec12 = new DtvccDecoder(); const b12 = new Cea708CdpBuilder();
+    e12.enqueueText('Two window atomic test with two rows');   // 36 chars → 23 + 13
+    const seen12 = [];
+    for (let f = 0; f < 40; f++) { const d = e12.drainFrame(35); if (d) { dec12.feedFrame(dtvccFromCdp(b12.buildCDP_DTVCC(d, '29.97', 0x80, 0x80, false))); seen12.push(f); } }
+    assert(seen12.join() === '0,1,12,13', `two packets per copy, copies 10 frames apart (sent at ${seen12.join()})`);
+    assert(dec12.display().join('|') === 'Two window atomic test|with two rows' && dec12.windows[0].anchor.v === 85 && dec12.windows[1].anchor.v === 90, `both rows shown, window 0 at 85 %, window 1 at 90 % (got "${dec12.display().join('|')}")`);
+    e12.enqueueText('Short one');
+    for (let f = 0; f < 30; f++) { const d = e12.drainFrame(35); if (d) dec12.feedFrame(dtvccFromCdp(b12.buildCDP_DTVCC(d, '29.97', 0x80, 0x80, false))); }
+    assert(dec12.display().join('|') === 'Short one' && !dec12.windows[0].defined, `a one-row caption deletes window 0 and shows in window 1 (got "${dec12.display().join('|')}")`);
 
     // Classic roll-up (repaint 0): CW0, text, ETX as a byte stream; CR BEFORE every later row
     const e5 = new DtvccEncoder(); e5.setRows(2); e5.setRepaint(0);

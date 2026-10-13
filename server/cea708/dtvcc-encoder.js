@@ -57,7 +57,7 @@ const CMD = {
 };
 
 const MAX_BLOCK = 31;           // service block payload limit (5-bit size)
-const DEFAULT_CAPACITY = 34;    // service data bytes per frame at 29.97 (see Cea708CdpBuilder.dtvccCapacity)
+const DEFAULT_CAPACITY = 35;    // service data bytes per frame at 29.97 (see Cea708CdpBuilder.dtvccCapacity)
 
 export class DtvccEncoder {
     constructor() {
@@ -85,6 +85,10 @@ export class DtvccEncoder {
         this._rowErase = 'pad';     // 'pad' = rows padded with spaces, 'hcr' = HCR then text (no padding)
         this._defineOnChange = true;
         this._columns = 0;          // 0 = one packet per row (27 columns at 29.97), else a fixed width sent in chunks
+        this._atomicDelete = false; // atomic: DeleteWindow + DefineWindow instead of HideWindow + SetPenLocation + HCR (4 more characters)
+        this._atomicWindows = 1;    // atomic: 1 = one row per caption; 2 = two rows, each its own window and packet
+        this._atomicHoldFrames = 45;// atomic: frames a part stays before the next part of a long caption goes out
+        this._atomicQueue = [];     // atomic: parts (one-row texts) waiting to be sent, in order
         this._capacity = DEFAULT_CAPACITY;
         this._framesSinceRepaint = 0;
         this._blankRedrawsLeft = 0;
@@ -115,16 +119,19 @@ export class DtvccEncoder {
     setRedraw(opts = {}) {
         if (opts.repeat !== undefined) this._repeat = Math.max(1, Math.min(6, Math.round(opts.repeat) || 1));
         if (opts.keepAlive !== undefined) this._keepAlive = !!opts.keepAlive;
-        if (opts.style !== undefined) { this._style = ['popon', 'youtube'].includes(opts.style) ? opts.style : 'rollup'; this._windowDefined = false; }
-        if (opts.repeatGap !== undefined) this._repeatGap = Math.max(0, Math.min(15, Math.round(opts.repeatGap) || 0));
+        if (opts.style !== undefined) { this._style = ['popon', 'youtube', 'atomic'].includes(opts.style) ? opts.style : 'rollup'; this._windowDefined = false; }
+        if (opts.repeatGap !== undefined) this._repeatGap = Math.max(0, Math.min(60, Math.round(opts.repeatGap) || 0));
         if (opts.maxBlocks !== undefined) this._maxBlocks = opts.maxBlocks === 2 ? 2 : 1;
         if (opts.rowErase !== undefined) this._rowErase = opts.rowErase === 'hcr' ? 'hcr' : 'pad';
         if (opts.defineOnChange !== undefined) this._defineOnChange = !!opts.defineOnChange;
         if (opts.columns !== undefined) this._columns = opts.columns ? Math.max(16, Math.min(CEA608_COLUMNS, Math.round(opts.columns))) : 0;
+        if (opts.atomicDelete !== undefined) this._atomicDelete = !!opts.atomicDelete;
+        if (opts.atomicWindows !== undefined) this._atomicWindows = opts.atomicWindows === 2 ? 2 : 1;
+        if (opts.atomicHoldFrames !== undefined) this._atomicHoldFrames = Math.max(15, Math.min(150, Math.round(opts.atomicHoldFrames) || 45));
     }
 
     get redrawOptions() {
-        return { style: this._style, repeat: this._repeat, repeatGap: this._repeatGap, keepAlive: this._keepAlive, maxBlocks: this._maxBlocks, rowErase: this._rowErase, defineOnChange: this._defineOnChange, columns: this.columns };
+        return { style: this._style, repeat: this._repeat, repeatGap: this._repeatGap, keepAlive: this._keepAlive, maxBlocks: this._maxBlocks, rowErase: this._rowErase, defineOnChange: this._defineOnChange, atomicDelete: this._atomicDelete, atomicWindows: this._atomicWindows, columns: this.columns };
     }
 
     /** Service-data bytes available per frame (from Cea708CdpBuilder.dtvccCapacity(frameRate)). */
@@ -139,9 +146,25 @@ export class DtvccEncoder {
 
     /** Characters of text one self-contained row packet can carry at the current capacity. */
     get chunkChars() {
+        if (this._style === 'atomic') return this.atomicChars;
         const blocks = this._maxBlocks;
         const data = Math.min(blocks * MAX_BLOCK, this._capacity - blocks);  // minus one header byte per block
         return Math.max(1, data - 3 - 1 - (this._style === 'popon' ? 1 : 0)); // SPL(3) + ETX(1) [+ SetCurrentWindow(1)]
+    }
+
+    /**
+     * Atomic style: the whole caption in ONE packet — HideWindow(2) + DefineWindow(7) +
+     * SetPenLocation(3) + HCR(1) + text + ETX(1), in up to two service blocks. With the
+     * standard 20 triplets per frame (34 service bytes) that is 18 characters; with
+     * cc_count 31 (58 bytes) it is 41, a full one-row caption. A frame either carries the
+     * caption whole or not at all, so repeated copies can never leave a partial caption.
+     */
+    get atomicChars() {
+        const blocks = this._capacity > MAX_BLOCK + 1 ? 2 : 1;
+        const data = Math.min(blocks * MAX_BLOCK, this._capacity - blocks);
+        // HideWindow(2) + DefineWindow(7) + SetPenLocation(3) + HCR(1) + ETX(1), or
+        // DeleteWindow(2) + DefineWindow(7) + ETX(1) (a deleted-and-defined window is empty with the pen at 0,0)
+        return Math.max(1, Math.min(42, data - (this._atomicDelete ? 10 : 14)));
     }
 
     /**
@@ -151,6 +174,7 @@ export class DtvccEncoder {
      */
     get columns() {
         if (this._repaintFrames === 0) return CEA608_COLUMNS;
+        if (this._style === 'atomic') return this.atomicChars;
         if (this._columns) return this._columns;
         const c = this.chunkChars;
         return c >= 24 ? Math.min(CEA608_COLUMNS, c) : CEA608_COLUMNS;
@@ -168,7 +192,7 @@ export class DtvccEncoder {
      * Build a DefineWindow command for Window 0.
      * Bottom of screen, full width, configured rows.
      */
-    _buildDefineWindow(id = 0, visible = true) {
+    _buildDefineWindow(id = 0, visible = true, anchorV = 90) {
         // DefineWindow (CEA-708 §8.4.5), six parameter bytes:
         //   1: reserved(2) visible(1) row_lock(1) column_lock(1) priority(3)
         //   2: relative_positioning(1) anchor_vertical(7)
@@ -179,12 +203,13 @@ export class DtvccEncoder {
         // An earlier version put the row count in the anchor-point nibble, so decoders
         // saw "anchor 1 (top-centre), 1 row" at the left edge: the window was centred on
         // the screen's left edge (half of it offscreen) and showed one row.
+        const rows = this._style === 'atomic' ? 1 : this._rows;
         const block = [];
         block.push(CMD.DFW | (id & 7));                  // DefineWindow id
         block.push((visible ? 1 : 0) << 5);              // visible flag, no locks, priority 0
-        block.push(0x80 | 90);                           // relative positioning, 90 % down
+        block.push(0x80 | (anchorV & 0x7F));             // relative positioning, anchorV % down
         block.push(50);                                  // 50 % across
-        block.push((7 << 4) | ((this._rows - 1) & 0x0F)); // anchor 7 = bottom-centre; rows − 1
+        block.push((7 << 4) | ((rows - 1) & 0x0F));      // anchor 7 = bottom-centre; rows − 1
         block.push((this.columns - 1) & 0x3F);           // columns − 1
         block.push((1 << 3) | 1);                        // window style 1 (608 pop-up), pen style 1
         return block;
@@ -234,6 +259,7 @@ export class DtvccEncoder {
         this._packets = [];
         if (this._style === 'popon') return this._queuePopon(withDefine, newCaption);
         if (this._style === 'youtube') return this._queueYoutube(newCaption);
+        if (this._style === 'atomic') return this._queueAtomic(newCaption);
         if (withDefine) {
             this._packets.push(this._blocks(this._buildDefineWindow()));
             this._windowDefined = true;
@@ -311,6 +337,64 @@ export class DtvccEncoder {
         this._framesSinceRepaint = 0;
     }
 
+    /**
+     * Atomic style: one packet per caption (see atomicChars), `repeat` copies `repeatGap`
+     * frames apart, nothing else. A one-row window; a caption longer than one row is sent as
+     * consecutive one-row captions, each after the previous one has been on screen for
+     * `atomicHoldFrames` (default 45) frames.
+     */
+    _queueAtomic(newCaption) {
+        const parts = this._atomicParts || [this._lines[0] || ''];
+        // one packet = one window: hide/delete the window(s) named by `mask`, define window `win`
+        // (visible, anchored bottom-centre at anchorV %), write the text, ETX
+        const packetFor = (text, win, mask, anchorV) => {
+            const data = this._atomicDelete
+                ? [0x8C, mask, ...this._buildDefineWindow(win, true, anchorV)]
+                : [0x8A, mask, ...this._buildDefineWindow(win, true, anchorV), CMD.SPL, 0, 0, CMD.HCR];
+            for (let i = 0; i < text.length; i++) { const c = text.charCodeAt(i); data.push(c >= 0x20 && c <= 0x7E ? c : 0x20); }
+            data.push(CMD.ETX);
+            return this._blocks(data);
+        };
+        const copies = newCaption ? this._repeat : 1;
+        if (this._atomicWindows === 2) {
+            // two rows at a time: row A in window 0 (85 % down), row B in window 1 (90 % down);
+            // a lone row goes into window 1 and its packet also hides window 0
+            const pairs = [];
+            for (let i = 0; i < parts.length; i += 2) pairs.push(parts.slice(i, i + 2));
+            pairs.forEach((pair, k) => {
+                if (k > 0) for (let g = 0; g < (this._atomicHoldFrames || 60); g++) this._packets.push(null);
+                const pk = pair.length === 2
+                    ? [packetFor(pair[0], 0, 0x01, 85), packetFor(pair[1], 1, 0x02, 90)]
+                    : [packetFor(pair[0], 1, 0x03, 90)];
+                for (let copy = 0; copy < copies; copy++) {
+                    if (copy > 0) for (let g = 0; g < this._repeatGap; g++) this._packets.push(null);
+                    this._packets.push(...pk);
+                }
+            });
+        } else {
+            // One-row parts go through a queue so that a caption arriving while an earlier
+            // caption's parts are still being shown appends instead of cutting them off. Each
+            // part is sent `copies` times `repeatGap` frames apart and then held until
+            // atomicHoldFrames have passed since its first packet. When the queue is behind
+            // by more than three parts the hold shrinks to the copies themselves (catch-up).
+            if (newCaption) this._atomicQueue.push(...parts);
+            const packetsPerPart = copies + (copies - 1) * this._repeatGap;
+            const hold = Math.max(this._atomicHoldFrames, packetsPerPart);
+            const catchUp = this._atomicQueue.length > 3;
+            while (this._atomicQueue.length) {
+                const text = this._atomicQueue.shift();
+                for (let copy = 0; copy < copies; copy++) {
+                    if (copy > 0) for (let g = 0; g < this._repeatGap; g++) this._packets.push(null);
+                    this._packets.push(packetFor(text, 0, 0x01, 90));
+                }
+                if (this._atomicQueue.length) for (let g = packetsPerPart; g < (catchUp ? packetsPerPart : hold); g++) this._packets.push(null);
+            }
+        }
+        this._windowDefined = true;
+        if (newCaption) this._repaintCount++;
+        this._framesSinceRepaint = 0;
+    }
+
     // ---------------------------------------------------------------- public API
 
     /**
@@ -332,7 +416,15 @@ export class DtvccEncoder {
             // Redraw mode: new rows scroll in at the bottom (roll-up) or replace the window
             // (pop-on: each caption stands alone), then the whole window is re-sent.
             const rows = wrapRows(trimmed, this.columns);
-            if (this._style === 'popon') this._lines = rows.slice(-this._rows);
+            if (this._style === 'atomic') {
+                // long captions become consecutive one-row parts; keep whatever is still queued
+                this._atomicParts = rows; this._lines = rows.slice(-1);
+                const pending = this._packets;
+                this._queueRedraw(true, true);
+                if (pending.length) this._packets = pending.concat(this._packets);
+                return;
+            }
+            else if (this._style === 'popon') this._lines = rows.slice(-this._rows);
             else for (const row of rows) {
                 this._lines.push(row);
                 while (this._lines.length > this._rows) this._lines.shift();
@@ -380,7 +472,7 @@ export class DtvccEncoder {
     enqueueClear() {
         this._lines = [];
         if (this._repaintFrames > 0) {
-            if (this._style === 'popon' || this._style === 'youtube') {
+            if (this._style === 'popon' || this._style === 'youtube' || this._style === 'atomic') {
                 // hide the window(s), repeated for the copies
                 this._packets = [];
                 for (let copy = 0; copy < this._repeat; copy++) {
@@ -431,7 +523,7 @@ export class DtvccEncoder {
                 this._queueRedraw(true);
                 return null;
             }
-            return pkt.length % 2 ? [...pkt, 0x00] : pkt;
+            return pkt;                            // the CDP builder pads the packet to a whole number of triplets
         }
 
         if (this.blockQueue.length === 0) return null;
@@ -464,12 +556,7 @@ export class DtvccEncoder {
             }
         }
 
-        // If we have data, pad to even number of bytes (DTVCC requirement)
-        if (output.length > 0 && output.length % 2 !== 0) {
-            // Null service block header (service 0, size 0)
-            output.push(0x00);
-        }
-
+        // the CDP builder pads the packet to a whole number of triplets
         return output.length > 0 ? output : null;
     }
 

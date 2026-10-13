@@ -43,7 +43,7 @@ if (sentFile) {
     const sched = JSON.parse(readFileSync(sentFile, 'utf8'));
     const caps = Array.isArray(sched) ? sched : sched.captions;
     const columns = (Array.isArray(sched) ? 27 : sched.columns) || 27;
-    const rows = (Array.isArray(sched) ? 2 : sched.rows) || 2;
+    const rows = (Array.isArray(sched) ? 2 : (sched.config && sched.config.dtvccStyle === 'atomic' ? (sched.config.dtvccAtomicWindows === 2 ? 2 : 1) : sched.rows)) || 2;
     // intended states, in order
     const states = [];
     let lines = [];

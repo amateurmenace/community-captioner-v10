@@ -17,7 +17,7 @@ const toMs = opt('--to') ? Date.parse(`${today}T${opt('--to')}Z`) : Infinity;
 const sched = JSON.parse(readFileSync(schedFile, 'utf8'));
 const caps = Array.isArray(sched) ? sched : sched.captions;
 const columns = (Array.isArray(sched) ? 26 : sched.columns) || 26;
-const rows = (Array.isArray(sched) ? 2 : sched.rows) || 2;
+const rows = (Array.isArray(sched) ? 2 : (sched.config && sched.config.dtvccStyle === 'atomic' ? (sched.config.dtvccAtomicWindows === 2 ? 2 : 1) : sched.rows)) || 2;
 const cues = JSON.parse(readFileSync(cuesFile, 'utf8')).cues.filter(x => x.start >= fromMs && x.start <= toMs).sort((a, b) => a.start - b.start);
 const norm = (t) => t.replace(/\s+/g, ' ').trim();
 

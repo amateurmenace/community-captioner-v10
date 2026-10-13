@@ -190,7 +190,11 @@ let captionConfig = {
     dtvccRepeat: 1,
     dtvccRepeatGap: 3,
     dtvccKeepAlive: true,       // false = burst only (YouTube's converter shows a re-sent window for a moment per 5 s segment)
-    dtvccStyle: 'rollup',       // 'rollup' | 'popon' | 'youtube' (see dtvcc-encoder.js)
+    dtvccStyle: 'rollup',       // 'rollup' | 'popon' | 'youtube' | 'atomic' (see dtvcc-encoder.js)
+    dtvccCcCount: 0,            // cc_data triplets per frame: 0 = standard for the rate (20 at 29.97). The Web Presenter re-packs to 20 and a 31 wedges it: leave 0.
+    dtvccAtomicDelete: false,   // atomic style: DeleteWindow + DefineWindow (23 characters) instead of Hide + pen + HCR (19)
+    dtvccAtomicWindows: 1,      // atomic style: 2 = two rows per caption, each row its own window and one-frame packet
+    dtvccAtomicHoldFrames: 45,  // atomic style: frames each part of a long caption stays before the next part
     // Experiments (API only): service blocks per packet (1|2), row erase ('pad'|'hcr'),
     // fixed row width (0 = one packet per row), DefineWindow with every caption.
     dtvccBlocks: 1,
@@ -211,6 +215,9 @@ function applyDtvccTransport() {
         rowErase: captionConfig.dtvccRowErase,
         columns: captionConfig.dtvccColumns,
         defineOnChange: captionConfig.dtvccDefineOnChange,
+        atomicDelete: captionConfig.dtvccAtomicDelete,
+        atomicWindows: captionConfig.dtvccAtomicWindows,
+        atomicHoldFrames: captionConfig.dtvccAtomicHoldFrames,
     });
 }
 
@@ -448,7 +455,7 @@ function startFrameLoop(frameRate = '29.97') {
     const fps = fpsMap[frameRate] || 29.97;
     const intervalMs = 1000.0 / fps;
     // the DTVCC row packets are laid out for the bytes one frame can carry at this rate
-    if (dtvccEncoder && cea708Builder) dtvccEncoder.setFrameCapacity(cea708Builder.dtvccCapacity(frameRate));
+    if (dtvccEncoder && cea708Builder) dtvccEncoder.setFrameCapacity(cea708Builder.dtvccCapacity(frameRate, captionConfig.dtvccCcCount));
 
     let debugCounter = 0;
     let activeFrames = 0;
@@ -461,10 +468,10 @@ function startFrameLoop(frameRate = '29.97') {
         if (captionConfig.encodingMode === 'dtvcc' && dtvccEncoder) {
             // DTVCC mode: drain both encoders — DTVCC for modern decoders,
             // CEA-608 in Field 1 for backward compatibility with older decoders
-            const dtvccData = dtvccEncoder.drainFrame(cea708Builder.dtvccCapacity(frameRate));
+            const dtvccData = dtvccEncoder.drainFrame(cea708Builder.dtvccCapacity(frameRate, captionConfig.dtvccCcCount));
             const with608 = captionConfig.cea608InDtvcc && cea608Encoder;
             const pair = with608 ? cea608Encoder.drainPair() : { cc1: 0x80, cc2: 0x80 };
-            cdp = cea708Builder.buildCDP_DTVCC(dtvccData, frameRate, pair.cc1, pair.cc2, !!with608);
+            cdp = cea708Builder.buildCDP_DTVCC(dtvccData, frameRate, pair.cc1, pair.cc2, !!with608, captionConfig.dtvccCcCount);
             isActive = !!dtvccData || (pair.cc1 !== 0x80 || pair.cc2 !== 0x80);
         } else if (cea608Encoder) {
             // CEA-608 mode: drain one CC pair per frame
@@ -942,7 +949,7 @@ app.get('/api/caption/config', (req, res) => {
 app.post('/api/caption/config', (req, res) => {
     const { encodingMode, captionStrategy, maxCharsPerLine, rollupRows, polishEnabled, profanityFilter,
             cea608PaceFrames, cea608Repeat, cea608InDtvcc, vancLine, dtvccRepaintFrames,
-            dtvccRepeat, dtvccRepeatGap, dtvccKeepAlive, dtvccStyle, dtvccBlocks, dtvccRowErase, dtvccColumns, dtvccDefineOnChange } = req.body;
+            dtvccRepeat, dtvccRepeatGap, dtvccKeepAlive, dtvccStyle, dtvccCcCount, dtvccAtomicDelete, dtvccAtomicWindows, dtvccAtomicHoldFrames, dtvccBlocks, dtvccRowErase, dtvccColumns, dtvccDefineOnChange } = req.body;
 
     if (encodingMode && ['cea608', 'dtvcc'].includes(encodingMode)) {
         captionConfig.encodingMode = encodingMode;
@@ -962,8 +969,16 @@ app.post('/api/caption/config', (req, res) => {
     if (dtvccRepaintFrames !== undefined) { captionConfig.dtvccRepaintFrames = Math.max(0, Math.min(300, parseInt(dtvccRepaintFrames) || 0)); transportChanged = true; }
     if (dtvccRepeat !== undefined) { captionConfig.dtvccRepeat = Math.max(1, Math.min(6, parseInt(dtvccRepeat) || 1)); transportChanged = true; }
     if (dtvccKeepAlive !== undefined) { captionConfig.dtvccKeepAlive = !!dtvccKeepAlive; transportChanged = true; }
-    if (dtvccStyle !== undefined) { captionConfig.dtvccStyle = ['popon', 'youtube'].includes(dtvccStyle) ? dtvccStyle : 'rollup'; transportChanged = true; }
-    if (dtvccRepeatGap !== undefined) { captionConfig.dtvccRepeatGap = Math.max(0, Math.min(15, parseInt(dtvccRepeatGap) || 0)); transportChanged = true; }
+    if (dtvccStyle !== undefined) { captionConfig.dtvccStyle = ['popon', 'youtube', 'atomic'].includes(dtvccStyle) ? dtvccStyle : 'rollup'; transportChanged = true; }
+    if (dtvccAtomicDelete !== undefined) { captionConfig.dtvccAtomicDelete = !!dtvccAtomicDelete; transportChanged = true; }
+    if (dtvccAtomicWindows !== undefined) { captionConfig.dtvccAtomicWindows = parseInt(dtvccAtomicWindows) === 2 ? 2 : 1; transportChanged = true; }
+    if (dtvccAtomicHoldFrames !== undefined) { captionConfig.dtvccAtomicHoldFrames = Math.max(15, Math.min(150, parseInt(dtvccAtomicHoldFrames) || 45)); transportChanged = true; }
+    if (dtvccCcCount !== undefined) {
+        captionConfig.dtvccCcCount = Math.max(0, Math.min(25, parseInt(dtvccCcCount) || 0));
+        if (dtvccEncoder && cea708Builder) dtvccEncoder.setFrameCapacity(cea708Builder.dtvccCapacity(deckLinkFrameRate, captionConfig.dtvccCcCount));
+        transportChanged = true;
+    }
+    if (dtvccRepeatGap !== undefined) { captionConfig.dtvccRepeatGap = Math.max(0, Math.min(60, parseInt(dtvccRepeatGap) || 0)); transportChanged = true; }
     if (dtvccBlocks !== undefined) { captionConfig.dtvccBlocks = parseInt(dtvccBlocks) === 2 ? 2 : 1; transportChanged = true; }
     if (dtvccRowErase !== undefined) { captionConfig.dtvccRowErase = dtvccRowErase === 'hcr' ? 'hcr' : 'pad'; transportChanged = true; }
     if (dtvccColumns !== undefined) { captionConfig.dtvccColumns = Math.max(0, Math.min(32, parseInt(dtvccColumns) || 0)); transportChanged = true; }

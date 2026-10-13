@@ -35,6 +35,8 @@ if (cmd === 'status') {
     if (!url) throw new Error('rtmp url required');
     const current = await get('livestreams/0/activePlatform');
     if (current.platform !== 'Custom URL H.264') { writeFileSync(saved, JSON.stringify(current)); console.log(`saved current platform → ${saved}: ${JSON.stringify(redact(current))}`); }
+    // the platform cannot be changed while the stream runs (HTTP 400): stop it first
+    try { await put('livestreams/0/stop', {}); await new Promise(r => setTimeout(r, 3000)); } catch {}
     // the built-in "Custom URL H.264" platform takes the destination directly (server "Custom" + url)
     await put('livestreams/0/activePlatform', { platform: 'Custom URL H.264', server: 'Custom', url, key, quality: 'Streaming High' });
     await put('livestreams/0/start', {});
@@ -44,6 +46,7 @@ if (cmd === 'status') {
     if (!existsSync(saved)) throw new Error(`${saved} not found — nothing to restore`);
     const prev = JSON.parse(readFileSync(saved, 'utf8'));
     try { await put('livestreams/0/stop', {}); } catch {}
+    await new Promise(r => setTimeout(r, 3000));   // a platform change right after stop is refused
     await put('livestreams/0/activePlatform', prev);
     console.log(`restored ${JSON.stringify(redact(prev))} (not started); status:`, JSON.stringify(await get('livestreams/0')));
 } else if (cmd === 'start' || cmd === 'stop') {

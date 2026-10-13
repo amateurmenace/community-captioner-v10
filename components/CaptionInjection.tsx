@@ -163,6 +163,7 @@ const CaptionInjection: React.FC<CaptionInjectionProps> = ({ onBack, apiKey }) =
     const [dtvccStyle, setDtvccStyle] = useState('rollup');
     // Transport presets (see dtvcc-encoder.js); the preset shown is derived from the live config
     const DTVCC_PRESETS: Record<string, Record<string, unknown>> = {
+        webpresenter: { dtvccStyle: 'atomic', dtvccAtomicDelete: true, dtvccAtomicWindows: 1, dtvccAtomicHoldFrames: 60, dtvccRepaintFrames: 30, dtvccKeepAlive: false, dtvccRepeat: 6, dtvccRepeatGap: 4, dtvccRowErase: 'hcr' },
         youtube:    { dtvccStyle: 'popon',   dtvccRepaintFrames: 30, dtvccKeepAlive: false, dtvccRepeat: 3, dtvccRepeatGap: 3, dtvccRowErase: 'hcr' },
         immediate:  { dtvccStyle: 'youtube', dtvccRepaintFrames: 30, dtvccKeepAlive: false, dtvccRepeat: 3, dtvccRepeatGap: 4, dtvccRowErase: 'hcr' },
         continuous: { dtvccStyle: 'rollup',  dtvccRepaintFrames: 1,  dtvccKeepAlive: true,  dtvccRepeat: 1, dtvccRepeatGap: 3, dtvccRowErase: 'pad' },
@@ -171,6 +172,7 @@ const CaptionInjection: React.FC<CaptionInjectionProps> = ({ onBack, apiKey }) =
         classic:    { dtvccStyle: 'rollup',  dtvccRepaintFrames: 0 },
     };
     const dtvccPreset = dtvccRepaintFrames === 0 ? 'classic'
+        : dtvccStyle === 'atomic' ? 'webpresenter'
         : dtvccStyle === 'popon' ? 'youtube'
         : dtvccStyle === 'youtube' ? 'immediate'
         : !dtvccKeepAlive ? 'custom'
@@ -818,7 +820,8 @@ const CaptionInjection: React.FC<CaptionInjectionProps> = ({ onBack, apiKey }) =
                                     Transport
                                     <select value={dtvccPreset} className="px-2 py-1 rounded border border-stone-200 text-xs"
                                         onChange={e => applyDtvccPreset(e.target.value)}>
-                                        <option value="youtube">YouTube / web encoder: pop-on, 3 copies (recommended)</option>
+                                        <option value="webpresenter">YouTube through a Web Presenter: one-frame captions, 23 characters (recommended)</option>
+                                        <option value="youtube">YouTube / web encoder: pop-on, 3 copies</option>
                                         <option value="immediate">YouTube / web encoder: immediate (decoders blink)</option>
                                         <option value="continuous">SDI decoder behind a lossy encoder: continuous (default)</option>
                                         <option value="halfsec">re-send every ½ second</option>
