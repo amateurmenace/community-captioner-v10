@@ -181,10 +181,34 @@ let captionConfig = {
     cea608InDtvcc: true,
     // VANC line of the caption packet on SDI (0 = DeckLink default = line 9).
     vancLine: 0,
-    // CEA-708: re-send the whole caption window every N frames (0 = classic roll-up).
-    // Lets a decoder behind a lossy encoder (Web Presenter) recover within N frames.
+    // CEA-708 redraw transport (see dtvcc-encoder.js): every frame carries one self-contained
+    // row packet; each caption's rows go out dtvccRepeat times (dtvccRepeatGap idle frames
+    // apart) and the whole window is re-sent every dtvccRepaintFrames frames (0 = classic
+    // roll-up). A decoder behind a lossy encoder (Web Presenter) never shows text on the
+    // wrong row and recovers a lost row at the next copy or keep-alive.
     dtvccRepaintFrames: 30,
+    dtvccRepeat: 2,
+    dtvccRepeatGap: 3,
+    // Experiments (API only): service blocks per packet (1|2), row erase ('pad'|'hcr'),
+    // fixed row width (0 = one packet per row), DefineWindow with every caption.
+    dtvccBlocks: 1,
+    dtvccRowErase: 'pad',
+    dtvccColumns: 0,
+    dtvccDefineOnChange: true,
 };
+
+function applyDtvccTransport() {
+    if (!dtvccEncoder) return;
+    dtvccEncoder.setRepaint(captionConfig.dtvccRepaintFrames);
+    dtvccEncoder.setRedraw({
+        repeat: captionConfig.dtvccRepeat,
+        repeatGap: captionConfig.dtvccRepeatGap,
+        maxBlocks: captionConfig.dtvccBlocks,
+        rowErase: captionConfig.dtvccRowErase,
+        columns: captionConfig.dtvccColumns,
+        defineOnChange: captionConfig.dtvccDefineOnChange,
+    });
+}
 
 // The UI sends frame rates as fps.toFixed(2) ("30.00", "59.94"); the CDP and
 // loop tables are keyed "30", "59.94", "23.98" … — normalize once here.
@@ -406,7 +430,7 @@ async function initCaptionEncoder() {
         });
         dtvccEncoder = new DtvccEncoder();
         dtvccEncoder.setRows(captionConfig.rollupRows);
-        dtvccEncoder.setRepaint(captionConfig.dtvccRepaintFrames);
+        applyDtvccTransport();
         cea708Builder = new Cea708CdpBuilder();
         console.log('[CEA-708] Encoders initialized (CEA-608 + DTVCC)');
     } catch (e) {
@@ -419,6 +443,8 @@ function startFrameLoop(frameRate = '29.97') {
     const fpsMap = { '23.98': 23.98, '24': 24, '25': 25, '29.97': 29.97, '30': 30, '59.94': 59.94, '60': 60 };
     const fps = fpsMap[frameRate] || 29.97;
     const intervalMs = 1000.0 / fps;
+    // the DTVCC row packets are laid out for the bytes one frame can carry at this rate
+    if (dtvccEncoder && cea708Builder) dtvccEncoder.setFrameCapacity(cea708Builder.dtvccCapacity(frameRate));
 
     let debugCounter = 0;
     let activeFrames = 0;
@@ -861,6 +887,7 @@ app.get('/api/inject/status', (req, res) => {
         framesOutput: nativeStatus.framesOutput || 0,
         droppedFrames: nativeStatus.droppedFrames || 0,
         encoderQueueDepth: (captionConfig.encodingMode === 'dtvcc' ? dtvccEncoder?.queueLength : cea608Encoder?.queueLength) || 0,
+        dtvccTransport: dtvccEncoder ? { repaintFrames: dtvccEncoder.repaintFrames, ...dtvccEncoder.redrawOptions } : null,
         cea708BridgeClients: cea708Clients.size,
         presenterUrl: `${presenterUrl}/?view=audience&session=demo`,
         addonLoaded: !!decklink,
@@ -910,7 +937,8 @@ app.get('/api/caption/config', (req, res) => {
 
 app.post('/api/caption/config', (req, res) => {
     const { encodingMode, captionStrategy, maxCharsPerLine, rollupRows, polishEnabled, profanityFilter,
-            cea608PaceFrames, cea608Repeat, cea608InDtvcc, vancLine, dtvccRepaintFrames } = req.body;
+            cea608PaceFrames, cea608Repeat, cea608InDtvcc, vancLine, dtvccRepaintFrames,
+            dtvccRepeat, dtvccRepeatGap, dtvccBlocks, dtvccRowErase, dtvccColumns, dtvccDefineOnChange } = req.body;
 
     if (encodingMode && ['cea608', 'dtvcc'].includes(encodingMode)) {
         captionConfig.encodingMode = encodingMode;
@@ -926,10 +954,15 @@ app.post('/api/caption/config', (req, res) => {
         if (cea608Encoder) cea608Encoder.setRollupRows(captionConfig.rollupRows);
         if (dtvccEncoder) dtvccEncoder.setRows(captionConfig.rollupRows);
     }
-    if (dtvccRepaintFrames !== undefined) {
-        captionConfig.dtvccRepaintFrames = Math.max(0, Math.min(300, parseInt(dtvccRepaintFrames) || 0));
-        if (dtvccEncoder) dtvccEncoder.setRepaint(captionConfig.dtvccRepaintFrames);
-    }
+    let transportChanged = false;
+    if (dtvccRepaintFrames !== undefined) { captionConfig.dtvccRepaintFrames = Math.max(0, Math.min(300, parseInt(dtvccRepaintFrames) || 0)); transportChanged = true; }
+    if (dtvccRepeat !== undefined) { captionConfig.dtvccRepeat = Math.max(1, Math.min(3, parseInt(dtvccRepeat) || 1)); transportChanged = true; }
+    if (dtvccRepeatGap !== undefined) { captionConfig.dtvccRepeatGap = Math.max(0, Math.min(15, parseInt(dtvccRepeatGap) || 0)); transportChanged = true; }
+    if (dtvccBlocks !== undefined) { captionConfig.dtvccBlocks = parseInt(dtvccBlocks) === 2 ? 2 : 1; transportChanged = true; }
+    if (dtvccRowErase !== undefined) { captionConfig.dtvccRowErase = dtvccRowErase === 'hcr' ? 'hcr' : 'pad'; transportChanged = true; }
+    if (dtvccColumns !== undefined) { captionConfig.dtvccColumns = Math.max(0, Math.min(32, parseInt(dtvccColumns) || 0)); transportChanged = true; }
+    if (dtvccDefineOnChange !== undefined) { captionConfig.dtvccDefineOnChange = !!dtvccDefineOnChange; transportChanged = true; }
+    if (transportChanged) applyDtvccTransport();
     if (polishEnabled !== undefined) {
         captionConfig.polishEnabled = !!polishEnabled;
     }

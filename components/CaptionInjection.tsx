@@ -158,6 +158,7 @@ const CaptionInjection: React.FC<CaptionInjectionProps> = ({ onBack, apiKey }) =
     // CEA-708 transport options (live-adjustable through /api/caption/config)
     const [cea608InDtvcc, setCea608InDtvcc] = useState(true);
     const [dtvccRepaintFrames, setDtvccRepaintFrames] = useState(30);
+    const [dtvccRepeat, setDtvccRepeat] = useState(2);
     const postCaptionConfig = useCallback((patch: Record<string, unknown>) => {
         fetch(`${getRelayUrl()}/api/caption/config`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(patch) }).catch(() => {});
     }, []);
@@ -165,6 +166,7 @@ const CaptionInjection: React.FC<CaptionInjectionProps> = ({ onBack, apiKey }) =
         fetch(`${getRelayUrl()}/api/caption/config`).then(r => r.json()).then(c => {
             if (typeof c.cea608InDtvcc === 'boolean') setCea608InDtvcc(c.cea608InDtvcc);
             if (typeof c.dtvccRepaintFrames === 'number') setDtvccRepaintFrames(c.dtvccRepaintFrames);
+            if (typeof c.dtvccRepeat === 'number') setDtvccRepeat(c.dtvccRepeat);
         }).catch(() => {});
     }, []);
     const [ndiSources, setNdiSources] = useState<{name: string; url: string}[]>([]);
@@ -783,16 +785,29 @@ const CaptionInjection: React.FC<CaptionInjectionProps> = ({ onBack, apiKey }) =
                                     Also send CEA-608 (CC1) for older decoders
                                 </label>
                                 <label className="flex items-center gap-2 text-xs text-stone-700">
-                                    Redraw the whole caption window
+                                    Re-send the caption window
                                     <select value={dtvccRepaintFrames} className="px-2 py-1 rounded border border-stone-200 text-xs"
                                         onChange={e => { const v = parseInt(e.target.value); setDtvccRepaintFrames(v); postCaptionConfig({ dtvccRepaintFrames: v }); }}>
                                         <option value={0}>never (classic roll-up)</option>
+                                        <option value={1}>continuously (every frame)</option>
+                                        <option value={5}>every 5 frames</option>
                                         <option value={15}>every ½ second</option>
                                         <option value={30}>every second</option>
                                         <option value={60}>every 2 seconds</option>
                                     </select>
                                 </label>
-                                <p className="text-[11px] text-stone-500">Redrawing lets a decoder that misses caption frames (a Blackmagic Web Presenter drops 15–50 % of them) show the right text again within that time. For YouTube switch CEA-608 off: YouTube prefers 608 when both are present and renders it as single characters, while its 708 rendering is correct. Keep it on for SDI decoders that only read 608.</p>
+                                {dtvccRepaintFrames >= 8 && (
+                                    <label className="flex items-center gap-2 text-xs text-stone-700">
+                                        Send every row
+                                        <select value={dtvccRepeat} className="px-2 py-1 rounded border border-stone-200 text-xs"
+                                            onChange={e => { const v = parseInt(e.target.value); setDtvccRepeat(v); postCaptionConfig({ dtvccRepeat: v }); }}>
+                                            <option value={1}>once</option>
+                                            <option value={2}>twice (recommended)</option>
+                                            <option value={3}>three times</option>
+                                        </select>
+                                    </label>
+                                )}
+                                <p className="text-[11px] text-stone-500">Each row goes out as its own self-contained packet, so an encoder that drops caption frames (a Blackmagic Web Presenter 4K loses 13–60 % of them, mostly one or two at a time) can never put text on the wrong row; a lost row is repaired by the second copy a few frames later or by the next re-send. Rows are 27 characters wide in this mode. For YouTube switch CEA-608 off: YouTube prefers 608 when both are present and renders it as single characters, while its 708 rendering is correct. Keep 608 on for SDI decoders that only read 608.</p>
                             </div>
                         )}
                     </section>

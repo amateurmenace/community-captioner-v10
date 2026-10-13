@@ -8,9 +8,9 @@ export const RELEASES_URL = `${GITHUB_REPO_URL}/releases/latest`;
 // Releases are tagged by product version (v10.x); asset names carry the app
 // version from package.json. Both assets live on the "Community Captioner v10.1" release.
 // Mac: app 6.11.1 — notarized, bundled DeckLink addon with NDI → SDI (NDI runtime bundled), local-only mode, local prerecorded transcription, in-app guide.
-// Windows: app 6.12.2 — built and tested on Windows with the DeckLink addon bundled, including
+// Windows: app 6.13.0 — built and tested on Windows with the DeckLink addon bundled, including
 //          NDI → SDI passthrough (needs NDI Tools / the NDI Runtime) with audio from any PC input,
-//          CEA-608 rows that roll, self-healing CEA-708, a working YouTube caption-ingestion POST;
-//          local AI on CPU or NVIDIA.
+//          CEA-608 rows that roll, CEA-708 with the self-positioned continuous redraw that survives
+//          the Web Presenter's frame loss, a working YouTube caption-ingestion POST; local AI on CPU or NVIDIA.
 export const MAC_DOWNLOAD_URL = `${GITHUB_REPO_URL}/releases/download/v10.1/Community-Captioner-6.11.1-mac-arm64.zip`;
-export const WINDOWS_DOWNLOAD_URL = `${GITHUB_REPO_URL}/releases/download/v10.1/Community-Captioner-6.12.2-windows-x64.zip`;
+export const WINDOWS_DOWNLOAD_URL = `${GITHUB_REPO_URL}/releases/download/v10.1/Community-Captioner-6.13.0-windows-x64.zip`;

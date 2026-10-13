@@ -106,17 +106,105 @@ const nonAsciiPairs = [];
 while (enc.queueLength > 0) nonAsciiPairs.push(enc.drainPair());
 assert(nonAsciiPairs.length === 6 && (nonAsciiPairs[5].cc2 & 0x7F) === 0x3F, `Non-ASCII "café" → "ca" "f?" with ? substitution (got ${nonAsciiPairs.length} pairs)`);
 
-// DefineWindow layout (CEA-708 §8.4.5): anchor point 7 (bottom-centre), relative 50 %/90 %, rows − 1, 32 columns
+// ─────────────────────────────────────────────
+// CEA-708 DTVCC encoder
+// ─────────────────────────────────────────────
+console.log('\n═══ CEA-708 DTVCC Encoder ═══');
 {
     const { DtvccEncoder } = await import('../server/cea708/dtvcc-encoder.js');
+    const { DtvccDecoder, dtvccFromCdp } = await import('../tools/sdi-verify/captions/dtvcc-model.mjs');
+    const CAP = new Cea708CdpBuilder().dtvccCapacity('29.97');
+    assert(CAP === 34, `DTVCC capacity at 29.97 is 34 service bytes (got ${CAP})`);
+
+    // DefineWindow layout (CEA-708 §8.4.5): anchor point 7 (bottom-centre), relative 50 %/90 %, rows − 1, columns − 1
     const d = new DtvccEncoder();
     d.setRows(2);
+    d.setFrameCapacity(CAP);
     d.enqueueText('Hi');
-    const bytes = d.drainFrame(60);
-    const i = bytes.indexOf(0x98);
-    const dfw = bytes.slice(i, i + 7);
-    assert(dfw[1] === 0x20 && dfw[2] === (0x80 | 90) && dfw[3] === 50 && dfw[4] === ((7 << 4) | 1) && dfw[5] === 31,
-        `DefineWindow layout: visible, rp 90 %/50 %, anchor 7, 2 rows, 32 cols (got ${dfw.map(b => b.toString(16)).join(' ')})`);
+    const first = d.drainFrame(CAP);
+    const i = first.indexOf(0x98);
+    const dfw = first.slice(i, i + 7);
+    assert(i === 1 && dfw[1] === 0x20 && dfw[2] === (0x80 | 90) && dfw[3] === 50 && dfw[4] === ((7 << 4) | 1) && dfw[5] === d.columns - 1,
+        `DefineWindow packet first: visible, rp 90 %/50 %, anchor 7, 2 rows, ${d.columns} cols (got ${dfw.map(b => b.toString(16)).join(' ')})`);
+    assert(d.columns === 27 && d.chunkChars === 27, `Redraw rows are 27 columns at 29.97 (one 31-byte service block: SPL + 27 chars + ETX) (got ${d.columns}/${d.chunkChars})`);
+
+    // Every following packet is self-contained: one service block, SPL(row, 0) … ETX, ≤ capacity
+    const pk = [];
+    for (let f = 0; f < 12; f++) pk.push(d.drainFrame(CAP));
+    const rowPk = pk.filter(Boolean);
+    assert(rowPk.length === 4, `2 rows × 2 copies = 4 row packets (got ${rowPk.length})`);
+    assert(rowPk.every(p => p.length <= CAP && p[0] === 0x3F && p[1] === 0x92 && p[3] === 0 && p[p.length - 1] === 0x03),
+        'Each row packet = one 31-byte service block starting with SetPenLocation(row, 0) and ending with ETX');
+    assert(rowPk[0][2] === 0 && rowPk[1][2] === 1 && rowPk[2][2] === 0 && rowPk[3][2] === 1, 'Row packets address rows 0,1 then 0,1 again');
+    const gapIdx = pk.map((p, k) => (p ? '' : k)).filter(k => k !== '');
+    assert(gapIdx.slice(0, 3).join() === '2,3,4' && pk[5] && pk[6] && !pk[7], `Second copy follows 3 idle frames (idle at ${gapIdx.join()})`);
+    assert(rowPk[0].length === 32 && String.fromCharCode(...rowPk[0].slice(4, 31)) === 'Hi'.padEnd(27), 'Row text padded to 27 columns overwrites stale characters');
+
+    // Decoder round trip with the first copy of every row lost: the second copy restores the display
+    const e2 = new DtvccEncoder(); e2.setRows(2); e2.setRepaint(30);
+    const b2 = new Cea708CdpBuilder(); const dec = new DtvccDecoder();
+    e2.enqueueText('The quick brown fox jumps over the lazy dog near the river.');
+    const shown = [];
+    for (let f = 0; f < 10; f++) {
+        const data = e2.drainFrame(CAP);
+        const pkt = dtvccFromCdp(b2.buildCDP_DTVCC(data, '29.97', 0x80, 0x80, false));
+        dec.feedFrame(f === 1 || f === 2 ? null : pkt);   // drop the first copy of both rows
+        shown.push(dec.display().join('|'));
+    }
+    assert(shown[2] === '|' && shown[7] === 'over the lazy dog near the|river.', `Lost first copy → window blank, second copy repairs it (got "${shown[2]}" then "${shown[7]}")`);
+    const knownRows = new Set(['', 'The quick brown fox jumps', 'over the lazy dog near the', 'river.']);
+    assert(shown.every(s => s.split('|').every(r => knownRows.has(r))), `No frame ever shows text on the wrong row (${shown.filter(s => !s.split('|').every(r => knownRows.has(r))).join(' / ')})`);
+
+    // Keep-alive: with nothing new, the rows are re-sent every repaint interval
+    const e3 = new DtvccEncoder(); e3.setRows(2); e3.setRepaint(15); e3.setRedraw({ repeat: 1 });
+    e3.enqueueText('Keep alive');
+    let active = [];
+    for (let f = 0; f < 50; f++) if (e3.drainFrame(CAP)) active.push(f);
+    assert(active.join() === '0,1,2,17,18,33,34,49', `Keep-alive re-sends both rows 15 frames after the last packet (active frames ${active.join()})`);
+
+    // DefineWindow accompanies every new caption, never a keep-alive
+    const e4 = new DtvccEncoder(); e4.setRows(2); e4.setRepaint(15); e4.setRedraw({ repeat: 1 });
+    e4.enqueueText('One'); const dfwCount = (n) => { let c = 0; for (let f = 0; f < n; f++) { const p = e4.drainFrame(CAP); if (p && p[1] === 0x98) c++; } return c; };
+    assert(dfwCount(40) === 1, 'One DefineWindow for the first caption, none in the keep-alives');
+    e4.enqueueText('Two');
+    assert(dfwCount(40) === 1, 'The next caption carries its own DefineWindow');
+
+    // Clear: blank rows are sent and kept alive for three cycles, then the encoder goes idle
+    e4.enqueueClear();
+    let blankFrames = 0, idleAfter = 0;
+    for (let f = 0; f < 120; f++) { const p = e4.drainFrame(CAP); if (p) blankFrames++; }
+    for (let f = 0; f < 60; f++) { if (e4.drainFrame(CAP)) idleAfter++; }
+    assert(blankFrames === 8 && idleAfter === 0, `Clear = 2 blank rows now + 3 keep-alives (${blankFrames} packets), then idle (${idleAfter})`);
+
+    // Continuous mode (repaint 1): rows alternate on every frame, no duplicate copies
+    const e7 = new DtvccEncoder(); e7.setRows(2); e7.setRepaint(1); e7.setRedraw({ repeat: 2, repeatGap: 3 });
+    e7.enqueueText('Continuous rows');
+    const seq7 = []; for (let f = 0; f < 9; f++) { const p = e7.drainFrame(CAP); seq7.push(p ? (p[1] === 0x98 ? 'D' : String(p[2])) : '-'); }
+    assert(seq7.join('') === 'D01010101', `Continuous: DefineWindow then row 0, row 1, row 0, row 1 … every frame (got ${seq7.join('')})`);
+
+    // Classic roll-up (repaint 0): CW0, text, ETX as a byte stream; CR BEFORE every later row
+    const e5 = new DtvccEncoder(); e5.setRows(2); e5.setRepaint(0);
+    e5.enqueueText('Hi');
+    const c = e5.drainFrame(CAP);
+    assert(c[0] === (0x20 | 11) && c[1] === 0x98 && c[8] === 0x80 && c[9] === 0x48 && c[10] === 0x69 && c[11] === 0x03,
+        `Classic mode: DFW + CW0 + "Hi" + ETX in one block, no CR after the first row (got ${c.map(b => b.toString(16)).join(' ')})`);
+    e5.enqueueText('Second row.');
+    const c2 = e5.drainFrame(CAP);
+    assert(c2[1] === 0x80 && c2[2] === 0x0D && c2[3] === 0x53, 'Classic mode: the next caption starts with CR, then its text');
+    const dec5 = new DtvccDecoder(); const b5 = new Cea708CdpBuilder();
+    const e5b = new DtvccEncoder(); e5b.setRows(2); e5b.setRepaint(0);
+    for (const t of ['One', 'Two', 'Three']) { e5b.enqueueText(t); for (let f = 0; f < 3; f++) dec5.feedFrame(dtvccFromCdp(b5.buildCDP_DTVCC(e5b.drainFrame(CAP), '29.97', 0x80, 0x80, false))); }
+    assert(dec5.display().join('|') === 'Two|Three', `Classic roll-up shows the last two captions on both rows (got "${dec5.display().join('|')}")`);
+    assert(e5.columns === 32, 'Classic mode keeps 32-column rows');
+
+    // Low per-frame capacity (59.94: 14 service bytes): 32-column rows go out in self-positioned chunks
+    const e6 = new DtvccEncoder(); e6.setRows(2); e6.setRepaint(30); e6.setRedraw({ repeat: 1 });
+    e6.setFrameCapacity(14);
+    assert(e6.columns === 32 && e6.chunkChars === 9, `59.94: 32 columns in 9-character chunks (got ${e6.columns}/${e6.chunkChars})`);
+    e6.enqueueText('abcdefghijklmnopqrstuvwxyz012345');
+    const pk6 = []; for (let f = 0; f < 12; f++) { const p = e6.drainFrame(14); if (p) pk6.push(p); }
+    assert(pk6.length === 1 + 8 && pk6.slice(1).every(p => p.length <= 14 && p[1] === 0x92), `DFW + 4 chunks per row × 2 rows, each ≤ 14 bytes with its own SetPenLocation (got ${pk6.length})`);
+    assert(pk6[2][3] === 9 && String.fromCharCode(...pk6[2].slice(4, 13)) === 'jklmnopqr', 'Second chunk starts at column 9 with the next 9 characters');
 }
 
 // ─────────────────────────────────────────────

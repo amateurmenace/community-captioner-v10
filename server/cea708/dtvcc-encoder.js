@@ -11,9 +11,27 @@
  *   - Commands: DefineWindow, SetPenLocation, SetPenAttributes, etc.
  *   - Text: direct UTF-8/G0/G1 character codes
  *
- * We use a simple rolling window approach:
- *   Window 0: bottom of screen, 2-3 rows, full width
- *   New text appended with CR for line breaks
+ * Two transport styles, both on window 0 (bottom-centre, 2–3 rows):
+ *
+ *   classic (setRepaint(0)): roll-up — text rows followed by CR, as a byte
+ *   stream split across frames. Compact, but a decoder behind a lossy
+ *   encoder (the Blackmagic Web Presenter 4K drops 13–60 % of caption
+ *   frames, mostly one or two at a time) loses characters and merges rows.
+ *
+ *   redraw (setRepaint(N), the default): every frame carries ONE
+ *   self-contained packet — SetPenLocation(row, col) + the row's text padded
+ *   to the chunk width + ETX — so a lost frame can only leave one stale
+ *   chunk behind, never text on the wrong row. Each caption is sent as a
+ *   DefineWindow packet (also the "clear" for YouTube's converter, which
+ *   treats DefineWindow as clear) followed by one packet per row chunk,
+ *   then the row packets again `repeat` times with `repeatGap` idle frames
+ *   between copies (losses come in short bursts, so spaced copies survive
+ *   independently), and the whole window is re-sent every N frames while
+ *   anything is displayed. All writes are idempotent for the decoder.
+ *   N = 1 is "continuous": the rows alternate on every frame. Measured through
+ *   a Web Presenter 4K losing 35–40 % of caption frames (2026-10-12): keep-alive
+ *   1 s → 75 % of frames correct, ½ s → 92 %, 5 frames → 99 %, continuous →
+ *   100 % with every caption complete within 12 frames; never a garbled row.
  */
 
 import { wrapRows, CEA608_COLUMNS } from './cea608-encoder.js';
@@ -38,24 +56,36 @@ const CMD = {
     SWA: 0x97,       // SetWindowAttributes
 };
 
+const MAX_BLOCK = 31;           // service block payload limit (5-bit size)
+const DEFAULT_CAPACITY = 34;    // service data bytes per frame at 29.97 (see Cea708CdpBuilder.dtvccCapacity)
+
 export class DtvccEncoder {
     constructor() {
-        /** @type {Array<number[]>} Queue of service blocks (byte arrays) */
+        /** @type {Array<number[]>} Classic mode: queue of service blocks (byte arrays) */
         this.blockQueue = [];
+        /** @type {Array<number[]|null>} Redraw mode: one packet (service-block bytes) per frame, null = idle frame */
+        this._packets = [];
         this._windowDefined = false;
         this._lastEnqueuedText = '';
         this._lastEnqueuedTime = 0;
         this._rows = 2;
-        // Repaint mode (0 = off): keep the visible rows and re-send the whole window
-        // every N frames and on every change. Idempotent for the decoder, so a lossy
-        // encoder downstream (Blackmagic Web Presenter drops 15–50 % of caption
-        // frames) only delays a caption instead of mangling it.
-        this._repaintFrames = 0;
-        this._framesSinceRepaint = 0;
         this._lines = [];
+        // Redraw mode settings (see class comment). repaintFrames 0 = classic roll-up.
+        this._repaintFrames = 30;
+        this._repeat = 2;           // copies of every row packet per caption / keep-alive
+        this._repeatGap = 3;        // idle frames between copies
+        this._maxBlocks = 1;        // service blocks per packet (2 = 29-column rows at 29.97, needs decoder support)
+        this._rowErase = 'pad';     // 'pad' = rows padded with spaces, 'hcr' = HCR then text (no padding)
+        this._defineOnChange = true;
+        this._columns = 0;          // 0 = one packet per row (27 columns at 29.97), else a fixed width sent in chunks
+        this._capacity = DEFAULT_CAPACITY;
+        this._framesSinceRepaint = 0;
+        this._blankRedrawsLeft = 0;
+        this._repaintCount = 0;
+        this._classicRowsWritten = 0;
     }
 
-    /** Re-send the full window every `frames` frames (0 = classic roll-up, no repaints). */
+    /** Re-send the full window every `frames` frames (0 = classic roll-up, no redraws). */
     setRepaint(frames) {
         this._repaintFrames = Math.max(0, Math.min(300, Math.round(frames) || 0));
         this._framesSinceRepaint = 0;
@@ -64,31 +94,53 @@ export class DtvccEncoder {
     get repaintFrames() { return this._repaintFrames; }
 
     /**
-     * One full redraw of window 0: define it (recovers a lost DefineWindow), then write
-     * every row from column 0 padded to the full width (overwrites stale characters).
+     * Redraw-mode transport options (all optional):
+     *   repeat     1–3 copies of every row packet (default 2)
+     *   repeatGap  idle frames between copies (default 3)
+     *   maxBlocks  1 or 2 service blocks per packet (default 1)
+     *   rowErase   'pad' | 'hcr' (default 'pad')
+     *   defineOnChange  send DefineWindow with every new caption (default true)
      */
-    _buildRepaint() {
-        const block = [];
-        // DefineWindow only on the first redraw after start/clear and then every
-        // fifth one (a late-joining or frame-dropping decoder still gets it within
-        // ~5 s): YouTube's converter treats every DefineWindow as "clear window",
-        // which made captions flash once a second when it was sent every time.
-        this._repaintCount = (this._repaintCount || 0) + 1;
-        if (!this._windowDefined || this._repaintCount % 5 === 1) {
-            block.push(...this._buildDefineWindow());
-            this._windowDefined = true;
+    setRedraw(opts = {}) {
+        if (opts.repeat !== undefined) this._repeat = Math.max(1, Math.min(3, Math.round(opts.repeat) || 1));
+        if (opts.repeatGap !== undefined) this._repeatGap = Math.max(0, Math.min(15, Math.round(opts.repeatGap) || 0));
+        if (opts.maxBlocks !== undefined) this._maxBlocks = opts.maxBlocks === 2 ? 2 : 1;
+        if (opts.rowErase !== undefined) this._rowErase = opts.rowErase === 'hcr' ? 'hcr' : 'pad';
+        if (opts.defineOnChange !== undefined) this._defineOnChange = !!opts.defineOnChange;
+        if (opts.columns !== undefined) this._columns = opts.columns ? Math.max(16, Math.min(CEA608_COLUMNS, Math.round(opts.columns))) : 0;
+    }
+
+    get redrawOptions() {
+        return { repeat: this._repeat, repeatGap: this._repeatGap, maxBlocks: this._maxBlocks, rowErase: this._rowErase, defineOnChange: this._defineOnChange, columns: this.columns };
+    }
+
+    /** Service-data bytes available per frame (from Cea708CdpBuilder.dtvccCapacity(frameRate)). */
+    setFrameCapacity(bytes) {
+        const c = Math.max(8, Math.min(128, Math.round(bytes) || DEFAULT_CAPACITY));
+        if (c !== this._capacity) {
+            this._capacity = c;
+            // the chunk layout depends on the capacity: re-send what is pending in the new layout
+            if (this._packets.length) this._queueRedraw(true);
         }
-        block.push(CMD.CW0);
-        for (let r = 0; r < this._rows; r++) {
-            const text = (this._lines[r] || '').padEnd(CEA608_COLUMNS, ' ');
-            block.push(CMD.SPL, r & 0x0F, 0);  // SetPenLocation row r, column 0
-            for (let i = 0; i < CEA608_COLUMNS; i++) {
-                const code = text.charCodeAt(i);
-                block.push(code >= 0x20 && code <= 0x7E ? code : 0x20);
-            }
-        }
-        block.push(CMD.ETX);
-        return block;
+    }
+
+    /** Characters of text one self-contained row packet can carry at the current capacity. */
+    get chunkChars() {
+        const blocks = this._maxBlocks;
+        const data = Math.min(blocks * MAX_BLOCK, this._capacity - blocks);  // minus one header byte per block
+        return Math.max(1, data - 3 - 1);                                     // SPL(3) + ETX(1)
+    }
+
+    /**
+     * Row width in redraw mode. Default: one packet per row when that gives at least 24
+     * columns (27 at 29.97 with one service block), else 32 columns sent in several chunks.
+     * A fixed width (setRedraw({columns})) is always sent in as many chunks as needed.
+     */
+    get columns() {
+        if (this._repaintFrames === 0) return CEA608_COLUMNS;
+        if (this._columns) return this._columns;
+        const c = this.chunkChars;
+        return c >= 24 ? Math.min(CEA608_COLUMNS, c) : CEA608_COLUMNS;
     }
 
     /**
@@ -104,14 +156,6 @@ export class DtvccEncoder {
      * Bottom of screen, full width, configured rows.
      */
     _buildDefineWindow() {
-        // DefineWindow0: DFW + 0 (window ID)
-        // 6 bytes follow the command:
-        //   byte 1: priority(3) | col_lock(1) | row_lock(1) | visible(1) | window_style(2-bit partial)
-        //   byte 2: anchor_v (row position, 0-74 for 1080)
-        //   byte 3: anchor_h (col position, 0-209 for 1080)
-        //   byte 4: row_count(4) | col_count_hi(4)  — row_count is actual-1
-        //   byte 5: col_count_lo(8) — total col_count is 10 bits
-        //   byte 6: pen_style(3) | window_style(3)
         // DefineWindow (CEA-708 §8.4.5), six parameter bytes:
         //   1: reserved(2) visible(1) row_lock(1) column_lock(1) priority(3)
         //   2: relative_positioning(1) anchor_vertical(7)
@@ -128,10 +172,68 @@ export class DtvccEncoder {
         block.push(0x80 | 90);                           // relative positioning, 90 % down
         block.push(50);                                  // 50 % across
         block.push((7 << 4) | ((this._rows - 1) & 0x0F)); // anchor 7 = bottom-centre; rows − 1
-        block.push(31 & 0x3F);                           // 32 columns
+        block.push((this.columns - 1) & 0x3F);           // columns − 1
         block.push((1 << 3) | 1);                        // window style 1 (608 pop-up), pen style 1
         return block;
     }
+
+    // ---------------------------------------------------------------- redraw mode
+
+    /** Wrap one service-data byte array into service blocks (service 1). Returns the packet bytes. */
+    _blocks(data) {
+        const out = [];
+        let i = 0;
+        while (i < data.length) {
+            const n = Math.min(MAX_BLOCK, data.length - i);
+            out.push((1 << 5) | n, ...data.slice(i, i + n));
+            i += n;
+        }
+        return out;
+    }
+
+    /** Packets that draw every row (and chunk) of the window, top to bottom. */
+    _rowPackets() {
+        const packets = [];
+        const width = this.columns;
+        const chunk = this.chunkChars;
+        for (let r = 0; r < this._rows; r++) {
+            const text = (this._lines[r] || '');
+            const useHcr = this._rowErase === 'hcr' && chunk >= width;
+            for (let col = 0; col < width; col += chunk) {
+                const piece = text.slice(col, col + chunk);
+                const data = [CMD.SPL, r & 0x0F, col & 0x3F];
+                if (useHcr) data.push(CMD.HCR);
+                const padded = useHcr ? piece : piece.padEnd(Math.min(chunk, width - col), ' ');
+                for (let i = 0; i < padded.length; i++) {
+                    const code = padded.charCodeAt(i);
+                    data.push(code >= 0x20 && code <= 0x7E ? code : 0x20);
+                }
+                data.push(CMD.ETX);
+                packets.push(this._blocks(data));
+            }
+        }
+        return packets;
+    }
+
+    /** Queue a full redraw: [DefineWindow] + rows, then `repeat − 1` more copies of the rows after `repeatGap` idle frames. */
+    _queueRedraw(withDefine) {
+        this._packets = [];
+        if (withDefine) {
+            this._packets.push(this._blocks(this._buildDefineWindow()));
+            this._windowDefined = true;
+            this._repaintCount++;
+        }
+        const rows = this._rowPackets();
+        // extra copies only pay off when the keep-alive is slower than the copy gap
+        const copies = this._repaintFrames <= this._repeatGap + rows.length ? 1 : this._repeat;
+        for (let copy = 0; copy < copies; copy++) {
+            if (copy > 0) for (let g = 0; g < this._repeatGap; g++) this._packets.push(null);
+            this._packets.push(...rows);
+        }
+        this._framesSinceRepaint = 0;
+    }
+
+    // ---------------------------------------------------------------- public API
 
     /**
      * Enqueue caption text as DTVCC service blocks.
@@ -149,15 +251,13 @@ export class DtvccEncoder {
         this._lastEnqueuedTime = now;
 
         if (this._repaintFrames > 0) {
-            // Repaint mode: new rows scroll in at the bottom, then redraw everything.
-            for (const row of wrapRows(trimmed, CEA608_COLUMNS)) {
+            // Redraw mode: new rows scroll in at the bottom, then the whole window is re-sent.
+            for (const row of wrapRows(trimmed, this.columns)) {
                 this._lines.push(row);
                 while (this._lines.length > this._rows) this._lines.shift();
             }
-            this.blockQueue = [];              // a pending repaint is obsolete now
-            this.blockQueue.push(this._buildRepaint());
-            this._framesSinceRepaint = 0;
-            this._windowDefined = true;
+            this._blankRedrawsLeft = 0;
+            this._queueRedraw(this._defineOnChange || !this._windowDefined);
             return;
         }
 
@@ -173,16 +273,18 @@ export class DtvccEncoder {
         block.push(CMD.CW0);
 
         // Encode text as G0 characters (basic ASCII 0x20-0x7E), one 32-column row at a
-        // time with a carriage return after each row (the window is 32 columns wide;
-        // anything longer on one row is cut off by the decoder).
+        // time. Like the CEA-608 encoder, the carriage return comes BEFORE each row
+        // (except the very first row after start/clear): the previous rows scroll up and
+        // the new row lands on the bottom row. A CR after the last row would scroll that
+        // row off as well and leave a blank bottom row.
         const rows = wrapRows(trimmed, CEA608_COLUMNS);
-        rows.forEach((row, r) => {
+        rows.forEach((row) => {
+            if (this._classicRowsWritten > 0) block.push(CMD.CR);
+            this._classicRowsWritten++;
             for (let i = 0; i < row.length; i++) {
                 const code = row.charCodeAt(i);
                 block.push(code >= 0x20 && code <= 0x7E ? code : 0x20);
             }
-            // Carriage return to roll up (after every row)
-            block.push(CMD.CR);
         });
 
         // End of text - flush to display
@@ -197,15 +299,16 @@ export class DtvccEncoder {
     enqueueClear() {
         this._lines = [];
         if (this._repaintFrames > 0) {
-            this.blockQueue = [];
-            this.blockQueue.push(this._buildRepaint());   // blank rows
-            this._framesSinceRepaint = 0;
+            // Blank rows, re-sent for a few keep-alive cycles so a lossy path still clears.
+            this._blankRedrawsLeft = 3;
+            this._queueRedraw(false);
             return;
         }
         const block = [];
         block.push(CMD.CLW);
         block.push(0x01); // Clear window 0 (bitmap: bit 0)
         this.blockQueue.push(block);
+        this._classicRowsWritten = 0;
     }
 
     /**
@@ -217,18 +320,29 @@ export class DtvccEncoder {
      *   Header: service_number(3bits) | block_size(5bits)
      *   Then block_size bytes of service data
      *
-     * Multiple blocks can fit per frame depending on available triplets.
-     *
      * @param {number} maxBytes - Maximum bytes available for DTVCC data this frame
      * @returns {number[]|null} DTVCC bytes or null if idle
      */
-    drainFrame(maxBytes = 36) {
-        if (this._repaintFrames > 0 && this.blockQueue.length === 0) {
-            if (++this._framesSinceRepaint >= this._repaintFrames && this._lines.some(Boolean)) {
-                this.blockQueue.push(this._buildRepaint());
-                this._framesSinceRepaint = 0;
+    drainFrame(maxBytes = DEFAULT_CAPACITY) {
+        if (this._repaintFrames > 0) {
+            this.setFrameCapacity(maxBytes);
+            if (this._packets.length === 0) {
+                const showing = this._lines.some(Boolean) || this._blankRedrawsLeft > 0;
+                if (++this._framesSinceRepaint >= this._repaintFrames && showing) {
+                    if (this._blankRedrawsLeft > 0) this._blankRedrawsLeft--;
+                    this._queueRedraw(false);
+                }
             }
+            if (this._packets.length === 0) return null;
+            const pkt = this._packets.shift();
+            if (!pkt) return null;                 // deliberate idle frame between copies
+            if (pkt.length > maxBytes) {           // capacity shrank: rebuild with the new layout
+                this._queueRedraw(true);
+                return null;
+            }
+            return pkt.length % 2 ? [...pkt, 0x00] : pkt;
         }
+
         if (this.blockQueue.length === 0) return null;
 
         const output = [];
@@ -240,7 +354,7 @@ export class DtvccEncoder {
             // Service block header: 3-bit service number + 5-bit size
             // Service 1 = 0x01, shifted left 5 = 0x20
             // Max block size per header = 31 bytes
-            const chunkSize = Math.min(block.length, 31, remaining - 1);
+            const chunkSize = Math.min(block.length, MAX_BLOCK, remaining - 1);
             if (chunkSize <= 0) break;
 
             // Service header byte: service_number=1 (bits 7-5), block_size (bits 4-0)
@@ -268,7 +382,9 @@ export class DtvccEncoder {
         return output.length > 0 ? output : null;
     }
 
+    /** Bytes still to be sent (packets in redraw mode, service-block bytes in classic mode). */
     get queueLength() {
+        if (this._repaintFrames > 0) return this._packets.reduce((sum, p) => sum + (p ? p.length : 0), 0);
         return this.blockQueue.reduce((sum, b) => sum + b.length, 0);
     }
 
@@ -276,13 +392,19 @@ export class DtvccEncoder {
         return this.queueLength > 200;
     }
 
+    /** The rows currently meant to be on screen (redraw mode). */
+    get lines() { return this._lines.slice(); }
+
     reset() {
         this.blockQueue = [];
+        this._packets = [];
         this._windowDefined = false;
         this._lastEnqueuedText = '';
         this._lastEnqueuedTime = 0;
         this._lines = [];
         this._framesSinceRepaint = 0;
+        this._blankRedrawsLeft = 0;
         this._repaintCount = 0;
+        this._classicRowsWritten = 0;
     }
 }
