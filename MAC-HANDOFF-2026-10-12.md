@@ -77,6 +77,13 @@ All platform-neutral JavaScript; the Mac app only needs `git pull`, a rebuild an
   correct and 36/40 captions complete; continuous gave 100 %, 40/40, worst delay 0.4 s, never a
   garbled row (CLAUDE.md addon note 17). Nothing to verify on Mac hardware beyond "it still
   encodes"; the Mac 608 path is untouched.
+- Later the same night (commit ea01b45): `dtvccStyle` 'rollup' | 'popon' | 'youtube' and
+  `dtvccKeepAlive` (relay config + `setRedraw({style, keepAlive})`), the Caption Injection
+  "Transport" preset select (YouTube pop-on ×3 / immediate / continuous / ½ s / 1 s / classic),
+  `tools/sdi-verify/captions/yt-live-captions.mjs` + `yt-score.mjs`. YouTube's converter rules and
+  the live verdict are CLAUDE.md addon note 18: through the Web Presenter only ~2/3 of captions
+  reach YouTube's track, so the caption-ingestion POST stays the YouTube path; embedded CEA-708
+  (continuous) is the decoder path. All JavaScript, nothing platform-specific.
 
 ## Findings worth knowing
 
