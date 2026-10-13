@@ -25,7 +25,7 @@ import { buildCorrectionIndex, applyCorrections, diffForRules } from './shared/c
 // conversational model the app used before, kept as a fallback.
 const CLOUD_MODELS = {
     'transcribe-live': 'gemini-3.5-transcribe-live',
-    'native-audio': 'gemini-2.5-flash-native-audio-preview-12-2025',
+    'native-audio': 'gemini-3.8-live',   // conversational fallback (the 2.5 native-audio previews are being retired); needs sendRealtimeInput({ audio })
 } as const;
 
 /** Rolling words-per-minute over the last 60 s of final captions. */
@@ -88,6 +88,27 @@ const getRelayUrl = () => {
 const getRelayHttpUrl = () => {
     const ws = getRelayUrl();
     return ws.replace(/^wss:/, 'https:').replace(/^ws:/, 'http:');
+};
+
+// True for localhost / 127.0.0.1 / [::1]. The relay hands its Gemini key only to a browser
+// on its own machine (GET /api/gemini/key), so there is no point asking from anywhere else.
+const isLoopbackHostname = (h: string) => {
+    const x = (h || '').replace(/^\[|\]$/g, '').toLowerCase();
+    return x === 'localhost' || x === '127.0.0.1' || x === '::1' || x.endsWith('.localhost');
+};
+
+// The relay's Gemini key (loaded from .env.local), for the browser the desktop app opens at
+// localhost. null when the relay is on another machine, has no key, or is unreachable.
+// The key is kept in memory only — never written to localStorage.
+const fetchServerGeminiKey = async (): Promise<{ key: string; source: string } | null> => {
+    try {
+        const base = getRelayHttpUrl();
+        if (!isLoopbackHostname(new URL(base).hostname)) return null;
+        const r = await fetch(`${base}/api/gemini/key`, { cache: 'no-store' });
+        if (!r.ok) return null;
+        const d = await r.json();
+        return d?.ok && typeof d.key === 'string' && d.key ? { key: d.key, source: String(d.source || 'relay') } : null;
+    } catch { return null; }
 };
 
 // Dictionary persistence — survives reloads and is mirrored to the relay so the
@@ -169,6 +190,7 @@ function App() {
         contextSettings: { sensitivity: 80, acronymExpansion: true, dialect: 'general' },
         // Load config
         apiKey: localStorage.getItem('cc_api_key') || process.env.API_KEY || '',
+        apiKeySource: localStorage.getItem('cc_api_key') ? 'stored' : process.env.API_KEY ? 'env' : undefined,
         localServerUrl: localStorage.getItem('cc_local_url') || 'ws://localhost:9000',
         localLlmUrl: localStorage.getItem('cc_llm_url') || 'http://localhost:11434',
         localLlmModel: localStorage.getItem('cc_llm_model') || 'gemma4:e2b',
@@ -264,6 +286,39 @@ function App() {
   useEffect(() => { captionsRef.current = appState.captions; }, [appState.captions]);
   useEffect(() => { interimRef.current = appState.interimText; }, [appState.interimText]);
   useEffect(() => { apiKeyRef.current = appState.apiKey; }, [appState.apiKey]);
+
+  // --- Gemini key for Cloud mode --------------------------------------------------
+  // Start pressed in Cloud mode without a key is remembered here (see the gate at the top
+  // of startRecording) and resumed by the effect below as soon as a key is present —
+  // after Save in Help & Settings → Cloud, or once the relay's key has been adopted.
+  const pendingCloudStartRef = useRef(false);
+
+  // Desktop app: the relay on this machine loaded the key from .env.local and the browser it
+  // opens at localhost may use it without typing. Asked at startup and again whenever the
+  // key becomes empty (a stored key was cleared in Settings). A LAN operator machine is
+  // refused by the relay and enters its own key.
+  useEffect(() => {
+      if (appState.apiKey) return;
+      let cancelled = false;
+      fetchServerGeminiKey().then(r => {
+          if (cancelled || !r) return;
+          diagLog('info', `Gemini key: using the relay's key (${r.source}); enter one in Help & Settings → Cloud only to override`);
+          setAppState(p => (p.apiKey ? p : { ...p, apiKey: r.key, apiKeySource: 'server' }));
+      });
+      return () => { cancelled = true; };
+  }, [appState.apiKey]);
+
+  // Resume a Cloud start that was waiting for a key. Cancelled when the operator leaves
+  // Cloud mode or the Dashboard, or closes Help & Settings without saving.
+  useEffect(() => {
+      if (!pendingCloudStartRef.current) return;
+      if (appState.mode !== 'cloud' || appState.view !== 'dashboard') { pendingCloudStartRef.current = false; return; }
+      if (!appState.apiKey || appState.isRecording) return;
+      pendingCloudStartRef.current = false;
+      diagLog('info', `Gemini key ${appState.apiKeySource === 'server' ? 'from the relay' : 'saved'} — starting the Cloud session that was waiting for it`);
+      setShowGlobalSettings(false);
+      setAppState(p => ({ ...p, isRecording: true }));
+  }, [appState.apiKey, appState.mode, appState.view, appState.isRecording]);
 
   // Translation needs an engine on the relay: the local AI brain or a Gemini key.
   // Ask the relay rather than assuming Gemini, and explain in-app instead of alerting.
@@ -685,6 +740,36 @@ function App() {
 
     const startRecording = async () => {
         try {
+            // 0. Cloud mode needs a Gemini key. Do not alert and give up (that lost the
+            //    operator's intent): keep Cloud mode, remember that a start is pending, explain,
+            //    and open Help & Settings → Cloud. The pending-start effect above starts the
+            //    session the moment a key is saved. Checked before the microphone is opened.
+            if (strategy === 'cloud' && !appState.apiKey) {
+                // A key typed elsewhere in this tab (Context Engine, Prerecorded, Analytics) only
+                // lands in localStorage, and the relay's key is missed when the relay was not up
+                // at page load: adopt either instead of asking again. The new key re-runs this
+                // effect (apiKey is a dependency), which then starts the session.
+                const stored = (localStorage.getItem('cc_api_key') || '').trim();
+                if (stored && stored !== 'PLACEHOLDER_API_KEY') {
+                    diagLog('info', 'Cloud mode: using the Gemini key saved in this browser');
+                    setAppState(p => ({ ...p, apiKey: stored, apiKeySource: 'stored' }));
+                    return;
+                }
+                const server = await fetchServerGeminiKey();
+                if (!mounted) return;
+                if (server) {
+                    diagLog('info', `Cloud mode: using the relay's Gemini key (${server.source})`);
+                    setAppState(p => ({ ...p, apiKey: server.key, apiKeySource: 'server' }));
+                    return;
+                }
+                pendingCloudStartRef.current = true;
+                diagLog('warn', 'Cloud mode: no Gemini API key — opening Help & Settings → Cloud; the session starts once a key is saved');
+                setAppState(p => ({ ...p, isRecording: false, notifications: [...p.notifications, { id: Date.now().toString(), message: 'Cloud mode needs a Gemini API key — enter it in Help & Settings → Cloud. The session starts as soon as the key is saved.', type: 'error', timestamp: Date.now() }] }));
+                setGlobalSettingsTab('cloud');
+                setShowGlobalSettings(true);
+                return;
+            }
+
             // 1. Get Audio Stream
             // CLOUD FIX: Remove sampleRate: 16000 constraint to avoid "OverconstrainedError" on consumer hardware
             // Let the browser pick the native rate, and AudioContext will handle resampling.
@@ -912,11 +997,7 @@ function App() {
             
             // --- CLOUD MODE (Gemini Live) ---
             else if (strategy === 'cloud') {
-                if (!appState.apiKey) {
-                    alert("API Key required for Cloud Mode");
-                    setAppState(p => ({...p, isRecording: false}));
-                    return;
-                }
+                // The key gate ran in step 0, before the microphone was opened.
 
                 // Cloud Mode Transcript Buffer to prevent race conditions
                 let cloudTranscriptBuffer = '';
@@ -995,7 +1076,9 @@ function App() {
                             const inputData = e.inputBuffer.getChannelData(0);
                             const pcmBlob = createPcmBlob(inputData);
                             // Fire and forget send
-                            session.sendRealtimeInput({ media: pcmBlob });
+                            // `audio` (not the deprecated `media`): gemini-3.8-live and 3.1-flash-live ignore or reject
+                            // media_chunks; gemini-3.5-transcribe-live accepts both (verified 2026-10-13)
+                            session.sendRealtimeInput({ audio: pcmBlob });
                         };
 
                         sourceNode.connect(processor);
@@ -1445,7 +1528,7 @@ function App() {
 
       <GlobalSettings 
         isOpen={showGlobalSettings} 
-        onClose={() => setShowGlobalSettings(false)} 
+        onClose={(reason) => { setShowGlobalSettings(false); if (reason !== 'saved') pendingCloudStartRef.current = false; }} 
         appState={appState}
         setAppState={setAppState}
         initialTab={globalSettingsTab}

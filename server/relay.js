@@ -11,6 +11,7 @@ import { polish, localPolish, summarize, truncateAtWord, setApiKey as setPolishe
 import { feedText as learnerFeedText, setApiKey as setLearnerApiKey, setEnabled as setLearnerEnabled, getSuggestions, acceptSuggestion, dismissSuggestion, setDictionary as setLearnerDictionary, getDictionary as getLearnerDictionary, extractDictionary, generateMishearings, getStatus as getLearnerStatus } from './context-learner.js';
 import { translateCaption, setApiKey as setTranslationApiKey, getSupportedLanguages, getCacheStats as getTranslationStats, translationAvailable } from './translation-service.js';
 import { getSystemMetrics } from './system-metrics.js';
+import { configureObsCaptions, getObsCaptionStatus, sendObsCaption, refreshObsStreaming } from './obs-captions.js';
 import { appendFileSync as fsAppendFileSync, statSync as fsStatSync, truncateSync as fsTruncateSync, readFileSync as fsReadFileSync } from 'fs';
 
 // ---------------------------------------------------------------------------
@@ -179,6 +180,20 @@ let captionConfig = {
     cea608PaceFrames: 1,
     cea608Repeat: 1,
     cea608InDtvcc: false,          // off by default: YouTube prefers 608 when both are present and mangles it
+    // CEA-608 style (see cea608-encoder.js): 'rollup' (RUx + CR per row, PAC once), 'rollup_pac'
+    // (PAC with every row), 'popon' (RCL ENM PAC text EOC — the broadcast / libcaption way),
+    // 'painton' (RDC PAC text DER). controlRepeat 2 = every control code twice (the 608 rule).
+    cea608Style: 'rollup_pac',    // default since 2026-10-13: YouTube renders roll-up only when every row carries its PAC (the PAC-once form came out as single characters); SDI decoders read both
+    cea608ControlRepeat: 2,
+    // One-frame CEA-608: the whole caption's pairs in one CDP (19 at 29.97), `copies` times
+    // `copyGap` frames apart, so a lossy encoder forwards a caption whole or not at all.
+    cea608OneFrame: false,
+    cea608Copies: 1,
+    cea608CopyGap: 3,
+    cea608HoldFrames: 0,           // erase the display (EDM) after N idle frames (0 = never)
+    cea608CcCount: 0,              // triplets per frame in CEA-608 mode (0 = standard for the rate, max 31)
+    cea608MaxPairs: 0,             // one-frame mode: field-1 pairs per frame (0 = all the CDP can carry, 19 at 29.97)
+    cdpSvcInfoEvery: 0,            // ccsvcinfo section in every CDP (0) or only every Nth frame (experiment)
     // VANC line of the caption packet on SDI (0 = DeckLink default = line 9).
     vancLine: 0,
     // CEA-708 redraw transport (see dtvcc-encoder.js): every frame carries one self-contained
@@ -202,6 +217,22 @@ let captionConfig = {
     dtvccColumns: 0,
     dtvccDefineOnChange: true,
 };
+
+function applyCea608Transport() {
+    if (cea708Builder) cea708Builder.svcInfoEvery = captionConfig.cdpSvcInfoEvery || 0;
+    if (!cea608Encoder) return;
+    cea608Encoder.setStyle(captionConfig.cea608Style);
+    cea608Encoder.setControlRepeat(captionConfig.cea608ControlRepeat);
+    cea608Encoder.setPacing(captionConfig.cea608PaceFrames, captionConfig.cea608Repeat);
+    cea608Encoder.setHoldFrames(captionConfig.cea608HoldFrames);
+    const capacity = cea708Builder ? cea708Builder.cea608Capacity(deckLinkFrameRate, captionConfig.cea608CcCount) : 19;
+    cea608Encoder.setOneFrame({
+        enabled: captionConfig.cea608OneFrame,
+        maxPairs: captionConfig.cea608MaxPairs ? Math.min(capacity, captionConfig.cea608MaxPairs) : capacity,
+        copies: captionConfig.cea608Copies,
+        copyGap: captionConfig.cea608CopyGap,
+    });
+}
 
 function applyDtvccTransport() {
     if (!dtvccEncoder) return;
@@ -443,6 +474,7 @@ async function initCaptionEncoder() {
         dtvccEncoder.setRows(captionConfig.rollupRows);
         applyDtvccTransport();
         cea708Builder = new Cea708CdpBuilder();
+        applyCea608Transport();
         console.log('[CEA-708] Encoders initialized (CEA-608 + DTVCC)');
     } catch (e) {
         console.warn('[CEA-708] Encoder init failed:', e.message);
@@ -456,6 +488,7 @@ function startFrameLoop(frameRate = '29.97') {
     const intervalMs = 1000.0 / fps;
     // the DTVCC row packets are laid out for the bytes one frame can carry at this rate
     if (dtvccEncoder && cea708Builder) dtvccEncoder.setFrameCapacity(cea708Builder.dtvccCapacity(frameRate, captionConfig.dtvccCcCount));
+    applyCea608Transport();
 
     let debugCounter = 0;
     let activeFrames = 0;
@@ -474,10 +507,10 @@ function startFrameLoop(frameRate = '29.97') {
             cdp = cea708Builder.buildCDP_DTVCC(dtvccData, frameRate, pair.cc1, pair.cc2, !!with608, captionConfig.dtvccCcCount);
             isActive = !!dtvccData || (pair.cc1 !== 0x80 || pair.cc2 !== 0x80);
         } else if (cea608Encoder) {
-            // CEA-608 mode: drain one CC pair per frame
-            const pair = cea608Encoder.drainPair();
-            cdp = cea708Builder.buildCDP(pair.cc1, pair.cc2, frameRate);
-            isActive = (pair.cc1 !== 0x80 || pair.cc2 !== 0x80);
+            // CEA-608 mode: one CC pair per frame, or a whole caption's pairs in one-frame mode
+            const pairs = cea608Encoder.drainPairs();
+            cdp = cea708Builder.buildCDP(pairs, frameRate, captionConfig.cea608CcCount);
+            isActive = pairs.some(p => p.cc1 !== 0x80 || p.cc2 !== 0x80);
         } else {
             return;
         }
@@ -899,6 +932,7 @@ app.get('/api/inject/status', (req, res) => {
         droppedFrames: nativeStatus.droppedFrames || 0,
         encoderQueueDepth: (captionConfig.encodingMode === 'dtvcc' ? dtvccEncoder?.queueLength : cea608Encoder?.queueLength) || 0,
         dtvccTransport: dtvccEncoder ? { repaintFrames: dtvccEncoder.repaintFrames, ...dtvccEncoder.redrawOptions } : null,
+        cea608Transport: cea608Encoder ? cea608Encoder.transport : null,
         cea708BridgeClients: cea708Clients.size,
         presenterUrl: `${presenterUrl}/?view=audience&session=demo`,
         addonLoaded: !!decklink,
@@ -929,7 +963,7 @@ app.post('/api/inject/caption', (req, res) => {
     feedCaptionToEncoder({ type: 'caption', isFinal: !!isFinal, payload: { text: processed } });
     // Same backup path as Dashboard captions: when a YouTube caption-ingestion URL is
     // set, every final line is POSTed to YouTube directly (bypasses the SDI encoder).
-    if (isFinal) forwardToYouTube(processed);
+    if (isFinal) { forwardToYouTube(processed); sendObsCaption(processed); }
     res.json({ ok: true, text: processed, applied });
 });
 
@@ -949,6 +983,7 @@ app.get('/api/caption/config', (req, res) => {
 app.post('/api/caption/config', (req, res) => {
     const { encodingMode, captionStrategy, maxCharsPerLine, rollupRows, polishEnabled, profanityFilter,
             cea608PaceFrames, cea608Repeat, cea608InDtvcc, vancLine, dtvccRepaintFrames,
+            cea608Style, cea608ControlRepeat, cea608OneFrame, cea608Copies, cea608CopyGap, cea608HoldFrames, cea608CcCount, cea608MaxPairs, cdpSvcInfoEvery,
             dtvccRepeat, dtvccRepeatGap, dtvccKeepAlive, dtvccStyle, dtvccCcCount, dtvccAtomicDelete, dtvccAtomicWindows, dtvccAtomicHoldFrames, dtvccBlocks, dtvccRowErase, dtvccColumns, dtvccDefineOnChange } = req.body;
 
     if (encodingMode && ['cea608', 'dtvcc'].includes(encodingMode)) {
@@ -995,6 +1030,17 @@ app.post('/api/caption/config', (req, res) => {
         if (cea608Repeat !== undefined) captionConfig.cea608Repeat = Math.max(1, Math.min(4, parseInt(cea608Repeat) || 1));
         if (cea608Encoder) cea608Encoder.setPacing(captionConfig.cea608PaceFrames, captionConfig.cea608Repeat);
     }
+    let cea608Changed = false;
+    if (cea608Style !== undefined) { captionConfig.cea608Style = ['rollup', 'rollup_pac', 'popon', 'painton'].includes(cea608Style) ? cea608Style : 'rollup'; cea608Changed = true; }
+    if (cea608ControlRepeat !== undefined) { captionConfig.cea608ControlRepeat = parseInt(cea608ControlRepeat) === 1 ? 1 : 2; cea608Changed = true; }
+    if (cea608OneFrame !== undefined) { captionConfig.cea608OneFrame = !!cea608OneFrame; cea608Changed = true; }
+    if (cea608Copies !== undefined) { captionConfig.cea608Copies = Math.max(1, Math.min(8, parseInt(cea608Copies) || 1)); cea608Changed = true; }
+    if (cea608CopyGap !== undefined) { captionConfig.cea608CopyGap = Math.max(0, Math.min(60, parseInt(cea608CopyGap) || 0)); cea608Changed = true; }
+    if (cea608HoldFrames !== undefined) { captionConfig.cea608HoldFrames = Math.max(0, Math.min(3000, parseInt(cea608HoldFrames) || 0)); cea608Changed = true; }
+    if (cea608CcCount !== undefined) { captionConfig.cea608CcCount = Math.max(0, Math.min(31, parseInt(cea608CcCount) || 0)); cea608Changed = true; }
+    if (cdpSvcInfoEvery !== undefined) { captionConfig.cdpSvcInfoEvery = Math.max(0, Math.min(60, parseInt(cdpSvcInfoEvery) || 0)); cea608Changed = true; }
+    if (cea608MaxPairs !== undefined) { captionConfig.cea608MaxPairs = Math.max(0, Math.min(31, parseInt(cea608MaxPairs) || 0)); cea608Changed = true; }
+    if (cea608Changed) applyCea608Transport();
     if (cea608InDtvcc !== undefined) {
         captionConfig.cea608InDtvcc = !!cea608InDtvcc;
     }
@@ -1163,6 +1209,21 @@ app.post('/api/youtube/caption-url', (req, res) => {
         console.log('[YouTube CC] Ingestion URL cleared');
     }
     res.json({ ok: true, url: youtubeCaptionState.url });
+});
+
+// --- OBS caption output (obs-websocket SendStreamCaption → libcaption CEA-608 pop-on in OBS's stream) ---
+app.get('/api/obs/status', async (req, res) => {
+    if (req.query.refresh) await refreshObsStreaming();
+    res.json(getObsCaptionStatus());
+});
+app.post('/api/obs/config', (req, res) => {
+    const { enabled, url, password, displaySeconds } = req.body || {};
+    if (url !== undefined && url && !/^wss?:\/\//i.test(String(url))) {
+        return res.status(400).json({ ok: false, error: 'OBS WebSocket URL must start with ws:// (e.g. ws://127.0.0.1:4455)' });
+    }
+    const status = configureObsCaptions({ enabled, url, password, displaySeconds });
+    console.log(`[OBS CC] ${status.enabled ? 'Enabled → ' + status.url : 'Disabled'}`);
+    res.json({ ok: true, ...status });
 });
 
 // =====================================================================
@@ -1448,6 +1509,35 @@ app.get('/api/gemini/status', (req, res) => {
         masked: maskKey(geminiKeyActive),
         keyLength: geminiKeyActive ? geminiKeyActive.length : 0,
     });
+});
+
+// The key itself, for the browser the desktop app opens on this machine (so it can run
+// Cloud mode without typing the key). Answered only to a request from the loopback socket —
+// req.socket.remoteAddress, not req.ip, because 'trust proxy' is on and X-Forwarded-For can
+// be spoofed from the LAN — whose Host header is a loopback name as well: the audience
+// tunnels (cloudflared, localhost.run) proxy into this relay from 127.0.0.1, so the socket
+// alone would hand the key to anyone holding the public URL. Cross-origin GETs are readable
+// under the "*" CORS header, so an Origin from a non-loopback page (any website open in the
+// operator's browser) is refused too. A LAN operator machine gets 403 and enters its own key.
+function loopbackHostname(h) {
+    const x = String(h || '').trim().toLowerCase().replace(/^\[([^\]]+)\](:\d+)?$/, '$1').replace(/:\d+$/, '');
+    return x === 'localhost' || x === '127.0.0.1' || x === '::1' || x.endsWith('.localhost');
+}
+function isLoopbackBrowserRequest(req) {
+    const a = String(req.socket?.remoteAddress || '');
+    if (a !== '127.0.0.1' && a !== '::1' && a !== '::ffff:127.0.0.1') return false;
+    if (!loopbackHostname(req.headers.host)) return false;
+    if (req.headers['x-forwarded-for'] || req.headers['x-forwarded-host'] || req.headers['forwarded'] || req.headers['cf-connecting-ip']) return false;
+    if (req.headers.origin) {
+        try { if (!loopbackHostname(new URL(req.headers.origin).hostname)) return false; } catch { return false; }
+    }
+    return true;
+}
+app.get('/api/gemini/key', (req, res) => {
+    res.setHeader('Cache-Control', 'no-store');
+    if (!isLoopbackBrowserRequest(req)) return res.status(403).json({ ok: false, error: 'Only the browser on the relay machine can read the key' });
+    if (!geminiKeyActive || geminiKeyActive.length < 10) return res.json({ ok: false });
+    res.json({ ok: true, key: geminiKeyActive, source: geminiKeySource });
 });
 
 // --- Local Proper Noun Extraction (no AI needed) ---
@@ -2318,7 +2408,7 @@ wss.on('connection', (ws, req) => {
                         const polishedText = (typeof polishedData.payload === 'string')
                             ? polishedData.payload
                             : (polishedData.payload?.text || '');
-                        if (polishedText) forwardToYouTube(polishedText);
+                        if (polishedText) { forwardToYouTube(polishedText); sendObsCaption(polishedText); }
                     }
                 });
                 return; // Don't fall through to unpolished broadcast

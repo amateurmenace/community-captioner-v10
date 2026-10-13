@@ -131,7 +131,11 @@ Audio → Gemini Transcribe Live / Gemini native audio / Whisper / WebSpeech →
 | `components/LocalSetup.tsx` | Guided local setup wizard: machine check → speech engine (install, start, mic test) → optional Ollama brain → finish |
 | `.github/workflows/build-mac.yml` | CI: builds the addon without Desktop Video (`BMD_LINK_FRAMEWORK=OFF`), signs with the Developer ID cert from secrets, notarizes, staples, attaches the zip to the release |
 | `server/translation-service.js` | Server-side Gemini translation with LRU cache and in-flight dedup for audience phone view |
-| `server/cea708/cea608-encoder.js` | CEA-608 Roll-Up 2/3 encoder with line breaking, dedup, configurable rows |
+| `server/cea708/cea608-encoder.js` | CEA-608 encoder: roll-up (PAC once / PAC per row), pop-on (RCL ENM PAC text EOC), paint-on (RDC PAC text DER), control codes once or twice, one-frame packing with copies, hold-then-EDM; `drainPairs()` per frame |
+| `server/obs-captions.js` | OBS caption output: obs-websocket 5 client (auth, reconnect) sending every final caption as `SendStreamCaption`; `POST /api/obs/config`, `GET /api/obs/status` |
+| `tools/sdi-verify/captions/cea608-model.mjs`, `cea608-display.mjs`, `wp-608-test.mjs`, `yt-clean-608.mjs` | CEA-608 decoder model, capture scorer, live numbered-caption sender per style, phased clean-stream generator (see the README there) |
+| `tools/sdi-verify/obs/` | OBS Studio as the control encoder: profile/scene writer, obs-websocket CLI (README there) |
+| `tools/e2e/cloud-e2e.mjs` | Fresh Chrome profile with a fake microphone (a WAV), driven over the DevTools protocol: landing → Dashboard → Cloud → Start; verifies the Gemini Live connection and caption text in the packaged app (`node tools/e2e/cloud-e2e.mjs http://localhost:8092 speech.wav`) |
 | `server/cea708/dtvcc-encoder.js` | CEA-708 DTVCC Service 1 encoder (~200+ chars/sec throughput) |
 | `server/cea708/cea708-cdp-builder.js` | SMPTE 334 CDP builder: `buildCDP()` for CEA-608, `buildCDP_DTVCC()` for dual-mode |
 | `native/decklink/src/addon.cpp` | N-API bindings exposing 8 JS functions |
@@ -140,7 +144,7 @@ Audio → Gemini Transcribe Live / Gemini native audio / Whisper / WebSpeech →
 | `native/decklink/src/output_handler.cpp` | Standalone mode (black frames + captions, CDP queue) |
 | `native/decklink/src/passthrough.cpp` | SDI in → SDI out + captions (CDP queue) |
 | `components/Dashboard.tsx` | Main control center: recording, live preview, relay connection, QR code modal, "Learn" pill (Auto-Learn toggle) + suggestion toasts with 10s auto-accept |
-| `components/OutputSettings.tsx` | Caption Output Designer: DeckLink/NDI config, Caption Processing settings |
+| `components/OutputSettings.tsx` | Caption Output Designer: browser overlay design (dimensions, typography, colors, overlay URL) and DeckLink/NDI output start/stop; the caption strategy / cap / transport controls are on the Caption Injection screen |
 | `components/ContextEngine.tsx` | Context Engine UI: Municipality Wizard (SSE research with grouped, selectable results + optional deep scan of official pages), PDF/DOCX upload with preview, paste/URL extraction with preview, Quick Names, Meeting Body, dictionary management, settings with how-to guide |
 | `components/AudienceView.tsx` | Phone caption viewer: auto-reconnect, dark/light mode, font sizes, fullscreen |
 | `App.tsx` | Root component, audio capture, WebSocket connection, state management. Landing → deployment choice (cloud only) or straight to workflow picker (local). |
@@ -190,6 +194,9 @@ Audio → Gemini Transcribe Live / Gemini native audio / Whisper / WebSpeech →
 | `/api/inject/caption` | POST | `{text, isFinal?, applyDictionary?}` → feeds the SDI encoder; the relay applies the dictionary to REST-injected captions (Dashboard captions arrive already corrected) |
 | `/api/youtube/caption-url` | GET | Current YouTube caption ingestion URL + last-POST status |
 | `/api/youtube/caption-url` | POST | Set/clear YouTube caption ingestion URL (body: `{url: "..."}` or `{url: ""}` to clear) |
+| `/api/obs/status` | GET | OBS caption output state: enabled, url, connected/identified, streaming, sent/refused, lastError (`?refresh=1` re-asks OBS) |
+| `/api/obs/config` | POST | `{enabled, url, password, displaySeconds}` → connect to obs-websocket and forward every final caption as `SendStreamCaption` |
+| `/api/gemini/key` | GET | The relay's Gemini key for the desktop app's own browser only (loopback socket + Host + Origin, no forwarding headers; 403 otherwise) |
 
 ## WebSocket Paths
 
@@ -326,13 +333,13 @@ English, Spanish, Chinese (Simplified), French, Portuguese, Haitian Creole, Russ
 
 ## Caption Encoding Configuration
 
-Configurable via Output Settings UI → Caption Processing section, or `POST /api/caption/config`:
+Set on the **Caption Injection** screen (step 3 "Caption Encoding": the CEA-608 / CEA-708 choice, then a **Caption text** row with the strategy select and the character cap, shown in both modes; the "Also send CEA-608" checkbox and the **Transport** preset appear only in CEA-708 mode) or with `POST /api/caption/config`. The screen loads the current values from `GET /api/caption/config` when opened and POSTs a patch on every change; the relay reads them live in `feedCaptionToEncoder` (relay.js) for each final caption, so they apply mid-session, and they last only as long as the relay process. `rollupRows`, `polishEnabled`, `profanityFilter`, the CEA-608 pacing keys and `vancLine` have no UI and are API-only. There is no "Caption Processing" section anywhere: `components/OutputSettings.tsx` is the Caption Output Designer (browser-overlay dimensions, typography, colors, overlay URL, plus DeckLink/NDI start/stop/clear) and never touches `/api/caption/config` (the claim that it did was wrong until 2026-10-13).
 
 ```json
 {
-  "encodingMode": "cea608",       // "cea608" | "dtvcc"
+  "encodingMode": "dtvcc",        // "cea608" | "dtvcc" (dtvcc with the one-frame transport is the default since 6.13.3)
   "captionStrategy": "truncate",  // "truncate" | "summarize" | "verbatim"
-  "maxCharsPerLine": 64,          // 32-128
+  "maxCharsPerLine": 46,          // 32-128 (46 = two one-frame pieces of 23)
   "rollupRows": 2,                // 2 | 3 (CEA-608 only)
   "polishEnabled": true           // auto-capitalize, punctuate, fix contractions
 }
@@ -343,7 +350,7 @@ Configurable via Output Settings UI → Caption Processing section, or `POST /ap
 - **DTVCC**: ~200+ chars/sec via CEA-708 Service 1. Also sends CEA-608 in Field 1 for backward compatibility with older decoders.
 
 **Caption Strategies**:
-- **Truncate**: Caps text at `maxCharsPerLine` at word boundary. Fast, no AI.
+- **Truncate**: Caps text at `maxCharsPerLine` at word boundary. Fast, no AI. With the one-frame YouTube transport each piece is 23 characters, so the cap matters mainly for the other transports.
 - **Summarize**: Gemini AI condenses speech to fit within limit. Requires API key. Falls back to truncate on timeout (800ms).
 - **Verbatim**: Full text, no truncation. May lag behind fast speakers with CEA-608.
 
@@ -426,6 +433,35 @@ Measured on the M1 Max with large-v3-turbo on MLX: a 4-minute MOV → 39 timesta
 ## Live machine metrics (server/system-metrics.js)
 
 The Dashboard header (third iteration, after the user rejected a wrapping two-row version as "a complete mess") is: **row 1** = brand, then right-aligned controls that are all the same 36 px pill (`CTL` class), on one line that never wraps (`whitespace-nowrap`; the active-dictionary pill hides below xl, the language select below lg), ending in a 36 px Start/Stop button; **row 2** = a 36 px session line: Duration · Latency · WPM · Confidence (9 px uppercase label + 13 px tabular value), then "Whisper 0.07 GB · Ollama 0.02 GB" as plain text, a "Watch this" warning and a "● M1 Max · 10 cores · 32 GB" toggle that opens the detail panel (bars, process list, warnings); **row 3** = a 32 px band of **full-width hairline graphs**, one cell per stat (CPU, GPU when reported, RAM, Net) with the value at the left and an SVG area graph filling the rest of the cell: 1 px `currentColor` line with a 10 % fill, up to 150 samples (5 min at 2 s) stretched across the cell from the first sample (`preserveAspectRatio="none"` + `vector-effect: non-scaling-stroke`), the path morphing between samples via a CSS `d` transition, tone turning amber at 70 % and red at 90 %. The user explicitly asked for the graphs to live horizontally across the top, always visible and slim; keep them hairline, never blocky, never behind a toggle. It polls `GET /api/system/metrics` every 2 s while recording or while the panel is open, 4 s otherwise. Sources: `os.cpus()` deltas; `vm_stat` app memory (active + wired + compressed) and `kern.memorystatus_vm_pressure_level` on macOS, `/proc/meminfo` MemAvailable on Linux, `os.freemem()` on Windows; `ioreg -r -d 1 -c IOAccelerator` "Device Utilization %" on Macs and `nvidia-smi` elsewhere (other GPUs report `available: false`); `netstat -ibn` / `/proc/net/dev` / `netstat -e` byte counters turned into KB/s; `ps` (or `tasklist` on Windows, memory only) for the managed Whisper pid and `pgrep -f ollama`. GB values are GiB so a 32 GB Mac reads 32.
+
+## Gemini models (measured 2026-10-13, key from .env.local; `GET /v1beta/models` lists what the key can use)
+
+Every path pins its thinking budget explicitly. **Gemini 2.5 Flash and every 3.x non-lite Flash think by default and the thought tokens count against `maxOutputTokens`**: with the old 2.5-flash + 256-token caps, polish took 1.7 s (always past its 500 ms race) or came back truncated (`finish=MAX_TOKENS`), Auto-Learn's 512-token cap was eaten entirely (nothing parseable) and Quick Names took 9.7 s (past its 8 s timeout) — those three paths were effectively dead. Thinking facts: 2.5-flash `thinkingBudget: 0` works; 2.5-flash-lite / 3.1-flash-lite / 3.5-flash-lite never think (3.5-flash-lite rejects `thinkingBudget` with 400, 2.5-flash-lite rejects `thinkingLevel`); 3.5-flash `MINIMAL` = off, `LOW` still thinks; 3.8-flash `MINIMAL` is rejected, `LOW` ≈ off (0 thoughts in 9 of 10 calls); 3.8-live rejects `thinkingLevel` (close 1007). **Gemini 3.x skips Google Search when asked for JSON** (0 grounding chunks on 3.8-flash and 3.5-flash at every thinking level, even with "MUST search"; JSON mode + googleSearch hung 76 s), so the wizard's research is now two-step: prose research with grounding on 3.8-flash → JSON formatting on 3.5-flash-lite (`grounded` flag per group). 3.8-flash writes URLs in code spans, so the locate regex stops at a backtick. Env overrides: `GEMINI_POLISH_MODEL`, `GEMINI_TRANSLATE_MODEL`, `GEMINI_LEARNER_MODEL`, `GEMINI_MODEL` (text/extraction, also what `/api/context/capabilities` reports).
+
+| Path | File | Old | New (2026-10-13) | Measured | Notes |
+|---|---|---|---|---|---|
+| Caption polish (500 ms race) | server/caption-polisher.js | gemini-2.5-flash | **gemini-2.5-flash-lite**, budget 0 | 300–350 ms (460–500 through the module) | only model that fits; 3.8-flash ≥ 1.6 s even with thinking off |
+| Summarize (800 ms) | server/caption-polisher.js | gemini-2.5-flash | **gemini-2.5-flash-lite** | 290–450 ms, 52–58 chars | 3.5-flash-lite 1.0 s (over budget) |
+| Audience translation (4 s) + `POST /api/translate` (10 s) | server/translation-service.js | gemini-2.5-flash | **gemini-3.8-flash**, LOW, 512 tokens | es 1.1–2.2 s, zh 2.1–2.2 s, ht 2.1 s | default thinking truncated at 2.9–4.1 s; 2.5-flash-lite 385 ms fallback via env |
+| Auto-Learn extraction (5 s) | server/context-learner.js | gemini-2.5-flash | **gemini-3.5-flash-lite**, JSON mode, 1024 tokens | 1.8–1.9 s, 17–18 entries | old: MAX_TOKENS every time; 3.8-flash LOW 3.9 s and "corrected" Pearlman → Perlman |
+| Quick Names mishearings (8 s) | server/context-learner.js | gemini-2.5-flash | **gemini-3.5-flash-lite**, JSON mode | 1.4–2.6 s | old 9.7 s and unparseable |
+| Document extraction (60 s/chunk) | context-learner.js via context-sources.js | gemini-2.5-flash | **gemini-3.8-flash**, LOW | 7.4 s, 16/16 names | default thinking 15.7 s, same recall |
+| Wizard locate (googleSearch) | server/context-sources.js | gemini-2.5-flash | **gemini-3.8-flash**, LOW | 9.7 s, 7 chunks | URLs come in code spans |
+| Wizard research (googleSearch) | server/context-sources.js | gemini-2.5-flash (one JSON call) | **3.8-flash LOW prose → 3.5-flash-lite JSON** | 29 s + 6 s, 49 items, 12 queries | single-call JSON never searched on 3.x |
+| urlContext page read (45 s) | server/context-sources.js | gemini-2.5-flash | **gemini-3.8-flash**, LOW | 13.6 s / 43 items | default thinking hit the 45 s timeout |
+| Browser translate fallback | services/geminiService.ts | gemini-2.5-flash-lite | gemini-3.8-flash, LOW | ≈1.2 s | |
+| Prerecorded transcription (inline audio + JSON schema) | services/geminiService.ts | gemini-2.5-flash | **gemini-3.8-flash** | 3.4–3.9 s / 12.6 s clip | "Coolidge Corner" right (2.5: "Koolage Corner", "Brickline"); gemini-3.5-transcribe has no timestamps |
+| Session analysis | services/geminiService.ts | gemini-3-flash-preview | **gemini-3.8-flash** | 11.2 s (was 16.7) | |
+| Settings "test connection" | components/GlobalSettings.tsx | gemini-3-flash-preview | gemini-3.8-flash | 2.7 s | |
+| Cloud live default | App.tsx | gemini-3.5-transcribe-live | keep | first interim 1.2 s, final 1.4 s after speech ends | perfect transcript; `media` and `audio` both accepted |
+| Cloud legacy recognizer | App.tsx | gemini-2.5-flash-native-audio-preview-12-2025 | **gemini-3.8-live** | sentence 1.2 s after speech, turnComplete 6.5 s | needs `sendRealtimeInput({ audio })` |
+| Audience translation alternative | — | — | gemini-3.5-live-translate-preview **not adopted** | speech → translated speech ≈ 3.2 s | bidi-only, audio in / audio out, one language per session, bypasses the corrected text |
+
+## Cloud mode and the Gemini key (fixed 2026-10-13)
+
+- The Dashboard's mode switch used to refuse Cloud when `localStorage cc_api_key` was empty and open a *second* GlobalSettings instance with a fake `appState` and a no-op setter, so Save wrote localStorage only and `appState.apiKey` (read once at startup) stayed empty until a reload; the Cloud start path then raised `alert("API Key required for Cloud Mode")`. That was the "key saved but not used / fell back to browser mode" symptom.
+- Now: choosing Cloud never needs a key up front. `startRecording` gates Cloud before opening the microphone: it adopts a key typed elsewhere (localStorage) or the relay's key, otherwise keeps Cloud mode, remembers a pending start, raises the error notification and opens Help & Settings on the **Cloud** tab; Save stores the key (`apiKeySource: 'stored'`) and the pending session starts by itself. An empty field keeps the relay key or clears a stored one.
+- **Server key for the desktop app**: `GET /api/gemini/key` returns the relay's key (`.env.local` / env) only to a loopback browser — loopback socket **and** loopback `Host`, no forwarding headers, loopback `Origin` if present — because the audience tunnels proxy into the relay from 127.0.0.1 and the `*` CORS header would otherwise hand the key to any site. The app fetches it at startup when no key is stored, keeps it in memory only (`apiKeySource: 'server'`), and the Cloud tab shows "Using the Gemini key from the relay (.env.local) — enter one here only to override". A LAN operator machine never receives it and enters its own.
 
 ## Caption Polisher (server/caption-polisher.js)
 
@@ -530,6 +566,14 @@ Several gotchas that don't apply on macOS:
 
 19. **One-frame ("atomic") captions: the transport that reaches YouTube through the Web Presenter (6.13.2, morning of 2026-10-13).** Loss is per frame and independent of how much is sent (per-packet survival by local packet density was flat in every run: 73 %, 79 %, 70 %, 55 %, 88 % for 9–100 % of frames carrying packets; it varies with time, not load). So a caption that fits ONE frame either arrives whole or not at all, which also sidesteps YouTube's frozen-text and partial-row rules. `dtvccStyle: 'atomic'`: the whole caption in one packet, repeated `dtvccRepeat` times `dtvccRepeatGap` frames apart, no keep-alive; `dtvccAtomicDelete: true` = DeleteWindow + DefineWindow + text + ETX (23 characters at 29.97; the deleted-and-defined window is empty with the pen at 0,0), `false` = HideWindow + DefineWindow + SetPenLocation + HCR + text + ETX (19); `dtvccAtomicWindows: 2` = two rows in two windows (YouTube handled the second window badly, 17/30 both rows, so not used); longer captions become consecutive one-row parts through a queue (`dtvccAtomicHoldFrames`, default 45 = 1.5 s per part): only the part on screen is scheduled, the next starts when its hold ends, and a new caption replaces parts still waiting (at most two wait; `atomicDropped` counts replacements) — 6.13.4, after the first version compressed the backlog instead, which starved YouTube on fast speech (51 of 72 pieces). The budget is fixed: **the Web Presenter re-packs every CDP to 20 triplets per frame** (cc_count 24 and 25 came out as 20 plus a 2-byte fragment) and **a 31-triplet CDP wedges its caption reader**: every SEI then carries cc_count 0 until its stream is stopped and started (dropping the SDI does not clear it); `dtvccCcCount` is capped at 25 and should stay 0. `Cea708CdpBuilder.dtvccCapacity` now returns the odd payload (35 at 29.97) and the encoder no longer pads packets (the builder pads to whole triplets). Measured through the Web Presenter at this morning's ~50 % loss. Decoder model on the local capture: atomic 18 chars ×3 copies 20 apart 30/30, atomic 23 chars 28/30 appeared, two windows 29/30, pop-on ×3 20 apart 19/30. **On YouTube's caption track (broadcast 5Vo9TqrtpBg, 30 captions each): 3 copies 20 apart 22–23/30; 5 copies 12 apart 29/30; 5×10 27/30; 6×8 30/30 (caption up 1.3 s after sending); 6×4 29/30 with 0.28 s rms timing error (up 0.7 s after sending); 8×3 28/30**; every delivered caption complete, never a garbled or partial one, bottom-centre on the player (operator-confirmed screenshot). Each copy restarts YouTube's cue, so the caption appears with the last copy: copies × gap is the added delay. Preset "YouTube through a Web Presenter: one-frame captions" = atomic, delete+define, 6 copies 3 frames apart, parts held 45 frames — **the app default since 6.13.3** (encodingMode dtvcc, CEA-608 off, maxCharsPerLine 46); the continuous preset remains the choice for SDI decoders. The caption-ingestion POST remains the full-quality YouTube path (two 32-column rows, no delay); this preset is the embedded alternative when the Web Presenter must carry the captions: short pieces, about 11 characters per second sustained. Evidence: `Desktop\web-presenter-evidence\redraw-2026-10-13-atomic\` (schedules, YouTube cues, README with every run).
 
+20. **Control encoder, CEA-608 re-examined, and YouTube's 608 converter (2026-10-13 afternoon, 6.14.0).** The mandate was to prove or disprove "it's the box" with a second encoder on the same SDI, and to find a CEA-608 form YouTube renders. Both done.
+    - **Control encoder = OBS Studio 32.1.1 on this PC** (DeckLink input 7 = the loopback of device 8, Tools → Decklink Captions bound to it, x264 → `ffmpeg -listen` and, through an ffmpeg tee, to YouTube; scripts and findings in `tools/sdi-verify/obs/README.md`). The numbered CEA-608 pattern arrived **240/240 pairs with all 60 control codes** (OBS packs two pairs into one SEI when its clock slips; decoders accept that). The Web Presenter 4K 4.2.3 on the same SDI in the same hour: **153/240 (36 % lost)**, control pairs 26/60. libobs forwards only field-1 608 pairs (never 708) and repacks all pairs queued since the last video packet into one A/53 SEI, so OBS is a 608-only control; ffmpeg has no DeckLink input in any public Windows build and MSYS2 is not installed here, so it was not built. **Verdict: the SDI and the CDP are right; the loss is the Web Presenter's.** Its own timecode is continuous (pic_timing SEI on every frame, 1500/1500, only drop-frame skips), so it drops caption *data*, not frames.
+    - **YouTube's CEA-608 converter, measured on the lossless OBS path** (broadcast feBhl1Gg5J0; cues read with `yt-live-captions.mjs`, scored with `yt-score.mjs`, 20 captions 2.5 s apart per phase): the old roll-up (RU2 RU2 PAC PAC once, then RU2 RU2 CR CR text per row) reaches the track as **single characters** — each new row's cue holds only its last character — with doubled or single control codes (0/20, 1/16); **roll-up with a PAC on every row** (`rollup_pac`: RU2 RU2 CR CR PAC PAC text) rolls properly, **16/16**, with per-pair timing tags in the cue; **pop-on** (RCL ENM PAC(14) text PAC(15) text EOC, one pair per frame) **20/20 complete at the bottom with 0.04 s timing error**, doubled or single codes alike (YouTube re-flows the two rows into its own 32-column lines, treating the second PAC as a word break); one-frame pop-on (19 pairs in one CDP) ×3 copies 20/20 but 1.3 s jitter, ×6 copies 8/16 (every other caption dropped); paint-on 11/20 (karaoke-style cues, one per 5-second segment); OBS's own libcaption pop-on (SendStreamCaption, rows 1–2) 18/20, drawn at the **top** (`line:0%`). The player reads the same WebVTT track from the media manifest (caption format id 386; no `timedtext` requests), so the track is what viewers get.
+    - **Through the Web Presenter** every one-pair-per-frame 608 form is destroyed by the loss (old roll-up, PAC-per-row, pop-on: 0/20 complete, 99.8 % of frames garbled, scored with `cea608-display.mjs`), and the one-frame 608 layouts cannot help because **the box forwards only the first field-1 pair of each frame** (2, 4, 8 and 19 pairs per CDP sent: max 1 pair per SEI received, every time). The one-frame CEA-708 transport (6.13.4 default) in the same hour: **19/20 complete, 95 % of frames correct, 0 garbled, median delay 1 frame**. A **wedge** was seen once: a whole 5-minute stream with cc_count 0 on every frame (nothing forwarded) right after the operator's USB session with Blackmagic Streaming Setup 4.2.4 (the box stayed on 4.2.3); stopping and starting the box's stream cleared it; one-frame 608 CDPs while streaming or while idle, and an SDI drop while idle, did not reproduce it.
+    - **Defaults and knobs (6.14.0):** `cea608Style` is `rollup_pac` (was `rollup`); `cea608ControlRepeat` 2|1; `cea608OneFrame` + `cea608Copies` / `cea608CopyGap` / `cea608MaxPairs`; `cea608HoldFrames` (EDM after N idle frames); `cea608CcCount`; `cdpSvcInfoEvery` (ccsvcinfo only every Nth CDP). The Caption Injection screen has a CEA-608 **Style** select (PAC-per-row roll-up · pop-on · pop-on one frame ×3 / ×6 · old roll-up · paint-on) and an **OBS Studio captions** panel (`server/obs-captions.js`: obs-websocket `SendStreamCaption`, the path most captioned YouTube streams use; never both Decklink Captions and this in one OBS — libobs starves the text while DeckLink data is queued). Unit tests: 106 (`test/test-cea708.mjs`, with a CEA-608 decoder model in `tools/sdi-verify/captions/cea608-model.mjs`).
+    - **Box variables never varied before** (numbered 608 pattern, same afternoon, baseline 153/240): ccsvcinfo only in every 5th CDP 142/240; quality Streaming Medium 130/240, Streaming Low 142/240; SRT (`srt://` as the Custom URL, ffmpeg `srt://0.0.0.0:9710?mode=listener`) 123/240 — all the same loss within run-to-run variance. 720p59.94 could not be fed: the addon refuses display mode `hp59` on device 8 (standalone and NDI), while standalone 1080p29.97 starts. Not done: the DeckLink Studio 4K as the source (wiring unknown), the second unit (192.168.20.106 does not answer), firmware 4.2.4 (the operator installed the Setup software but the box still reports 4.2.3: the unit only updates over USB/Ethernet from the Setup utility).
+    - **Operator settings.** Web Presenter → YouTube: the caption-ingestion POST (full quality), else the one-frame CEA-708 preset. OBS as the encoder: DeckLink input + Decklink Captions with CEA-608 pop-on or PAC-per-row roll-up on the SDI, or the OBS captions panel. Any SDI decoder: CEA-608 PAC-per-row roll-up (default) or pop-on; the Web Presenter's own loss still applies downstream of it.
+
 ### Frame & buffer access pattern (Windows)
 
 ```cpp
@@ -547,15 +591,13 @@ Always release IDeckLinkVideoBuffer after the access scope and BEFORE handing th
 ## CEA-608/708 Encoding Details
 
 ### CEA-608 (cea608-encoder.js)
-- Configurable Roll-Up 2 or 3 mode via `setRollupRows()`
-- Row 15 PAC (0x14/0x60) — bottom of screen
-- Odd parity on all bytes (bit 7)
-- Control codes sent twice for error resilience
-- Mode+PAC sent once per caption (not per line) to reduce overhead
-- Line breaking at 32-char word boundaries
-- Deduplication: skips identical text within 2 seconds
-- Backlog protection: relay drops captions when queue > 120 pairs
-- ~60 chars/sec throughput at 29.97fps
+- Styles (`setStyle`, config `cea608Style`): `rollup_pac` (default since 6.14.0: RUx RUx CR CR PAC PAC text per row — the PAC on every row is what makes YouTube render roll-up), `rollup` (PAC once after start/clear, the 6.11–6.13 form; YouTube shows it as single characters), `popon` (RCL ENM PAC(14) text PAC(15) text EOC; rows 13–15 for 3 rows; longer captions become consecutive pop-ons), `painton` (RDC, then PAC + text + DER for every displayed row)
+- Roll-up 2, 3 or 4 rows via `setRollupRows()`; base row 15 (PAC 0x14/0x70), pop-on/paint-on rows via 0x14/0x40 (14), 0x14/0x60 (15), 0x13/0x60 (13)
+- Odd parity on all bytes (bit 7); control codes sent twice (`setControlRepeat(2)`, the CEA-608 rule) or once (libcaption sends most once)
+- `drainPairs()` returns the pairs of one frame: one (the line-21 rate) or, in one-frame mode (`setOneFrame({enabled, maxPairs, copies, copyGap})`), a whole caption packed into as few CDPs as the rate allows (19 pairs at 29.97) and repeated `copies` times — decoders and YouTube read every field-1 triplet of a frame in order, **but the Web Presenter forwards only the first**, so this is for clean paths only
+- `setHoldFrames(N)`: EDM after N idle frames (0 = never)
+- Line breaking at 32-char word boundaries; backlog protection: relay drops captions when queue > 120 pairs; ~60 chars/sec throughput at 29.97fps
+- `Cea708CdpBuilder.buildCDP(pairs, frameRate, ccCount)` carries extra pairs as further field-1 triplets after the field-2 null; `svcInfoEvery` puts the ccsvcinfo section only in every Nth CDP (flags 0x43 instead of 0x77 on the others)
 
 ### DTVCC (dtvcc-encoder.js)
 - Service 1 caption data with DefineWindow, SetCurrentWindow, text, CR, ETX
@@ -596,13 +638,13 @@ Only one application can use a DeckLink output port at a time. Stop any other ap
 Previously caused by the native addon using a single CDP buffer (`m_currentCDP`) that was re-attached to every frame. Fixed by switching to `std::queue<std::vector<uint8_t>> m_cdpQueue` in all three output handlers. If garbled text reappears, verify `npm run build:native` was run after the fix.
 
 ### Captions too slow / falling behind
-CEA-608 can only display ~60 chars/sec. Use Caption Processing settings to:
+CEA-608 can only display ~60 chars/sec. Use the Caption text row on the Caption Injection screen (or `POST /api/caption/config`) to:
 - Switch to **Truncate** strategy with lower max chars (32-48)
 - Switch to **Summarize** strategy (requires Gemini API key)
 - Switch to **DTVCC** encoding mode for ~200+ chars/sec (requires DTVCC-capable decoder)
 
 ### Summarize mode not working
-Requires a Gemini API key. Enter it in Context Engine → Settings → Gemini API Key, or in Output Settings → Caption Processing → Gemini API Key. The key is sent to the relay via `POST /api/polisher/apikey`. Without a key, summarize falls back to truncation.
+Requires a Gemini API key on the relay: `.env.local` (`GEMINI_API_KEY`) or Context Engine → Settings → Gemini API Key (sent to the relay via `POST /api/polisher/apikey`). Without a key, summarize falls back to truncation.
 
 ### PDF upload says "No entries found" / "Upload failed"
 - "pdfParse is not a function" in the relay log means someone reverted to the pdf-parse v1 call form. pdf-parse ≥2 exports a `PDFParse` class — always go through `extractPdfText()` in `server/context-sources.js`.
@@ -649,7 +691,7 @@ Fixed: the relay now feeds the learner from the WebSocket final-caption handler,
 - **Balanced (default)**: Web Speech API → Chrome/Edge stream microphone audio to Google's speech servers; Safari uses Apple's. Not local. Text then goes to the local relay, which sends each final line to Gemini for polish when a key is loaded and the polish toggle is on (both true by default with `.env.local`).
 - **Cloud**: audio streamed to Gemini Live. Two recognizers (Settings → Cloud → "Cloud Mode Recognizer", stored in `localStorage cc_cloud_model`):
   - `transcribe-live` → **`gemini-3.5-transcribe-live`** (default). Purpose-built transcription model; config is just `{ inputAudioTranscription: {} }`. Streams `serverContent.interimInputTranscription.text` (cumulative text of the current segment, ~2/s → shown as interim) and emits `serverContent.inputTranscription.text` as a finished segment ~1.7 s after the speaker pauses (followed by `generationComplete`). Each finished segment becomes one caption line. In testing it transcribed "Brookline", "Bernard Greene" and "Coolidge Corner" correctly where the legacy model produced "Brooke Line", "Bernard Green", "coolage corner".
-  - `native-audio` → `gemini-2.5-flash-native-audio-preview-12-2025` (legacy). Conversational model told to stay silent; `inputTranscription` arrives as word fragments that are buffered until `turnComplete`.
+  - `native-audio` → `gemini-3.8-live` (since 2026-10-13; was `gemini-2.5-flash-native-audio-preview-12-2025`, which is being retired and misheard "Brookline" as "Brickland"). Conversational model told to stay silent; `inputTranscription` arrives as a whole sentence ~1.2 s after the speaker stops but the caption is only finalized on `turnComplete` (~6 s), and it still speaks ~5 s of audio despite the instruction — a fallback, not the default. Audio must go up as `session.sendRealtimeInput({ audio })`: the deprecated `media` (media_chunks) field makes 3.8-live produce nothing and 3.1-flash-live close with 1007; transcribe-live accepts both.
   - Batch `gemini-3.5-transcribe` returns its text in `candidates[0].content.parts[0].audioTranscription.text` (not `response.text`) and has no timestamps, so Prerecorded still uses `gemini-2.5-flash` with a JSON schema.
 - **Local / Fully Local**: audio to the bundled speech server (or your own) over a WebSocket on this machine; nothing leaves the machine unless a Gemini key enables polish/translation/learning. Fully Local additionally routes the Context Engine and session analysis to Ollama.
 The landing page copy reflects this (it used to claim Web Speech kept audio on-device, which is wrong).

@@ -73,14 +73,17 @@ export function extractFrames(file) {
             const firstMb = (nal[1] & 0x80) !== 0;  // ue(v) == 0 → first slice of a picture
             if (!firstMb) continue;
             frameIdx++;
-            const f = { idx: frameIdx, idr: type === 5, f1: null, f2: null, dtvcc: [], ccCount: 0, raw: [] };
+            // f1 = the FIRST valid field-1 pair of the frame (the line-21 rate), f1all = every
+            // field-1 pair in order (the one-frame CEA-608 transport and libcaption/OBS put a
+            // whole caption's pairs into one SEI), f2 = the last field-2 pair
+            const f = { idx: frameIdx, idr: type === 5, f1: null, f1all: [], f2: null, dtvcc: [], ccCount: 0, raw: [] };
             for (const sei of pendingSei) {
-                f.ccCount = sei.ccCount;
+                f.ccCount += sei.ccCount;
                 for (const [h, a, b] of sei.trip) {
                     const valid = !!(h & 0x04), ct = h & 0x03;
                     f.raw.push([h, a, b]);
                     if (!valid) continue;
-                    if (ct === 0) f.f1 = [a, b];
+                    if (ct === 0) { if (!f.f1) f.f1 = [a, b]; f.f1all.push([a, b]); }
                     else if (ct === 1) f.f2 = [a, b];
                     else f.dtvcc.push(a, b);
                 }
@@ -105,23 +108,29 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
     const file = process.argv[2];
     const csvOut = process.argv.includes('--csv') ? process.argv[process.argv.indexOf('--csv') + 1] : null;
     const frames = extractFrames(file);
-    let nonNull = 0, ctrl = 0, dtvccFrames = 0;
+    let nonNull = 0, ctrl = 0, dtvccFrames = 0, multi = 0, maxPairs = 0;
     const lines = [];
     let text = '';
     for (const f of frames) {
-        if (!isNullPair(f.f1)) {
+        const live = f.f1all.filter(p => !isNullPair(p));
+        if (live.length) {
             nonNull++;
-            const a = strip(f.f1[0]);
-            if (a >= 0x10 && a <= 0x1F) ctrl++;
-            text += pairText(f.f1);
+            if (live.length > 1) multi++;
+            maxPairs = Math.max(maxPairs, live.length);
+            for (const p of live) {
+                const a = strip(p[0]);
+                if (a >= 0x10 && a <= 0x1F) ctrl++;
+                text += pairText(p);
+            }
         }
         if (f.dtvcc.length) dtvccFrames++;
-        if (csvOut || !isNullPair(f.f1) || f.dtvcc.length) {
-            lines.push(`${f.idx},${f.idr ? 'I' : 'P'},${f.ccCount},${f.f1 ? f.f1.map(b => b.toString(16).padStart(2, '0')).join('') : ''},${!isNullPair(f.f1) ? JSON.stringify(pairText(f.f1)) : ''},${f.dtvcc.map(b => b.toString(16).padStart(2, '0')).join('')}`);
+        if (csvOut || live.length || f.dtvcc.length) {
+            // f1hex/f1text = the first pair (the columns older scripts read); f1all = every pair of the frame
+            lines.push(`${f.idx},${f.idr ? 'I' : 'P'},${f.ccCount},${f.f1 ? f.f1.map(b => b.toString(16).padStart(2, '0')).join('') : ''},${!isNullPair(f.f1) ? JSON.stringify(pairText(f.f1)) : ''},${f.dtvcc.map(b => b.toString(16).padStart(2, '0')).join('')},${live.map(p => p.map(b => b.toString(16).padStart(2, '0')).join('')).join(' ')}`);
         }
     }
-    console.log(`${frames.length} frames; ${nonNull} with a non-null 608 field-1 pair (${ctrl} control codes); ${dtvccFrames} frames with DTVCC bytes`);
+    console.log(`${frames.length} frames; ${nonNull} with a non-null 608 field-1 pair (${ctrl} control codes; ${multi} frames carry more than one pair, max ${maxPairs}); ${dtvccFrames} frames with DTVCC bytes`);
     console.log('608 text:', JSON.stringify(text));
-    if (csvOut) writeFileSync(csvOut, 'frame,type,cc_count,f1hex,f1text,dtvcc\n' + lines.join('\n') + '\n');
+    if (csvOut) writeFileSync(csvOut, 'frame,type,cc_count,f1hex,f1text,dtvcc,f1all\n' + lines.join('\n') + '\n');
     else console.log(lines.join('\n'));
 }

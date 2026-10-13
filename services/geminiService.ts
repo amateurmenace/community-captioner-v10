@@ -1,7 +1,15 @@
 
-import { GoogleGenAI, Type } from "@google/genai";
+import { GoogleGenAI, Type, ThinkingLevel } from "@google/genai";
 import { DictionaryEntry, Caption } from "../types";
 import { languageName } from "../utils/languages";
+
+// Browser-side Gemini calls (measured 2026-10-13, see CLAUDE.md "Gemini models").
+// gemini-3.8-flash is the current stable Flash: it keeps JSON response schemas,
+// inline audio with timestamps and Google Search grounding working. Its default
+// thinking level roughly doubles latency, so the interactive paths cap it at LOW;
+// the one-off session analysis and file transcription keep the default for quality.
+const TEXT_MODEL = "gemini-3.8-flash";
+const LOW_THINKING = { thinkingLevel: ThinkingLevel.LOW };
 
 // Helper to get client with dynamic key
 const getClient = (apiKey?: string) => {
@@ -16,10 +24,12 @@ export const translateText = async (text: string, targetLang: string, apiKey?: s
   if (targetLang === 'en') return text;
   try {
     const ai = getClient(apiKey);
+    // Fallback used only when the relay is unreachable; same model as the relay's
+    // translation-service.js so the Dashboard reads the same quality (≈1.2 s).
     const response = await ai.models.generateContent({
-        model: "gemini-2.5-flash-lite",
+        model: TEXT_MODEL,
         contents: `Translate the following live caption to ${languageName(targetLang)}. Return ONLY the translated text, no quotes or explanation.\n\nText: "${text}"`,
-        config: { temperature: 0.1 },
+        config: { temperature: 0.1, thinkingConfig: LOW_THINKING },
     });
     return response.text?.trim() || text;
   } catch (e) { 
@@ -32,8 +42,12 @@ export const transcribeFile = async (base64Data: string, mimeType: string, apiKe
     const ai = getClient(apiKey);
     
     try {
+        // gemini-3.8-flash: a 12.6 s two-utterance test clip came back as two segments at
+        // 0 ms and 8500 ms (true start ≈ 8.3 s) with "Coolidge Corner" spelled right;
+        // 2.5-flash returned 819 / 8507 ms and "Koolage Corner". gemini-3.5-transcribe
+        // (batch) is more accurate still but returns no timestamps, so it is not used here.
         const response = await ai.models.generateContent({
-            model: "gemini-2.5-flash", // "-latest" alias was removed from the API (404)
+            model: TEXT_MODEL,
             contents: {
                 parts: [
                     { inlineData: { mimeType, data: base64Data } },
@@ -79,12 +93,13 @@ export const searchMunicipalitySources = async (municipality: string, apiKey?: s
 
         // Use Google Search grounding to find real URLs
         const response = await ai.models.generateContent({
-            model: "gemini-2.5-flash",
+            model: TEXT_MODEL,
             contents: `Find the official municipal website for "${municipality}" and list the most useful pages for learning proper nouns (elected officials, department staff, boards/commissions, meeting agendas/minutes).
 
 For each page found, provide the title, full URL, a category, and why it's useful for live captioning.`,
             config: {
                 tools: [{ googleSearch: {} }],
+                thinkingConfig: LOW_THINKING,
             },
         });
 
@@ -145,11 +160,12 @@ export const generateContextDictionary = async (text: string, apiKey?: string): 
   try {
     const ai = getClient(apiKey);
     const response = await ai.models.generateContent({
-      model: "gemini-3-flash-preview",
-      contents: `Analyze text for proper nouns/places/terminology/acronyms. 
+      model: TEXT_MODEL,
+      contents: `Analyze text for proper nouns/places/terminology/acronyms.
       Create a correction map: 'original' (likely phonetic error or raw acronym) -> 'replacement' (correct term).
       Input: ${text.substring(0, 30000)}`,
       config: {
+        thinkingConfig: LOW_THINKING,
         responseMimeType: "application/json",
         responseSchema: {
           type: Type.ARRAY,
@@ -178,7 +194,7 @@ export const generateSessionAnalysis = async (captions: Caption[], apiKey?: stri
     const fullTranscript = captions.map(c => c.text).join(' ');
     
     const response = await ai.models.generateContent({
-      model: "gemini-3-flash-preview",
+      model: TEXT_MODEL,
       contents: `Analyze the following transcript.
       1. Provide a concise summary (3-5 sentences) capturing the main topics and outcomes.
       2. Extract up to 10 highlights. MUST use direct quotes from the text.

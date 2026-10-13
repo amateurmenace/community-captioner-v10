@@ -139,6 +139,10 @@ export interface AppState {
   pastSessions: Session[];
   // User Config
   apiKey?: string;
+  /** Where the active Gemini key came from: typed by the operator (localStorage cc_api_key),
+   *  the relay's .env.local via GET /api/gemini/key (desktop app at localhost; never persisted
+   *  in the browser), or the build environment. Undefined when there is no key. */
+  apiKeySource?: 'stored' | 'server' | 'env';
   localServerUrl?: string; // Whisper
   localLlmUrl?: string; // Ollama (new)
   localLlmModel?: string; // Ollama model for the Context Engine (default: qwen3:4b)

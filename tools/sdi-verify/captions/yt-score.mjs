@@ -17,9 +17,11 @@ const toMs = opt('--to') ? Date.parse(`${today}T${opt('--to')}Z`) : Infinity;
 const sched = JSON.parse(readFileSync(schedFile, 'utf8'));
 const caps = Array.isArray(sched) ? sched : sched.captions;
 const columns = (Array.isArray(sched) ? 26 : sched.columns) || 26;
-const rows = (Array.isArray(sched) ? 2 : (sched.config && sched.config.dtvccStyle === 'atomic' ? (sched.config.dtvccAtomicWindows === 2 ? 2 : 1) : sched.rows)) || 2;
+// CEA-608 schedules (wp-608-test.mjs / yt-clean-608.mjs / obs-ws.mjs captions-test) carry `style`; 708 schedules take the window rows from the transport
+const rows = (Array.isArray(sched) ? 2 : (sched.style ? sched.rows : (sched.config && sched.config.dtvccStyle === 'atomic' ? (sched.config.dtvccAtomicWindows === 2 ? 2 : 1) : sched.rows))) || 2;
 const cues = JSON.parse(readFileSync(cuesFile, 'utf8')).cues.filter(x => x.start >= fromMs && x.start <= toMs).sort((a, b) => a.start - b.start);
-const norm = (t) => t.replace(/\s+/g, ' ').trim();
+// YouTube emits paint-on captions as karaoke-style cues with per-pair timestamps (<00:00:03.551><c>05</c>): strip the tags
+const norm = (t) => t.replace(/<[^>]*>/g, '').replace(/\s+/g, ' ').trim();
 
 let found = 0, complete = 0, totalVisible = 0;
 const diffs = [];
@@ -28,7 +30,8 @@ for (let k = 0; k < caps.length; k++) {
     const c = caps[k];
     const want = wrapRows(c.text, columns).slice(-rows);
     const wantText = norm(want.join(' '));
-    const matches = (x) => norm(x.text) === wantText || (want.length > 1 && (norm(x.text) === norm(want[0]) || norm(x.text) === norm(want[1])));
+    // a lone row counts only when it carries the caption's tag (first word): second rows repeat across runs
+    const matches = (x) => norm(x.text) === wantText || (want.length > 1 && norm(x.text) === norm(want[0]));
     const start = cues.findIndex((x, i) => i >= cursor && matches(x));
     if (start < 0) { console.log(`  ${String(k + 1).padStart(2)}  MISSING   ${JSON.stringify(want.join(' | '))}`); prevFirst = null; prevSend = null; continue; }
     // this caption's cues run until a cue that is not its text (the next caption or something else)

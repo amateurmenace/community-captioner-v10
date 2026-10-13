@@ -4,7 +4,6 @@ import { Caption, DictionaryEntry, OperationMode, SessionStats, Notification, Au
 import { useTranslation } from '../utils/i18n';
 import { diagLog, diagEntries, clearDiagLog, onDiagChange, diagText, relayLogDownloadUrl, DiagEntry } from '../utils/diagnostics';
 import { LANGUAGES } from '../utils/languages';
-import GlobalSettings from './GlobalSettings';
 
 interface DashboardProps {
   isRecording: boolean;
@@ -372,7 +371,6 @@ const Dashboard: React.FC<DashboardProps> = ({
   const [showCorrections, setShowCorrections] = useState(false);
   const [editingId, setEditingId] = useState<string | null>(null);
   const [previewStream, setPreviewStream] = useState<MediaStream | null>(null);
-  const [openSettingsTab, setOpenSettingsTab] = useState<'cloud' | 'local' | null>(null);
   
   // Relay Logic & Broadcast Channel
   const relayWsRef = useRef<WebSocket | null>(null);
@@ -663,14 +661,13 @@ const Dashboard: React.FC<DashboardProps> = ({
       }
   };
 
+  // Any mode can be chosen up front. Cloud mode checks for a Gemini key when Start is
+  // pressed (App.tsx startRecording): it keeps the mode, opens Help & Settings → Cloud and
+  // starts once the key is saved. The gate that used to live here refused the mode and
+  // opened a second GlobalSettings whose setAppState was a no-op, so a key saved there
+  // never reached App state until the page was reloaded.
   const handleModeSwitch = (newMode: OperationMode) => {
       if (isRecording) return;
-      const apiKey = localStorage.getItem('cc_api_key');
-      
-      if (newMode === 'cloud' && !apiKey) {
-          setOpenSettingsTab('cloud');
-          return;
-      }
       setMode(newMode);
   };
 
@@ -1211,7 +1208,6 @@ const Dashboard: React.FC<DashboardProps> = ({
       )}
       {showQrModal && <QrModal onClose={() => setShowQrModal(false)} />}
       {showLinkModal && <LinkModal onClose={() => setShowLinkModal(false)} />}
-      <GlobalSettings isOpen={!!openSettingsTab} onClose={() => setOpenSettingsTab(null)} initialTab={openSettingsTab === 'cloud' ? 'cloud' : 'local'} appState={{...stats, ...{apiKey: localStorage.getItem('cc_api_key'), localServerUrl: localStorage.getItem('cc_local_url')}} as any} setAppState={() => {}} />
     </div>
   );
 };

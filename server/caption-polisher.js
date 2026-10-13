@@ -113,6 +113,22 @@ export function localPolish(text) {
 let geminiApiKey = process.env.GEMINI_API_KEY || null;
 let geminiEnabled = true;  // Can be toggled via API
 
+// Polish and summarize sit in the live caption path (500 ms / 800 ms budgets), so
+// the model is chosen for latency. Measured 2026-10-13 from the studio PC (3 samples
+// each, median): gemini-2.5-flash-lite 307 ms polish / 345 ms summarize;
+// gemini-2.5-flash with thinking off 477 / 441; gemini-3.1-flash-lite 850 / 666;
+// gemini-3.5-flash-lite 896 / 1029; gemini-3.5-flash (minimal thinking) 941;
+// gemini-3.8-flash ≥1.6 s even with thinking off. Only 2.5-flash-lite fits the
+// budgets. Thinking is pinned off: on 2.5-flash the default thinking spent the
+// whole maxOutputTokens budget (finish=MAX_TOKENS → truncated captions) and took
+// 1.7 s, so the old polish call either timed out or returned a cut-off line.
+const POLISH_MODEL = process.env.GEMINI_POLISH_MODEL || 'gemini-2.5-flash-lite';
+// 2.5 models take thinkingBudget 0; 3.x lite models never think and reject it; other
+// 3.x models take thinkingLevel (LOW is accepted by all of them, MINIMAL is not).
+const POLISH_THINKING = /gemini-2\.5/.test(POLISH_MODEL) ? { thinkingBudget: 0 }
+    : /flash-lite/.test(POLISH_MODEL) ? null
+    : { thinkingLevel: 'LOW' };
+
 const POLISH_PROMPT = `Fix grammar, punctuation, and capitalization only. Do not change the meaning, add words, or remove words. Preserve the speaker's natural phrasing. Return ONLY the corrected text with no explanation or quotes.`;
 
 /**
@@ -133,9 +149,9 @@ async function geminiPolish(text) {
         // Race against 500ms timeout for real-time captioning
         const result = await Promise.race([
             ai.models.generateContent({
-                model: 'gemini-2.5-flash',
+                model: POLISH_MODEL,
                 contents: `${POLISH_PROMPT}\n\nText: ${text}`,
-                config: { maxOutputTokens: 256, temperature: 0.1 }
+                config: { maxOutputTokens: 256, temperature: 0.1, ...(POLISH_THINKING ? { thinkingConfig: POLISH_THINKING } : {}) }
             }),
             new Promise((_, reject) => setTimeout(() => reject(new Error('timeout')), 500))
         ]);
@@ -178,9 +194,9 @@ async function geminiSummarize(text, maxChars) {
 
         const result = await Promise.race([
             ai.models.generateContent({
-                model: 'gemini-2.5-flash',
+                model: POLISH_MODEL,
                 contents: `Condense this speech excerpt to under ${maxChars} characters. Keep the key meaning and important words. Do not add interpretation. Return ONLY the condensed text.\n\nText: ${text}`,
-                config: { maxOutputTokens: 128, temperature: 0.1 }
+                config: { maxOutputTokens: 128, temperature: 0.1, ...(POLISH_THINKING ? { thinkingConfig: POLISH_THINKING } : {}) }
             }),
             new Promise((_, reject) => setTimeout(() => reject(new Error('timeout')), 800))
         ]);

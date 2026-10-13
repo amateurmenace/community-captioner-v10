@@ -64,22 +64,46 @@ export class Cea708CdpBuilder {
     constructor() {
         this.sequence = 0;
         this.dtvccSequence = 0; // 2-bit rolling counter for DTVCC packet headers
+        this.svcInfoEvery = 0;  // 0 = ccsvcinfo section in every CDP; N = only every Nth frame (experiment)
+    }
+
+    /** Whether this CDP carries the ccsvcinfo section (every frame unless svcInfoEvery > 1). */
+    _withSvcInfo() {
+        return !(this.svcInfoEvery > 1) || (this.sequence % this.svcInfoEvery) === 0;
+    }
+
+    /** CEA-608 pairs one frame can carry in one-frame mode: every triplet but the field-2 slot. */
+    cea608Capacity(frameRate = '29.97', ccCount = 0) {
+        return Math.max(1, Math.min(31, ccCount || FULL_CC_COUNT_BY_RATE[frameRate] || 20) - 1);
     }
 
     /**
-     * Build a complete CDP packet.
+     * Build a complete CDP packet carrying CEA-608 field-1 data.
      *
-     * @param {number} cc1 - First CEA-608 byte (with parity)
-     * @param {number} cc2 - Second CEA-608 byte (with parity)
-     * @param {string} [frameRate='29.97'] - Frame rate string
+     * Two call forms:
+     *   buildCDP(cc1, cc2, frameRate)            — one pair (the line-21 rate)
+     *   buildCDP(pairs, frameRate, ccCount)      — pairs = [{cc1, cc2}, …]: the first pair in the
+     *     field-1 triplet, the field-2 triplet null, and the remaining pairs as further field-1
+     *     triplets in place of the DTVCC padding (the one-frame CEA-608 transport; decoders that
+     *     read every cc_data triplet — YouTube, ffmpeg, libcaption — take them in order).
+     *   `ccCount` overrides the triplet count for the rate (20 at 29.97, up to 31).
+     *
      * @returns {Uint8Array} The complete CDP packet
      */
-    buildCDP(cc1, cc2, frameRate = '29.97') {
+    buildCDP(cc1, cc2, frameRate = '29.97', ccCountArg = 0) {
+        let pairs;
+        if (Array.isArray(cc1)) {
+            pairs = cc1.length ? cc1 : [{ cc1: 0x80, cc2: 0x80 }];
+            ccCountArg = typeof frameRate === 'number' ? frameRate : 0;
+            frameRate = typeof cc2 === 'string' ? cc2 : '29.97';
+        } else {
+            pairs = [{ cc1, cc2 }];
+        }
         const frCode = FRAME_RATE_CODES[frameRate] || 0x04;
         // Standard cc_count for the frame rate (20 at 29.97): a short count is legal on paper, but
         // decoders that assume the standard layout (the Web Presenter → YouTube path did) read
         // past the data into the footer and show its sequence counter as text.
-        const ccCount = FULL_CC_COUNT_BY_RATE[frameRate] || 20;
+        const ccCount = Math.max(3, Math.min(31, ccCountArg || FULL_CC_COUNT_BY_RATE[frameRate] || 20));
         const totalTriplets = ccCount;
 
         // CDP layout matches the Blackmagic SDK reference encoder:
@@ -98,7 +122,8 @@ export class Cea708CdpBuilder {
         //   --- cdp_footer_section ---
         //   4 (0x74 + seq + CRC)
         const ccDataSectionLen = 2 + totalTriplets * 3;
-        const svcInfoSectionLen = 9;
+        const withSvc = this._withSvcInfo();
+        const svcInfoSectionLen = withSvc ? 9 : 0;
         const footerLen = 4;
         const cdpLength = 7 /* header */ + ccDataSectionLen + svcInfoSectionLen + footerLen;
 
@@ -112,7 +137,7 @@ export class Cea708CdpBuilder {
         cdp[pos++] = (frCode << 4) | 0x0F;               // cdp_frame_rate + reserved nibble
         // flags: ccdata_present | svcinfo_present | svc_info_start | svc_info_complete | caption_service_active | reserved
         //       (0x40)         | (0x20)          | (0x10)         | (0x04)            | (0x02)                | (0x01)
-        cdp[pos++] = 0x40 | 0x20 | 0x10 | 0x04 | 0x02 | 0x01;  // = 0x77
+        cdp[pos++] = withSvc ? (0x40 | 0x20 | 0x10 | 0x04 | 0x02 | 0x01) : (0x40 | 0x02 | 0x01);  // = 0x77, or 0x43 without the ccsvcinfo section
         const seq = this.sequence & 0xFFFF;
         cdp[pos++] = (seq >> 8) & 0xFF;
         cdp[pos++] = seq & 0xFF;
@@ -123,21 +148,30 @@ export class Cea708CdpBuilder {
 
         // Triplet 1: Field 1 CEA-608 (the actual caption byte pair)
         cdp[pos++] = 0xFC;                               // cc_valid=1, cc_type=0 (field 1 NTSC)
-        cdp[pos++] = cc1;
-        cdp[pos++] = cc2;
+        cdp[pos++] = pairs[0].cc1;
+        cdp[pos++] = pairs[0].cc2;
 
         // Triplet 2: Field 2 null
         cdp[pos++] = 0xFD;                               // cc_valid=1, cc_type=1 (field 2 NTSC)
         cdp[pos++] = 0x80;
         cdp[pos++] = 0x80;
 
-        // Remaining DTVCC null triplets (cc_valid=0)
+        // Remaining triplets: further field-1 pairs (one-frame mode), then DTVCC null triplets (cc_valid=0)
+        let extra = 1;
         for (let i = 2; i < totalTriplets; i++) {
+            if (extra < pairs.length) {
+                cdp[pos++] = 0xFC;
+                cdp[pos++] = pairs[extra].cc1;
+                cdp[pos++] = pairs[extra].cc2;
+                extra++;
+                continue;
+            }
             cdp[pos++] = (0x1F << 3) | 0x02;             // marker | cc_type 708 data, cc_valid=0
             cdp[pos++] = 0x00;
             cdp[pos++] = 0x00;
         }
 
+        if (withSvc) {
         // --- ccsvcinfo_section (CEA-708 §4.5, ATSC A/65 Table 6.26) ---
         // Advertises one service: Primary Caption Service, English, digital_cc, 16:9.
         // Without this block, common CC-aware decoders treat the CDP as "no caption services" and ignore it.
@@ -150,6 +184,7 @@ export class Cea708CdpBuilder {
         cdp[pos++] = 0x7E;                               // digital_cc=0 (this is a line-21 CEA-608 service), reserved bits 1, line21_field=0 (field 1)
         cdp[pos++] = 0x7F;                               // !easy_reader, 16:9 aspect, reserved
         cdp[pos++] = 0xFF;                               // reserved
+        }
 
         // --- footer ---
         cdp[pos++] = 0x74;                               // cdp_footer_id
@@ -236,7 +271,8 @@ export class Cea708CdpBuilder {
         }
 
         const ccDataSectionLen = 2 + totalTriplets * 3;
-        const svcInfoSectionLen = 9;
+        const withSvc = this._withSvcInfo();
+        const svcInfoSectionLen = withSvc ? 9 : 0;
         const footerLen = 4;
         const cdpLength = 7 + ccDataSectionLen + svcInfoSectionLen + footerLen;
 
@@ -248,7 +284,7 @@ export class Cea708CdpBuilder {
         cdp[pos++] = 0x69;
         cdp[pos++] = cdpLength;
         cdp[pos++] = (frCode << 4) | 0x0F;
-        cdp[pos++] = 0x40 | 0x20 | 0x10 | 0x04 | 0x02 | 0x01; // = 0x77, same flags as buildCDP
+        cdp[pos++] = withSvc ? (0x40 | 0x20 | 0x10 | 0x04 | 0x02 | 0x01) : (0x40 | 0x02 | 0x01); // = 0x77, same flags as buildCDP (0x43 without ccsvcinfo)
         const seq = this.sequence & 0xFFFF;
         cdp[pos++] = (seq >> 8) & 0xFF;
         cdp[pos++] = seq & 0xFF;
@@ -297,6 +333,7 @@ export class Cea708CdpBuilder {
             }
         }
 
+        if (withSvc) {
         // --- ccsvcinfo_section (advertises Service 1 / English / digital_cc) ---
         cdp[pos++] = 0x73;
         cdp[pos++] = 0x80 | (1 << 6) | (1 << 4) | 1; // 0xD1
@@ -307,6 +344,7 @@ export class Cea708CdpBuilder {
         cdp[pos++] = 0x80 | 1; // digital_cc | service_number=1
         cdp[pos++] = 0x7F;
         cdp[pos++] = 0xFF;
+        }
 
         // --- footer ---
         cdp[pos++] = 0x74;

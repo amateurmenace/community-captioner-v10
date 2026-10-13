@@ -107,6 +107,93 @@ while (enc.queueLength > 0) nonAsciiPairs.push(enc.drainPair());
 assert(nonAsciiPairs.length === 6 && (nonAsciiPairs[5].cc2 & 0x7F) === 0x3F, `Non-ASCII "café" → "ca" "f?" with ? substitution (got ${nonAsciiPairs.length} pairs)`);
 
 // ─────────────────────────────────────────────
+// CEA-608 styles: pop-on, paint-on, PAC per row, single control codes, one-frame, hold
+// ─────────────────────────────────────────────
+console.log('\n═══ CEA-608 Styles ═══');
+{
+    const { Cea608Decoder, pairsFromCdp } = await import('../tools/sdi-verify/captions/cea608-model.mjs');
+    const hex = (p) => [p.cc1 & 0x7F, p.cc2 & 0x7F].map(x => x.toString(16).padStart(2, '0')).join('');
+    const drainAll = (e) => { const out = []; while (e.queuedFrames > 0) out.push(e.drainPairs()); return out; };
+
+    // Pop-on: RCL ENM PAC(14) row PAC(15) row EOC, every control code twice, one pair per frame
+    const p = new Cea608Encoder({ style: 'popon' });
+    p.enqueueText('Pop-on captions load into the hidden memory and flip');
+    const pf = drainAll(p);
+    const seq = pf.map(f => hex(f[0]));
+    assert(pf.every(f => f.length === 1), 'One pair per frame by default');
+    assert(seq.slice(0, 6).join(' ') === '1420 1420 142e 142e 1440 1440', `Pop-on starts RCL RCL ENM ENM PAC14 PAC14 (got ${seq.slice(0, 6).join(' ')})`);
+    assert(seq.slice(-2).join(' ') === '142f 142f', 'Pop-on ends with EOC EOC');
+    const pac15 = seq.indexOf('1460');
+    assert(pac15 > 6 && seq[pac15 + 1] === '1460', 'Second row addressed with PAC row 15, twice');
+    // decode with the model: nothing visible until EOC, then both rows on rows 14/15
+    const d = new Cea608Decoder();
+    const b = new Cea708CdpBuilder();
+    const shownAt = [];
+    pf.forEach((f, i) => { d.feedFrame(pairsFromCdp(b.buildCDP(f, '29.97'))); if (d.shown()) shownAt.push(i); });
+    assert(shownAt[0] === pf.length - 2 && d.display()[13] === 'Pop-on captions load into the' && d.display()[14] === 'hidden memory and flip', `Nothing shown until the first EOC, then rows 14/15 (shown from frame ${shownAt[0]} of ${pf.length}: ${JSON.stringify(d.display().slice(13))})`);
+    p.enqueueText('Next');
+    drainAll(p).forEach(f => d.feedFrame(pairsFromCdp(b.buildCDP(f, '29.97'))));
+    assert(d.shown() === 'Next' && d.display()[14] === 'Next', `The next pop-on caption replaces the first (got ${JSON.stringify(d.shown())})`);
+
+    // Single control codes (libcaption style)
+    const p1 = new Cea608Encoder({ style: 'popon', controlRepeat: 1 });
+    p1.enqueueText('Hi');
+    const s1 = drainAll(p1).map(f => hex(f[0]));
+    assert(s1.join(' ') === '1420 142e 1460 4869 142f', `controlRepeat 1: RCL ENM PAC15 "Hi" EOC once each (got ${s1.join(' ')})`);
+
+    // One-frame mode: the whole caption in one frame, copies gap frames apart; the CDP carries every pair
+    const of = new Cea608Encoder({ style: 'popon', controlRepeat: 1 });
+    of.setOneFrame({ enabled: true, maxPairs: 19, copies: 3, copyGap: 4 });
+    of.enqueueText('One frame caption here');          // RCL ENM PAC + 11 pairs + EOC = 15 pairs
+    const frames = drainAll(of);
+    const data = frames.map((f, i) => (f.length > 1 || hex(f[0]) !== '0000') ? i : -1).filter(i => i >= 0);
+    assert(frames[0].length === 15 && data.join() === '0,5,10', `One-frame: 15 pairs in one frame, 3 copies 4 frames apart (frames ${data.join()}, ${frames[0].length} pairs)`);
+    const cdp = b.buildCDP(frames[0], '29.97');
+    assert(cdp.length === 82 && pairsFromCdp(cdp).length === 15 && cdp[9] === 0xFC && cdp[12] === 0xFD && cdp[15] === 0xFC, `CDP carries 15 field-1 pairs after the field-2 null (${pairsFromCdp(cdp).length} pairs, ${cdp.length} bytes)`);
+    const d2 = new Cea608Decoder();
+    frames.forEach((f, i) => d2.feedFrame(i === 0 ? null : pairsFromCdp(b.buildCDP(f, '29.97'))));   // first copy lost
+    assert(d2.shown() === 'One frame caption here' && d2.events.filter(e => e.kind === 'eoc').length === 2, `A lost first copy: the second copy displays the caption whole (got ${JSON.stringify(d2.shown())})`);
+    const big = new Cea608Encoder({ style: 'popon', controlRepeat: 1 });
+    big.setOneFrame({ enabled: true, maxPairs: 19, copies: 1 });
+    big.enqueueText('A caption longer than one frame can carry at nineteen pairs');
+    const bf = drainAll(big);
+    assert(bf.length === 2 && bf[0].length === 19 && hex(bf[1][bf[1].length - 1]) === '142f', `Longer captions spill into a second frame with the EOC last (${bf.map(f => f.length).join('+')} pairs)`);
+
+    // Paint-on: RDC, then every displayed row rewritten in place with PAC + text + DER
+    const pa = new Cea608Encoder({ style: 'painton' });
+    pa.enqueueText('Paint on');
+    const ps = drainAll(pa).map(f => hex(f[0]));
+    assert(ps.slice(0, 2).join(' ') === '1429 1429' && ps.slice(2, 6).join(' ') === '1440 1440 1424 1424' && ps.slice(6, 8).join(' ') === '1460 1460' && ps.slice(-2).join(' ') === '1424 1424', `Paint-on: RDC, row 14 PAC + DER (blank row), row 15 PAC + text + DER (got ${ps.join(' ')})`);
+    const d3 = new Cea608Decoder();
+    drainAll(new Cea608Encoder({ style: 'painton' }), 0);
+    const pa2 = new Cea608Encoder({ style: 'painton' }); pa2.enqueueText('Paint on');
+    drainAll(pa2).forEach(f => d3.feedFrame(pairsFromCdp(b.buildCDP(f, '29.97'))));
+    assert(d3.display()[14] === 'Paint on' && d3.mode === 'painton', `Paint-on text lands on row 15 directly (got ${JSON.stringify(d3.display()[14])})`);
+
+    // Roll-up with PAC per row
+    const rp = new Cea608Encoder({ style: 'rollup_pac' });
+    rp.enqueueText('Row');
+    const rs = drainAll(rp).map(f => hex(f[0]));
+    assert(rs.join(' ') === '1425 1425 142d 142d 1470 1470 526f 7700', `rollup_pac: RU2 RU2 CR CR PAC PAC "Row" (got ${rs.join(' ')})`);
+    rp.enqueueText('Two');
+    assert(drainAll(rp).map(f => hex(f[0])).slice(4, 6).join(' ') === '1470 1470', 'rollup_pac repeats the PAC with every row');
+
+    // Hold: EDM after N idle frames, then nothing
+    const h = new Cea608Encoder({ style: 'popon', holdFrames: 10 });
+    h.enqueueText('Hold');
+    const hs = []; for (let i = 0; i < 40; i++) hs.push(hex(h.drainPairs()[0]));
+    const edm = hs.indexOf('142c');
+    assert(edm === 19 && hs[20] === '142c' && hs.slice(21).every(x => x === '0000'), `EDM EDM ${edm - 9} frames after the caption's last pair, then idle (EDM at ${edm})`);
+    const d4 = new Cea608Decoder();
+    const h2 = new Cea608Encoder({ style: 'popon', holdFrames: 10 }); h2.enqueueText('Hold');
+    for (let i = 0; i < 40; i++) d4.feedFrame(pairsFromCdp(b.buildCDP(h2.drainPairs(), '29.97')));
+    assert(d4.shown() === '' && d4.events.some(e => e.kind === 'edm'), 'The hold erases the display');
+
+    // The transport summary used by /api/inject/status
+    assert(of.transport.style === 'popon' && of.transport.oneFrame === true && of.transport.copies === 3, 'transport getter reports style / oneFrame / copies');
+}
+
+// ─────────────────────────────────────────────
 // CEA-708 DTVCC encoder
 // ─────────────────────────────────────────────
 console.log('\n═══ CEA-708 DTVCC Encoder ═══');

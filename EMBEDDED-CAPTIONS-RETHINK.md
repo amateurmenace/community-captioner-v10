@@ -23,6 +23,18 @@
 > when 50-character sentences came every 3 s). It ships as the "YouTube through a Web Presenter" preset, a documented
 > fallback; the POST path stays the full-quality answer.
 
+> **Re-examination, afternoon of 13 Oct (6.14.0) — the control-encoder session.** OBS Studio on the same
+> SDI (DeckLink input 7 = loopback of device 8, Decklink Captions, x264) forwarded the numbered CEA-608
+> pattern 240/240 while the Web Presenter 4K lost 36 % of it in the same hour: the SDI and the CDP are
+> right, the loss is the box's (its own timecode is continuous on every frame). YouTube's 608 converter,
+> measured on that lossless path, renders roll-up only when every row carries its PAC (the old PAC-once
+> form comes out as single characters), and pop-on 20 of 20 at the bottom; so the app now defaults to
+> PAC-per-row roll-up, offers pop-on, and sends captions to OBS over obs-websocket for operators who
+> encode with OBS. Through the Web Presenter every one-pair-per-frame 608 form is destroyed (0/20), the
+> box forwards only one 608 pair per frame, and the one-frame CEA-708 transport remains the embedded
+> answer (19/20). Details: CLAUDE.md addon note 20, `tools/sdi-verify/captions/README.md`,
+> `tools/sdi-verify/obs/README.md`.
+
 **Mandate for the new session:** decide, with evidence, whether embedded CEA-608/708 captions from
 Community Captioner can be made broadcast-reliable on the path *DeckLink SDI → Blackmagic Web
 Presenter 4K → YouTube* (and on SDI in general), and either make it so or state plainly that it is

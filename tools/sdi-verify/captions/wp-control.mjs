@@ -2,7 +2,7 @@
 // receiver for caption captures, and put it back, through its REST API.
 //
 //   node wp-control.mjs <host> status
-//   node wp-control.mjs <host> capture-on  <rtmp://pc-ip:1935/live> [key]   # saves the current platform to wp-saved-<host>.json
+//   node wp-control.mjs <host> capture-on  <rtmp://pc-ip:1935/live> [key] [quality]   # saves the current platform to wp-saved-<host>.json; quality = Streaming High (default) | Streaming Medium | Streaming Low
 //   node wp-control.mjs <host> capture-off                                  # restores the saved platform (stream key included)
 //   node wp-control.mjs <host> start | stop
 //
@@ -32,13 +32,14 @@ if (cmd === 'status') {
     console.log(JSON.stringify({ product: prod, stream: s, activePlatform: redact(p) }, null, 1));
 } else if (cmd === 'capture-on') {
     const url = rest[0]; const key = rest[1] || 'test';
+    const quality = rest[2] || process.env.WP_QUALITY || 'Streaming High';   // Streaming High | Streaming Medium | Streaming Low | …
     if (!url) throw new Error('rtmp url required');
     const current = await get('livestreams/0/activePlatform');
     if (current.platform !== 'Custom URL H.264') { writeFileSync(saved, JSON.stringify(current)); console.log(`saved current platform → ${saved}: ${JSON.stringify(redact(current))}`); }
     // the platform cannot be changed while the stream runs (HTTP 400): stop it first
     try { await put('livestreams/0/stop', {}); await new Promise(r => setTimeout(r, 3000)); } catch {}
     // the built-in "Custom URL H.264" platform takes the destination directly (server "Custom" + url)
-    await put('livestreams/0/activePlatform', { platform: 'Custom URL H.264', server: 'Custom', url, key, quality: 'Streaming High' });
+    await put('livestreams/0/activePlatform', { platform: 'Custom URL H.264', server: 'Custom', url, key, quality });
     await put('livestreams/0/start', {});
     await new Promise(r => setTimeout(r, 5000));
     console.log(`streaming to ${url}/${key}; status:`, JSON.stringify(await get('livestreams/0')));

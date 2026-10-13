@@ -265,3 +265,14 @@ Publish by replacing the 6.4.0 Windows asset on `v10.1` with the 6.10.6 zip, upd
 ## Report back
 
 Zip size and SHA256, CPU/GPU, browser(s) tested, Whisper backend, prerecorded speed, and which of these worked: browser-speech pill, spoken-language setting, mic-blocked banner, device fallback, Diagnostics, session log persistence, relay log file and endpoints, scrolling, translation tags, auto-start, stale-server replace, YouTube path, Ollama download panel. Plus every line of the brief that was wrong.
+
+# v6.14.0 update (2026-10-13)
+
+Built and verified on the Windows rig in the control-encoder session (CLAUDE.md addon note 20). Nothing changed in the
+addon; the exe was built with the in-tree `decklink_addon.node`. Verification that was run on the packaged exe
+(`Desktop\CommunityCaptioner-6.14.0`, `PORT=8091` → it fell back to 8092 because a leftover dev relay held 8091):
+`/api/app/info` 6.14.0 + desktopApp true, `/api/context/capabilities` pdf/docx/upload/geminiKey true with model
+gemini-3.8-flash, `/api/inject/status` addonLoaded + ndiAvailable, `/api/gemini/key` ok from 127.0.0.1 and 403 from the
+LAN address, `/api/obs/status`, `/api/caption/config` cea608Style rollup_pac, a TXT upload extracted with Gemini, and
+`node tools/e2e/cloud-e2e.mjs http://localhost:8092 speech.wav` (fresh Chrome profile, fake microphone): Gemini Live
+connected in 2 s on gemini-3.5-transcribe-live, the spoken sentence on the Dashboard in 6 s, no key typed.

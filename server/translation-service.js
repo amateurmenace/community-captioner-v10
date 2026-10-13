@@ -6,6 +6,19 @@
 
 let geminiApiKey = null;
 
+// Quality path: the audience reads nothing but this text. gemini-3.8-flash with
+// thinkingLevel LOW measured 1.1–2.2 s per caption from the studio PC (es/zh/ht all
+// sane), inside the 4 s audience budget and the 10 s Dashboard budget; languages are
+// translated in parallel and each caption is cached per language. Thinking must be
+// capped: at the default level the model spent ~240 thought tokens against the
+// 256-token output cap and returned truncated translations (finish=MAX_TOKENS).
+// The faster models (2.5-flash-lite 0.4 s, 3.5-flash-lite 1.0 s) are a fallback via
+// GEMINI_TRANSLATE_MODEL when latency matters more than quality.
+const TRANSLATE_MODEL = process.env.GEMINI_TRANSLATE_MODEL || 'gemini-3.8-flash';
+const TRANSLATE_THINKING = /gemini-2\.5/.test(TRANSLATE_MODEL) ? { thinkingBudget: 0 }
+    : /flash-lite/.test(TRANSLATE_MODEL) ? undefined   // lite models do not think; thinkingBudget is rejected by 3.5-flash-lite
+    : { thinkingLevel: 'LOW' };
+
 // LRU Cache: key = "lang:text", value = {translated, ts}
 const cache = new Map();
 const CACHE_MAX = 500;
@@ -151,11 +164,14 @@ async function doTranslate(text, targetLang, langName, cacheKey, timeoutMs = 400
         // 3 s late is still useful; one in English is not), 10 s for the Dashboard.
         const response = await Promise.race([
             ai.models.generateContent({
-                model: 'gemini-2.5-flash',
+                model: TRANSLATE_MODEL,
                 contents: `Translate the following live caption text to ${langName}. Return ONLY the translated text, nothing else. Do not add quotes or explanations.\n\n${text}`,
                 config: {
-                    maxOutputTokens: 256,
+                    // 512 (was 256): LOW thinking occasionally spends ~120 tokens, and CJK/Arabic
+                    // renderings of a two-row caption run longer than the English.
+                    maxOutputTokens: 512,
                     temperature: 0.1,
+                    ...(TRANSLATE_THINKING ? { thinkingConfig: TRANSLATE_THINKING } : {}),
                 },
             }),
             new Promise((_, reject) => setTimeout(() => reject(new Error('timeout')), timeoutMs))

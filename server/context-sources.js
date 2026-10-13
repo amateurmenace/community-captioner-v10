@@ -31,7 +31,31 @@ import * as pdfParseModule from 'pdf-parse';
 import * as pdfjsWorker from 'pdfjs-dist/legacy/build/pdf.worker.mjs';
 if (!globalThis.pdfjsWorker) globalThis.pdfjsWorker = pdfjsWorker;
 
-export const GEMINI_TEXT_MODEL = process.env.GEMINI_MODEL || 'gemini-2.5-flash';
+// Text-quality paths: document extraction (context-learner.js extractDictionary),
+// urlContext page reads and the wizard's official-site search. gemini-3.8-flash
+// with thinkingLevel LOW, measured 2026-10-13 from the studio PC: sample agenda
+// 7.4 s (16/16 expected names, misheard variants filled in), brooklinema.gov via
+// urlContext 13.6 s / 43 items (45 s at the default thinking level — right at the
+// timeout), site search 9.7 s with 7 grounding chunks. gemini-3.5-flash-lite does
+// the same in 5.4 s / 5.8 s with fewer items; 2.5-flash took 16.6 s. Thinking is
+// capped at LOW because the default level doubles or triples latency with no
+// measured gain in recall (lite models never think and reject thinkingBudget).
+export const GEMINI_TEXT_MODEL = process.env.GEMINI_MODEL || 'gemini-3.8-flash';
+export const GEMINI_TEXT_THINKING = /gemini-2\.5|flash-lite/.test(GEMINI_TEXT_MODEL) ? null : { thinkingLevel: 'LOW' };
+export function textModelConfig(config = {}) {
+    return GEMINI_TEXT_THINKING ? { ...config, thinkingConfig: GEMINI_TEXT_THINKING } : config;
+}
+
+// Wizard research runs in two steps on Gemini 3. The Gemini 3 models (3.5-flash and
+// 3.8-flash, at every thinking level, even with a prompt saying it MUST search and
+// for a 1,200-person town) answer the old "return a JSON array of current officials"
+// prompt from memory and never call Google Search (groundingMetadata empty), while
+// 2.5-flash ran 21 queries for the same prompt. Asked for plain prose with sources,
+// 3.8-flash does search (12 queries, 37 grounding chunks, 29 s for Brookline's
+// people group), so step 1 researches in prose and step 2 turns the notes into the
+// JSON items on a fast non-thinking model (6.4 s, 49 items); 35.5 s in all,
+// against 24.5 s / 34 items for the old single call on 2.5-flash.
+export const GEMINI_FORMAT_MODEL = process.env.GEMINI_FORMAT_MODEL || 'gemini-3.5-flash-lite';
 
 const BROWSER_HEADERS = {
     'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Safari/605.1.15',
@@ -404,7 +428,7 @@ List the most useful pages on that official site for learning the names used in 
 - boards and commissions index
 - meeting agendas & minutes portal (CivicClerk, Legistar, Granicus, etc.)
 For each page give: title, full URL, category. Prefer pages on the official .gov/.us/.org domain. Output a short markdown list with full URLs.`,
-            config: { tools: [{ googleSearch: {} }], temperature: 0.1 },
+            config: textModelConfig({ tools: [{ googleSearch: {} }], temperature: 0.1 }),
         }), 40000, 'Google Search');
     } catch (e) {
         return { ok: false, error: e.message, sources: [] };
@@ -415,10 +439,11 @@ For each page give: title, full URL, category. Prefer pages on the official .gov
     const chunks = meta.groundingChunks || [];
     const queries = meta.webSearchQueries || [];
 
-    // Candidate URLs: from the model's text (real URLs) + grounding chunks (redirects)
+    // Candidate URLs: from the model's text (real URLs) + grounding chunks (redirects).
+    // Gemini 3 writes URLs inside markdown code spans, so a backtick ends a URL too.
     const candidates = new Map(); // normalized url → {title?, fromText}
-    for (const u of (text.match(/https?:\/\/[^\s)<>"'\]]+/g) || [])) {
-        const clean = u.replace(/[.,;:!?)*]+$/, '');
+    for (const u of (text.match(/https?:\/\/[^\s)<>"'\]`]+/g) || [])) {
+        const clean = u.replace(/[.,;:!?)*`]+$/, '');
         const norm = normalizeUrl(clean);
         if (!candidates.has(norm)) candidates.set(norm, { fromText: true });
     }
@@ -561,22 +586,41 @@ export async function researchMunicipality(query, apiKey, { onGroup = () => {}, 
 
     const results = await Promise.all(selected.map(async (group) => {
         const started = Date.now();
-        const prompt = `You are building a live-captioning correction dictionary for public meetings of the municipality "${query}"${domainHint ? ` (focus: ${domainHint})` : ''}.
-Use Google Search to find CURRENT, factual information. Research: ${group.ask}.
-
-Return ONLY a JSON array. Each element: {"name": "<exact proper spelling>", "category": "<one of: ${group.categories.join(', ')}>", "detail": "<role, expansion or one-line context>", "misheard": ["<1-3 ways a speech-to-text engine might mis-transcribe this name, lowercase>"]}.
+        // Step 1 — grounded research in prose (Gemini 3 only calls Google Search when the
+        // answer is free text; see the GEMINI_FORMAT_MODEL note above).
+        const researchPrompt = `You are researching the municipality "${query}"${domainHint ? ` (focus: ${domainHint})` : ''} for a live-captioning correction dictionary used in its public meetings.
+Search the web (the official municipal and school pages, meeting agendas, recent local news) and report, as a plain list with the source page for each item: ${group.ask}.
 Rules:
 - Only include real items you found evidence for. Never invent names.
 - Use the exact official spelling and capitalization (e.g. "Bernard W. Greene", "Zoning Board of Appeals", "Coolidge Corner").
+- For people give full names and their role.
+- Aim for 25-60 items. Do not output JSON.`;
+        let meta = {};
+        try {
+            const notes = await withTimeout(ai.models.generateContent({
+                model: GEMINI_TEXT_MODEL,
+                contents: researchPrompt,
+                config: textModelConfig({ tools: [{ googleSearch: {} }], temperature: 0.1 }),
+            }), 60000, `${group.label} research`);
+            meta = notes?.candidates?.[0]?.groundingMetadata || {};
+            const notesText = (notes?.text || '').trim();
+            if (!notesText) throw new Error('empty research result');
+
+            // Step 2 — notes → dictionary items (no tools, JSON mode, fast model)
+            const formatPrompt = `Convert these research notes about "${query}" into a JSON array for a live-captioning correction dictionary.
+Each element: {"name": "<exact proper spelling>", "category": "<one of: ${group.categories.join(', ')}>", "detail": "<role, expansion or one-line context>", "misheard": ["<1-3 ways a speech-to-text engine might mis-transcribe this name, lowercase>"]}.
+Rules:
+- One element per person, body, place or term in the notes; never add names that are not in the notes.
 - For people give full names; put titles in "detail", not in "name".
 - "misheard" should contain plausible phonetic errors (e.g. "Pham" → "fam", "Greene" → "green", "Buono" → "bono"); leave it empty when the name is spelled the way it sounds.
-- Aim for 25-60 entries for this group.`;
-        try {
+
+Notes:
+${notesText.slice(0, 40000)}`;
             const response = await withTimeout(ai.models.generateContent({
-                model: GEMINI_TEXT_MODEL,
-                contents: prompt,
-                config: { tools: [{ googleSearch: {} }], temperature: 0.1 },
-            }), 75000, `${group.label} research`);
+                model: GEMINI_FORMAT_MODEL,
+                contents: formatPrompt,
+                config: { temperature: 0.1, responseMimeType: 'application/json', maxOutputTokens: 8192 },
+            }), 30000, `${group.label} formatting`);
             const arr = parseJsonArray(response?.text) || [];
             const items = arr
                 .filter(it => it && typeof it.name === 'string' && it.name.trim().length >= 2)
@@ -587,8 +631,7 @@ Rules:
                     misheard: Array.isArray(it.misheard) ? it.misheard.filter(m => typeof m === 'string').map(m => m.trim().toLowerCase()).filter(Boolean).slice(0, 3) : [],
                     group: group.key,
                 }));
-            const meta = response?.candidates?.[0]?.groundingMetadata || {};
-            const out = { key: group.key, label: group.label, ok: true, items, elapsedMs: Date.now() - started, queries: meta.webSearchQueries || [] };
+            const out = { key: group.key, label: group.label, ok: true, items, elapsedMs: Date.now() - started, queries: meta.webSearchQueries || [], grounded: (meta.groundingChunks || []).length > 0 };
             onGroup(group.key, out);
             return out;
         } catch (e) {
@@ -616,7 +659,7 @@ export async function extractDictionaryFromUrl(url, apiKey, { timeoutMs = 45000 
 Extract every proper noun that matters for live-caption accuracy: people's full names (with roles), board/committee/department names, place names, streets, schools, organizations, and acronyms (with expansions).
 Return ONLY a JSON array of {"name": "<exact spelling>", "category": "<elected_official|staff|board_or_committee|department|organization|place|school|acronym|term>", "detail": "<role or expansion>", "misheard": ["<plausible speech-to-text errors, lowercase>"]}.
 Only include items that actually appear on the page. If the page could not be read, return [].`,
-            config: { tools: [{ urlContext: {} }], temperature: 0.1 },
+            config: textModelConfig({ tools: [{ urlContext: {} }], temperature: 0.1 }),
         }), timeoutMs, 'Gemini page read');
         const status = response?.candidates?.[0]?.urlContextMetadata?.urlMetadata?.[0]?.urlRetrievalStatus || '';
         const arr = parseJsonArray(response?.text) || [];

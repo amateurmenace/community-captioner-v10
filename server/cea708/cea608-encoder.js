@@ -1,32 +1,54 @@
 /**
- * CEA-608 Roll-Up Encoder
+ * CEA-608 Encoder (roll-up, pop-on and paint-on)
  *
  * Converts caption text into CEA-608 byte pairs for closed captioning.
- * Outputs one {cc1, cc2} pair per video frame. Characters are queued
- * and drained at frame rate (~60 chars/sec at 29.97fps, 1 pair per frame).
+ * The encoder is drained once per video frame: `drainPairs()` returns the
+ * pairs that go into that frame's CDP — normally ONE pair (the line-21 rate,
+ * ~60 chars/sec at 29.97 fps), or several in "one-frame" mode (below).
  *
- * Each caption is wrapped into rows of at most 32 columns (the CEA-608 row
- * width — anything longer piles up in column 32 on real decoders) and every
- * row is sent as
+ * Styles (setStyle):
  *
- *   RUx RUx  CR CR  <text pairs>
+ *   rollup      (default) every row of a caption goes out as
+ *                   RUx RUx [PAC PAC once after start/clear] CR CR <text>
+ *               i.e. roll-up command and carriage return precede the text,
+ *               so the previous row scrolls up and the newest row lands on
+ *               the base row (row 15).
+ *   rollup_pac  the same, but the base-row PAC is sent with every row
+ *               (RUx CR PAC <text>) — a decoder that lost the first PAC still
+ *               positions the text.
+ *   popon       the way broadcast encoders and libcaption (OBS) send captions:
+ *                   RCL ENM PAC(row) <text> [PAC(row) <text>] EOC
+ *               The text is loaded into the non-displayed memory and EOC
+ *               flips it on screen in one go; the rows sit on rows 14/15
+ *               (13–15 for three rows). A caption longer than the row count
+ *               becomes consecutive pop-on captions.
+ *   painton     RDC PAC(row) <text> DER … — text appears as it is typed,
+ *               every row is rewritten in place and deleted to its end.
  *
- * i.e. the roll-up command and a carriage return precede the text, so the
- * previous row scrolls up and the newest row is always on the base row.
- * The first row after (re)start also carries the PAC that sets the base
- * row (row 15). Control codes are transmitted twice, as CEA-608 requires.
+ * Control codes are transmitted twice (setControlRepeat(2), the CEA-608
+ * error-resilience rule) unless set to 1 (libcaption sends most codes once).
  *
- * Control codes per CEA-608 spec:
- *   RU2  (0x14, 0x25) — Roll-Up 2 rows     RU3 (0x14, 0x26) — 3 rows
- *   PAC  (0x14, 0x70) — Position cursor at row 15 (bottom)
- *   CR   (0x14, 0x2D) — Carriage Return (rolls text up)
- *   EDM  (0x14, 0x2C) — Erase Displayed Memory
+ * One-frame mode (setOneFrame): the whole caption's pairs are packed into as
+ * few frames as the CDP allows (19 pairs at 29.97 with the standard 20
+ * triplets: field 1, field 2, then the rest as extra field-1 triplets), and
+ * the frames are repeated `copies` times `copyGap` frames apart. A lossy
+ * encoder then either forwards a caption whole or not at all; the next copy
+ * repairs it. With pop-on the EOC is always in the last frame, so a lost
+ * frame can only delay a caption, never show a partial one for long.
  *
- * Pacing: some downstream encoders cannot keep up with a pair on every frame
- * (the Blackmagic Web Presenter 4K keeps only a fraction of them). `paceFrames`
- * spreads the stream out — one pair every N frames with null pairs in
- * between. `repeat` emits each pair on N consecutive frames (diagnostic:
- * a decoder that does not de-duplicate prints every character twice).
+ * Hold (setHoldFrames): after N frames without a new caption the display is
+ * erased with EDM (0 = never, the default; broadcast practice is a few
+ * seconds).
+ *
+ * Pacing (setPacing) for the one-pair-per-frame modes: `paceFrames` spreads
+ * the stream out (one pair every N frames); `repeat` emits each pair on N
+ * consecutive frames (diagnostic).
+ *
+ * Control codes per CEA-608 (channel 1, before parity):
+ *   RU2 14 25 · RU3 14 26 · RU4 14 27 · CR 14 2D · EDM 14 2C · ENM 14 2E
+ *   RCL 14 20 · EOC 14 2F · RDC 14 29 · DER 14 24
+ *   PAC row 13 = 13 60, row 14 = 14 40, row 15 = 14 60 (white, no indent);
+ *   the roll-up base-row PAC is 14 70 (row 15, indent 0, white).
  */
 
 export const CEA608_COLUMNS = 32;
@@ -45,16 +67,31 @@ function addParity(byte) {
 }
 
 // Control code constants (before parity)
-const CTRL = {
+export const CTRL = {
     RU2:  [0x14, 0x25],  // Roll-Up 2 rows
     RU3:  [0x14, 0x26],  // Roll-Up 3 rows
     RU4:  [0x14, 0x27],  // Roll-Up 4 rows
-    PAC:  [0x14, 0x70],  // Preamble Address Code — Row 15, white, indent 0
+    PAC:  [0x14, 0x70],  // Preamble Address Code — Row 15, white, indent 0 (roll-up base row)
     CR:   [0x14, 0x2D],  // Carriage Return
     EDM:  [0x14, 0x2C],  // Erase Displayed Memory
+    ENM:  [0x14, 0x2E],  // Erase Non-displayed Memory
+    RCL:  [0x14, 0x20],  // Resume Caption Loading (pop-on)
+    EOC:  [0x14, 0x2F],  // End Of Caption (flip memories)
+    RDC:  [0x14, 0x29],  // Resume Direct Captioning (paint-on)
+    DER:  [0x14, 0x24],  // Delete to End of Row
+};
+
+// PAC (white, no indent, no underline) for screen rows 11–15, channel 1
+const ROW_PAC = {
+    11: [0x10, 0x40],
+    12: [0x13, 0x40],
+    13: [0x13, 0x60],
+    14: [0x14, 0x40],
+    15: [0x14, 0x60],
 };
 
 const NULL_PAIR = Object.freeze({ cc1: 0x80, cc2: 0x80 });
+export const STYLES = ['rollup', 'rollup_pac', 'popon', 'painton'];
 
 /**
  * Wrap text into rows of at most `columns` characters, breaking at spaces
@@ -80,19 +117,48 @@ export function wrapRows(text, columns = CEA608_COLUMNS) {
     return rows;
 }
 
+/** Printable ASCII pairs for a row of text ('?' for anything else; odd length ends with a null byte). */
+export function textPairs(text) {
+    const chars = [];
+    for (let i = 0; i < text.length; i++) {
+        const code = text.charCodeAt(i);
+        chars.push(code >= 0x20 && code <= 0x7E ? code : 0x3F);
+    }
+    const pairs = [];
+    for (let i = 0; i < chars.length; i += 2) {
+        const cc1 = addParity(chars[i]);
+        const cc2 = (i + 1 < chars.length) ? addParity(chars[i + 1]) : 0x80;
+        pairs.push({ cc1, cc2 });
+    }
+    return pairs;
+}
+
 export class Cea608Encoder {
     constructor(options = {}) {
-        /** @type {Array<{cc1: number, cc2: number}>} */
-        this.pairQueue = [];
+        /** @type {Array<Array<{cc1:number,cc2:number}>|null>} queue of frames: the pairs of one frame, null = idle frame */
+        this.frames = [];
         this.initialized = false;
         this.rollupRows = 2;
+        this.style = 'rollup';
+        this.controlRepeat = 2;
         this.paceFrames = 1;     // emit one pair every N frames
         this.repeat = 1;         // emit each pair on N consecutive frames (diagnostic)
+        this.oneFrame = false;   // pack whole captions into frames (see class comment)
+        this.maxPairsPerFrame = 19;
+        this.copies = 1;         // one-frame mode: copies of every caption
+        this.copyGap = 3;        // idle frames between copies
+        this.holdFrames = 0;     // erase the display after N idle frames (0 = never)
         this._frameCounter = 0;
         this._repeatLeft = 0;
-        this._lastPair = NULL_PAIR;
+        this._lastFrame = [NULL_PAIR];
+        this._displayed = false; // something is on screen (for the hold/EDM logic)
+        this._idleFrames = 0;    // frames drained with nothing to send since the last caption data
         this.setRollupRows(options.rollupRows ?? 2);
         this.setPacing(options.paceFrames ?? 1, options.repeat ?? 1);
+        if (options.style) this.setStyle(options.style);
+        if (options.controlRepeat) this.setControlRepeat(options.controlRepeat);
+        if (options.oneFrame !== undefined) this.setOneFrame(options);
+        if (options.holdFrames !== undefined) this.setHoldFrames(options.holdFrames);
     }
 
     /** 2, 3 or 4 displayed rows. Takes effect from the next caption. */
@@ -104,111 +170,175 @@ export class Cea608Encoder {
         }
     }
 
+    /** 'rollup' | 'rollup_pac' | 'popon' | 'painton' */
+    setStyle(style) {
+        const s = STYLES.includes(style) ? style : 'rollup';
+        if (s !== this.style) { this.style = s; this.initialized = false; }
+    }
+
+    /** Transmit every control code once (1) or twice (2, the CEA-608 rule). */
+    setControlRepeat(n) {
+        this.controlRepeat = n === 1 ? 1 : 2;
+    }
+
     /** One pair every `paceFrames` frames, each pair on `repeat` consecutive frames. */
     setPacing(paceFrames = 1, repeat = 1) {
         this.paceFrames = Math.max(1, Math.min(8, Math.round(paceFrames) || 1));
         this.repeat = Math.max(1, Math.min(4, Math.round(repeat) || 1));
     }
 
+    /**
+     * One-frame mode: {enabled, maxPairs (pairs per frame the CDP can carry,
+     * Cea708CdpBuilder.cea608Capacity), copies (1–8), copyGap (0–60 frames)}.
+     */
+    setOneFrame(opts = {}) {
+        if (opts.enabled !== undefined) this.oneFrame = !!opts.enabled;
+        else if (opts.oneFrame !== undefined) this.oneFrame = !!opts.oneFrame;
+        if (opts.maxPairs !== undefined) this.maxPairsPerFrame = Math.max(1, Math.min(31, Math.round(opts.maxPairs) || 19));
+        if (opts.copies !== undefined) this.copies = Math.max(1, Math.min(8, Math.round(opts.copies) || 1));
+        if (opts.copyGap !== undefined) this.copyGap = Math.max(0, Math.min(60, Math.round(opts.copyGap) || 0));
+    }
+
+    /** Erase the display (EDM) after `frames` frames without a new caption; 0 = never. */
+    setHoldFrames(frames) {
+        this.holdFrames = Math.max(0, Math.min(3000, Math.round(frames) || 0));
+    }
+
+    get transport() {
+        return { style: this.style, controlRepeat: this.controlRepeat, oneFrame: this.oneFrame, maxPairsPerFrame: this.maxPairsPerFrame,
+                 copies: this.copies, copyGap: this.copyGap, holdFrames: this.holdFrames, paceFrames: this.paceFrames, repeat: this.repeat, rows: this.rollupRows };
+    }
+
     _rollupCode() {
         return this.rollupRows === 4 ? CTRL.RU4 : this.rollupRows === 3 ? CTRL.RU3 : CTRL.RU2;
     }
 
-    /**
-     * Enqueue a control code pair with parity bits applied (twice, per the
-     * CEA-608 error-resilience rule).
-     */
-    _enqueueControl(ctrl) {
+    /** A control code with parity, repeated per setControlRepeat. */
+    _control(ctrl) {
         const pair = { cc1: addParity(ctrl[0]), cc2: addParity(ctrl[1]) };
-        this.pairQueue.push(pair, { ...pair });
+        const out = [pair];
+        if (this.controlRepeat === 2) out.push({ ...pair });
+        return out;
     }
 
-    /**
-     * Start of a row: roll-up mode (+ base-row PAC once after start/clear),
-     * then a carriage return so the previous row scrolls up.
-     */
-    _enqueueRowStart() {
-        this._enqueueControl(this._rollupCode());
-        if (!this.initialized) {
-            this.initialized = true;
-            this._enqueueControl(CTRL.PAC);
-        }
-        this._enqueueControl(CTRL.CR);
-    }
-
-    /**
-     * Enqueue printable ASCII text as character pairs.
-     * Characters are paired two at a time. Odd-length text gets
-     * the last char paired with a null (0x80).
-     */
-    _enqueueChars(text) {
-        // Filter to printable ASCII only (0x20-0x7E)
-        const chars = [];
-        for (let i = 0; i < text.length; i++) {
-            const code = text.charCodeAt(i);
-            if (code >= 0x20 && code <= 0x7E) {
-                chars.push(code);
-            } else {
-                chars.push(0x3F); // '?' for non-ASCII
+    /** The pairs of one caption (rows already wrapped), by style. */
+    _captionPairs(rows) {
+        const out = [];
+        if (this.style === 'popon') {
+            out.push(...this._control(CTRL.RCL), ...this._control(CTRL.ENM));
+            const base = 15 - (rows.length - 1);
+            rows.forEach((row, i) => { out.push(...this._control(ROW_PAC[base + i] || ROW_PAC[15]), ...textPairs(row)); });
+            out.push(...this._control(CTRL.EOC));
+        } else if (this.style === 'painton') {
+            out.push(...this._control(CTRL.RDC));
+            // every displayed row is rewritten: PAC, text, delete to end of row (blank rows just PAC + DER)
+            const n = this.rollupRows;
+            const base = 15 - (n - 1);
+            for (let i = 0; i < n; i++) {
+                const row = rows[i - (n - rows.length)] || '';    // bottom-aligned
+                out.push(...this._control(ROW_PAC[base + i] || ROW_PAC[15]));
+                if (row) out.push(...textPairs(row));
+                if (row.length < CEA608_COLUMNS) out.push(...this._control(CTRL.DER));
+            }
+        } else {
+            for (const row of rows) {
+                out.push(...this._control(this._rollupCode()));
+                if (this.style === 'rollup_pac') {
+                    out.push(...this._control(CTRL.CR), ...this._control(CTRL.PAC));
+                } else {
+                    if (!this.initialized) { this.initialized = true; out.push(...this._control(CTRL.PAC)); }
+                    out.push(...this._control(CTRL.CR));
+                }
+                out.push(...textPairs(row));
             }
         }
+        return out;
+    }
 
-        // Pair characters two at a time
-        for (let i = 0; i < chars.length; i += 2) {
-            const cc1 = addParity(chars[i]);
-            const cc2 = (i + 1 < chars.length) ? addParity(chars[i + 1]) : 0x80;
-            this.pairQueue.push({ cc1, cc2 });
+    /** Queue the pairs of one caption as frames (one pair per frame, or packed with copies in one-frame mode). */
+    _queue(pairs) {
+        if (!pairs.length) return;
+        if (!this.oneFrame) {
+            for (const p of pairs) this.frames.push([p]);
+            return;
+        }
+        const chunks = [];
+        for (let i = 0; i < pairs.length; i += this.maxPairsPerFrame) chunks.push(pairs.slice(i, i + this.maxPairsPerFrame));
+        for (let c = 0; c < this.copies; c++) {
+            if (c > 0) for (let g = 0; g < this.copyGap; g++) this.frames.push(null);
+            for (const chunk of chunks) this.frames.push(chunk.map(p => ({ ...p })));
         }
     }
 
     /**
-     * Enqueue one caption. The text is wrapped into 32-column rows and each
-     * row goes out as RUx RUx CR CR <text>. The second argument is accepted
-     * for compatibility; interim (non-final) text is encoded the same way,
-     * so callers should only pass final captions.
+     * Enqueue one caption. The text is wrapped into 32-column rows and sent in
+     * the current style. The second argument is accepted for compatibility;
+     * interim (non-final) text is encoded the same way, so callers should
+     * only pass final captions.
      *
      * @param {string} text - The caption text
      * @param {boolean} [isFinal=true]
      */
     enqueueText(text, isFinal = true) { // eslint-disable-line no-unused-vars
-        for (const row of wrapRows(text)) {
-            this._enqueueRowStart();
-            this._enqueueChars(row);
+        const rows = wrapRows(text);
+        if (!rows.length) return;
+        if (this.style === 'popon' || this.style === 'painton') {
+            // a caption longer than the display becomes consecutive captions
+            const n = this.rollupRows;
+            for (let i = 0; i < rows.length; i += n) this._queue(this._captionPairs(rows.slice(i, i + n)));
+        } else {
+            this._queue(this._captionPairs(rows));
         }
+        this._displayed = true;
+        this._idleFrames = 0;
     }
 
     /**
      * Enqueue an Erase Displayed Memory command to clear the screen.
-     * The next caption re-sends the base-row PAC.
+     * The next roll-up caption re-sends the base-row PAC.
      */
     enqueueClear() {
-        this._enqueueControl(CTRL.EDM);
+        this._queue(this._control(CTRL.EDM));
         this.initialized = false;
+        this._displayed = false;
     }
 
     /**
-     * Drain the next CC byte pair for one video frame, honouring pacing.
-     * Returns null padding {0x80, 0x80} when nothing is due this frame.
+     * Drain the pairs for one video frame, honouring pacing. Returns an array
+     * with one null pair {0x80, 0x80} when nothing is due this frame.
+     * Call once per video frame (e.g., 29.97 times/sec).
      *
-     * Call this once per video frame (e.g., 29.97 times/sec).
-     *
+     * @returns {Array<{cc1: number, cc2: number}>}
+     */
+    drainPairs() {
+        if (this._repeatLeft > 0) {
+            this._repeatLeft--;
+            return this._lastFrame;
+        }
+        this._frameCounter++;
+        if (!this.oneFrame && this._frameCounter % this.paceFrames !== 0) return [NULL_PAIR];
+        if (this.frames.length === 0 && this.holdFrames > 0 && this._displayed) {
+            // nothing queued: erase the display once the hold time has passed
+            if (++this._idleFrames >= this.holdFrames) this.enqueueClear();
+        }
+        if (this.frames.length > 0) {
+            const frame = this.frames.shift();
+            if (!frame) return [NULL_PAIR];           // deliberate idle frame between copies
+            this._lastFrame = frame;
+            this._repeatLeft = this.oneFrame ? 0 : this.repeat - 1;
+            this._idleFrames = 0;
+            return frame;
+        }
+        // Null padding — no caption data this frame
+        return [NULL_PAIR];
+    }
+
+    /**
+     * Drain the next CC byte pair for one video frame (one-pair-per-frame modes).
      * @returns {{cc1: number, cc2: number}}
      */
     drainPair() {
-        if (this._repeatLeft > 0) {
-            this._repeatLeft--;
-            return this._lastPair;
-        }
-        this._frameCounter++;
-        if (this._frameCounter % this.paceFrames !== 0) return NULL_PAIR;
-        if (this.pairQueue.length > 0) {
-            const pair = this.pairQueue.shift();
-            this._lastPair = pair;
-            this._repeatLeft = this.repeat - 1;
-            return pair;
-        }
-        // Null padding — no caption data this frame
-        return NULL_PAIR;
+        return this.drainPairs()[0];
     }
 
     /**
@@ -216,17 +346,24 @@ export class Cea608Encoder {
      * @returns {number}
      */
     get queueLength() {
-        return this.pairQueue.length;
+        let n = 0;
+        for (const f of this.frames) if (f) n += f.length;
+        return n;
     }
 
+    /** Frames currently queued (pairs and idle gaps). */
+    get queuedFrames() { return this.frames.length; }
+
     /**
-     * Reset encoder state (pacing settings are kept).
+     * Reset encoder state (style, pacing and transport settings are kept).
      */
     reset() {
-        this.pairQueue = [];
+        this.frames = [];
         this.initialized = false;
         this._frameCounter = 0;
         this._repeatLeft = 0;
-        this._lastPair = NULL_PAIR;
+        this._lastFrame = [NULL_PAIR];
+        this._displayed = false;
+        this._idleFrames = 0;
     }
 }

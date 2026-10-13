@@ -131,6 +131,96 @@ const YouTubeCaptionIngestPanel: React.FC = () => {
     );
 };
 
+// OBS caption output: every final caption is sent to OBS Studio over obs-websocket
+// (SendStreamCaption); OBS embeds it as a CEA-608 pop-on caption in its own stream, the
+// path most captioned YouTube streams use — and it bypasses the SDI encoder entirely.
+const ObsCaptionPanel: React.FC = () => {
+    const getRelayUrl = () => {
+        const port = window.location.port || '80';
+        const relayPort = (parseInt(port) >= 5170 && parseInt(port) <= 5199) ? '8080' : port;
+        return `${window.location.protocol}//${window.location.hostname}:${relayPort}`;
+    };
+    type ObsStatus = { enabled: boolean; url: string; passwordSet: boolean; connected: boolean; identified: boolean; streaming: boolean | null; obsVersion: string | null; sent: number; refused: number; lastSentMs: number; lastError: string | null };
+    const [url, setUrl] = useState('ws://127.0.0.1:4455');
+    const [password, setPassword] = useState('');
+    const [status, setStatus] = useState<ObsStatus | null>(null);
+    const [saving, setSaving] = useState(false);
+    const [loaded, setLoaded] = useState(false);
+
+    useEffect(() => {
+        const load = async () => {
+            try {
+                const r = await fetch(`${getRelayUrl()}/api/obs/status`);
+                if (r.ok) {
+                    const j = await r.json();
+                    setStatus(j);
+                    if (!loaded) { if (j.url) setUrl(j.url); setLoaded(true); }
+                }
+            } catch {}
+        };
+        load();
+        const t = setInterval(load, 3000);
+        return () => clearInterval(t);
+    }, [loaded]);
+
+    const apply = async (enabled: boolean) => {
+        setSaving(true);
+        try {
+            const body: Record<string, unknown> = { enabled, url: url.trim() };
+            if (password) body.password = password;
+            const r = await fetch(`${getRelayUrl()}/api/obs/config`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+            const j = await r.json();
+            if (j.ok) { setStatus(j); setPassword(''); }
+        } finally { setSaving(false); }
+    };
+
+    const active = !!status?.enabled;
+    const secondsSinceLast = status?.lastSentMs ? Math.round((Date.now() - status.lastSentMs) / 1000) : null;
+    const state = !active ? null
+        : !status?.connected ? 'connecting to OBS…'
+        : !status?.identified ? 'OBS refused the password'
+        : status?.streaming === false ? 'connected · OBS is not streaming'
+        : `connected${status?.obsVersion ? ' · OBS ' + status.obsVersion.split(' / ')[0] : ''}`;
+
+    return (
+        <div className="bg-white border border-stone-200 rounded-2xl p-4">
+            <div className="flex items-center gap-2 mb-2">
+                <p className="text-[10px] font-bold text-stone-400 uppercase tracking-wider">OBS Studio captions (obs-websocket)</p>
+                {active && (
+                    <span className={`ml-auto text-[10px] font-bold px-2 py-0.5 rounded-full ${status?.identified ? 'bg-green-100 text-green-700' : 'bg-amber-100 text-amber-700'}`}>
+                        {status?.identified ? `Active · ${status.sent} sent` : 'Enabled'}
+                    </span>
+                )}
+            </div>
+            <p className="text-[11px] text-stone-500 mb-3 leading-relaxed">
+                If OBS is your encoder, enable its WebSocket server (OBS → Tools → WebSocket Server Settings, set a password) and the
+                captioner sends every final caption to OBS, which embeds it as a CEA-608 pop-on caption in its stream — the path most
+                captioned YouTube streams use (YouTube draws these at the top of the picture). It never touches the Web Presenter. If OBS
+                takes this SDI feed through a DeckLink input instead, use OBS → Tools → Decklink Captions with that input and leave this
+                off: OBS prefers DeckLink captions and starves these while any arrive.
+            </p>
+            <div className="flex flex-wrap gap-2">
+                <input type="text" value={url} onChange={(e) => setUrl(e.target.value)} placeholder="ws://127.0.0.1:4455"
+                    className="flex-1 min-w-[180px] px-3 py-2 rounded-lg text-[11px] bg-stone-50 border border-stone-200 font-mono outline-none focus:border-sage-400" />
+                <input type="password" value={password} onChange={(e) => setPassword(e.target.value)} placeholder={status?.passwordSet ? 'password (saved)' : 'password'}
+                    className="w-36 px-3 py-2 rounded-lg text-[11px] bg-stone-50 border border-stone-200 font-mono outline-none focus:border-sage-400" />
+                {!active ? (
+                    <button onClick={() => apply(true)} disabled={saving || !url.trim()} className="px-3 py-2 bg-sage-600 text-white text-xs font-bold rounded-lg disabled:bg-stone-300 hover:bg-sage-700">
+                        {saving ? 'Connecting…' : 'Enable'}
+                    </button>
+                ) : (
+                    <>
+                        <button onClick={() => apply(true)} disabled={saving} className="px-3 py-2 bg-sage-600 text-white text-xs font-bold rounded-lg disabled:bg-stone-300 hover:bg-sage-700">Apply</button>
+                        <button onClick={() => apply(false)} disabled={saving} className="px-3 py-2 bg-stone-100 text-stone-600 text-xs font-bold rounded-lg hover:bg-stone-200">Disable</button>
+                    </>
+                )}
+            </div>
+            {state && <p className="text-[10px] text-stone-500 mt-2">{state}{secondsSinceLast !== null && status?.identified ? ` · last caption ${secondsSinceLast}s ago` : ''}{status?.refused ? ` · ${status.refused} refused` : ''}</p>}
+            {status?.lastError && active && <p className="text-[10px] text-red-600 mt-1">{status.lastError}</p>}
+        </div>
+    );
+};
+
 const CaptionInjection: React.FC<CaptionInjectionProps> = ({ onBack, apiKey }) => {
     const getRelayUrl = () => {
         const port = window.location.port || '80';
@@ -189,9 +279,43 @@ const CaptionInjection: React.FC<CaptionInjectionProps> = ({ onBack, apiKey }) =
         if (typeof cfg.dtvccStyle === 'string') setDtvccStyle(cfg.dtvccStyle);
         postCaptionConfig(cfg);
     };
+    // CEA-608 styles (see cea608-encoder.js); the preset shown is derived from the live config
+    const [cea608Style, setCea608Style] = useState('rollup_pac');
+    const [cea608OneFrame, setCea608OneFrame] = useState(false);
+    const [cea608Copies, setCea608Copies] = useState(1);
+    const CEA608_PRESETS: Record<string, Record<string, unknown>> = {
+        rollup_pac:  { cea608Style: 'rollup_pac', cea608ControlRepeat: 2, cea608OneFrame: false },
+        popon:       { cea608Style: 'popon', cea608ControlRepeat: 2, cea608OneFrame: false },
+        popon_frame: { cea608Style: 'popon', cea608ControlRepeat: 1, cea608OneFrame: true, cea608Copies: 3, cea608CopyGap: 4 },
+        popon_frame6:{ cea608Style: 'popon', cea608ControlRepeat: 1, cea608OneFrame: true, cea608Copies: 6, cea608CopyGap: 3 },
+        rollup:      { cea608Style: 'rollup', cea608ControlRepeat: 2, cea608OneFrame: false },
+        painton:     { cea608Style: 'painton', cea608ControlRepeat: 2, cea608OneFrame: false },
+    };
+    const cea608Preset = cea608Style === 'popon' && cea608OneFrame ? (cea608Copies >= 6 ? 'popon_frame6' : 'popon_frame')
+        : ['rollup_pac', 'popon', 'rollup', 'painton'].includes(cea608Style) ? cea608Style : 'custom';
+    const applyCea608Preset = (name: string) => {
+        const cfg = CEA608_PRESETS[name];
+        if (!cfg) return;
+        if (typeof cfg.cea608Style === 'string') setCea608Style(cfg.cea608Style);
+        if (typeof cfg.cea608OneFrame === 'boolean') setCea608OneFrame(cfg.cea608OneFrame);
+        if (typeof cfg.cea608Copies === 'number') setCea608Copies(cfg.cea608Copies);
+        postCaptionConfig(cfg);
+    };
     const postCaptionConfig = useCallback((patch: Record<string, unknown>) => {
         fetch(`${getRelayUrl()}/api/caption/config`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(patch) }).catch(() => {});
     }, []);
+    // Caption text: strategy and character cap, applied by feedCaptionToEncoder in relay.js in
+    // both encoding modes. The cap keeps the field's text apart from the accepted value so the
+    // operator can clear and retype; the relay only hears 32–128, and blur/Enter snaps the field back.
+    const [captionStrategy, setCaptionStrategy] = useState('truncate');
+    const [maxCharsPerLine, setMaxCharsPerLine] = useState(46);
+    const [maxCharsText, setMaxCharsText] = useState('46');
+    const commitMaxChars = (raw: string) => {
+        const n = parseInt(raw, 10);
+        const v = Number.isFinite(n) ? Math.max(32, Math.min(128, n)) : maxCharsPerLine;
+        setMaxCharsText(String(v));
+        if (v !== maxCharsPerLine) { setMaxCharsPerLine(v); postCaptionConfig({ maxCharsPerLine: v }); }
+    };
     useEffect(() => {
         fetch(`${getRelayUrl()}/api/caption/config`).then(r => r.json()).then(c => {
             if (typeof c.cea608InDtvcc === 'boolean') setCea608InDtvcc(c.cea608InDtvcc);
@@ -199,6 +323,11 @@ const CaptionInjection: React.FC<CaptionInjectionProps> = ({ onBack, apiKey }) =
             if (typeof c.dtvccRepeat === 'number') setDtvccRepeat(c.dtvccRepeat);
             if (typeof c.dtvccKeepAlive === 'boolean') setDtvccKeepAlive(c.dtvccKeepAlive);
             if (typeof c.dtvccStyle === 'string') setDtvccStyle(c.dtvccStyle);
+            if (typeof c.captionStrategy === 'string') setCaptionStrategy(c.captionStrategy);
+            if (typeof c.maxCharsPerLine === 'number') { setMaxCharsPerLine(c.maxCharsPerLine); setMaxCharsText(String(c.maxCharsPerLine)); }
+            if (typeof c.cea608Style === 'string') setCea608Style(c.cea608Style);
+            if (typeof c.cea608OneFrame === 'boolean') setCea608OneFrame(c.cea608OneFrame);
+            if (typeof c.cea608Copies === 'number') setCea608Copies(c.cea608Copies);
         }).catch(() => {});
     }, []);
     const [ndiSources, setNdiSources] = useState<{name: string; url: string}[]>([]);
@@ -809,30 +938,71 @@ const CaptionInjection: React.FC<CaptionInjectionProps> = ({ onBack, apiKey }) =
                                 <p className="text-[10px] text-stone-500">Higher throughput · self-healing · optional 608</p>
                             </button>
                         </div>
-                        {encodingMode === 'dtvcc' && (
-                            <div className="mt-2 p-3 rounded-lg border border-stone-200 bg-stone-50 space-y-2">
-                                <label className="flex items-center gap-2 text-xs text-stone-700">
-                                    <input type="checkbox" checked={cea608InDtvcc}
-                                        onChange={e => { setCea608InDtvcc(e.target.checked); postCaptionConfig({ cea608InDtvcc: e.target.checked }); }} />
-                                    Also send CEA-608 (CC1) for older decoders
-                                </label>
-                                <label className="flex items-center gap-2 text-xs text-stone-700">
-                                    Transport
-                                    <select value={dtvccPreset} className="px-2 py-1 rounded border border-stone-200 text-xs"
-                                        onChange={e => applyDtvccPreset(e.target.value)}>
-                                        <option value="webpresenter">YouTube through a Web Presenter: one-frame captions, 23 characters (default)</option>
-                                        <option value="youtube">YouTube / web encoder: pop-on, 3 copies</option>
-                                        <option value="immediate">YouTube / web encoder: immediate (decoders blink)</option>
-                                        <option value="continuous">SDI decoder behind a lossy encoder: continuous</option>
-                                        <option value="halfsec">re-send every ½ second</option>
-                                        <option value="second">re-send every second</option>
-                                        <option value="classic">classic roll-up (no redraw)</option>
-                                        <option value="custom">custom (set by API)</option>
+                        <div className="mt-2 p-3 rounded-lg border border-stone-200 bg-stone-50 space-y-2">
+                            <div className="flex flex-wrap items-center gap-2 text-xs text-stone-700">
+                                <label className="flex items-center gap-2">
+                                    Caption text
+                                    <select value={captionStrategy} className="px-2 py-1 rounded border border-stone-200 text-xs"
+                                        onChange={e => { setCaptionStrategy(e.target.value); postCaptionConfig({ captionStrategy: e.target.value }); }}>
+                                        <option value="truncate">truncate at the cap</option>
+                                        <option value="summarize">summarize with Gemini</option>
+                                        <option value="verbatim">verbatim</option>
                                     </select>
                                 </label>
-                                <p className="text-[11px] text-stone-500">Each row goes out as its own self-contained packet (27 characters wide), so an encoder that drops caption frames (a Blackmagic Web Presenter 4K loses 20–40 % of them, one or two at a time) can never put text on the wrong row. <b>YouTube</b>: its caption converter closes a caption on HideWindow, opens one on DefineWindow or DisplayWindow, and keeps only the last of identical re-sends in each 5-second segment, so a re-sent window is shown for a moment and then vanishes. The YouTube preset uses pop-on: each caption is written into a hidden window and shown with one display command, sent three times within half a second and never again; the caption appears with the last copy that gets through (about half a second after it was spoken) and lasts until the next caption, with no flicker on any decoder. "Immediate" sends hide + define + rows three times instead: the caption appears with the first copy, but an SDI decoder on the same feed blinks briefly at each copy. <b>TV or decoder behind the encoder</b>: re-sending continuously repairs any lost row within a frame or two and is invisible on a real decoder. For YouTube also switch CEA-608 off: YouTube prefers 608 when both are present and renders it as single characters. Keep 608 on for SDI decoders that only read 608.</p>
+                                <label className="flex items-center gap-2">
+                                    cap
+                                    <input type="number" min={32} max={128} step={1} value={maxCharsText}
+                                        className="w-16 px-2 py-1 rounded border border-stone-200 text-xs"
+                                        onChange={e => { setMaxCharsText(e.target.value); const n = parseInt(e.target.value, 10); if (n >= 32 && n <= 128 && n !== maxCharsPerLine) { setMaxCharsPerLine(n); postCaptionConfig({ maxCharsPerLine: n }); } }}
+                                        onBlur={() => commitMaxChars(maxCharsText)}
+                                        onKeyDown={e => { if (e.key === 'Enter') e.currentTarget.blur(); }} />
+                                    characters
+                                </label>
                             </div>
-                        )}
+                            <p className="text-[11px] text-stone-500">Truncate cuts each caption at the cap on a word boundary; Summarize condenses it with Gemini (needs a key, falls back to truncate); Verbatim sends everything and can lag behind fast speech. The one-frame YouTube transport sends pieces of 23 characters, so the cap mainly matters for the other transports.</p>
+                            {encodingMode === 'cea608' && (
+                                <>
+                                    <label className="flex items-center gap-2 text-xs text-stone-700">
+                                        Style
+                                        <select value={cea608Preset} className="px-2 py-1 rounded border border-stone-200 text-xs"
+                                            onChange={e => applyCea608Preset(e.target.value)}>
+                                            <option value="rollup_pac">roll-up, 2 rows, row address with every row (default)</option>
+                                            <option value="popon">pop-on: each caption appears whole (YouTube / web encoders)</option>
+                                            <option value="popon_frame">pop-on in one frame, 3 copies (lossy encoder)</option>
+                                            <option value="popon_frame6">pop-on in one frame, 6 copies</option>
+                                            <option value="rollup">roll-up, row address once (6.13 and earlier)</option>
+                                            <option value="painton">paint-on</option>
+                                            <option value="custom">custom (set by API)</option>
+                                        </select>
+                                    </label>
+                                    <p className="text-[11px] text-stone-500">Measured on YouTube through a lossless encoder (2026-10-13): roll-up is readable only when every row carries its row address (the old form, with the address sent once, came out as single characters); pop-on reached YouTube 20 of 20 complete at the bottom of the picture; paint-on loses every other caption to YouTube's 5-second segments; six one-frame copies make YouTube drop captions, three do not. SDI decoders read all of them.</p>
+                                </>
+                            )}
+                            {encodingMode === 'dtvcc' && (
+                                <>
+                                    <label className="flex items-center gap-2 text-xs text-stone-700">
+                                        <input type="checkbox" checked={cea608InDtvcc}
+                                            onChange={e => { setCea608InDtvcc(e.target.checked); postCaptionConfig({ cea608InDtvcc: e.target.checked }); }} />
+                                        Also send CEA-608 (CC1) for older decoders
+                                    </label>
+                                    <label className="flex items-center gap-2 text-xs text-stone-700">
+                                        Transport
+                                        <select value={dtvccPreset} className="px-2 py-1 rounded border border-stone-200 text-xs"
+                                            onChange={e => applyDtvccPreset(e.target.value)}>
+                                            <option value="webpresenter">YouTube through a Web Presenter: one-frame captions, 23 characters (default)</option>
+                                            <option value="youtube">YouTube / web encoder: pop-on, 3 copies</option>
+                                            <option value="immediate">YouTube / web encoder: immediate (decoders blink)</option>
+                                            <option value="continuous">SDI decoder behind a lossy encoder: continuous</option>
+                                            <option value="halfsec">re-send every ½ second</option>
+                                            <option value="second">re-send every second</option>
+                                            <option value="classic">classic roll-up (no redraw)</option>
+                                            <option value="custom">custom (set by API)</option>
+                                        </select>
+                                    </label>
+                                    <p className="text-[11px] text-stone-500">Each row goes out as its own self-contained packet (27 characters wide), so an encoder that drops caption frames (a Blackmagic Web Presenter 4K loses 20–40 % of them, one or two at a time) can never put text on the wrong row. <b>YouTube</b>: its caption converter closes a caption on HideWindow, opens one on DefineWindow or DisplayWindow, and keeps only the last of identical re-sends in each 5-second segment, so a re-sent window is shown for a moment and then vanishes. The YouTube preset uses pop-on: each caption is written into a hidden window and shown with one display command, sent three times within half a second and never again; the caption appears with the last copy that gets through (about half a second after it was spoken) and lasts until the next caption, with no flicker on any decoder. "Immediate" sends hide + define + rows three times instead: the caption appears with the first copy, but an SDI decoder on the same feed blinks briefly at each copy. <b>TV or decoder behind the encoder</b>: re-sending continuously repairs any lost row within a frame or two and is invisible on a real decoder. For YouTube also switch CEA-608 off: YouTube prefers 608 when both are present and renders it as single characters. Keep 608 on for SDI decoders that only read 608.</p>
+                                </>
+                            )}
+                        </div>
                     </section>
 
                     {/* Big start/stop */}
@@ -1038,6 +1208,7 @@ const CaptionInjection: React.FC<CaptionInjectionProps> = ({ onBack, apiKey }) =
 
                     {/* YouTube Caption Ingestion URL — bypasses encoder CC forwarding */}
                     <YouTubeCaptionIngestPanel />
+                    <ObsCaptionPanel />
 
                     {/* Tech reference */}
                     <div className="bg-white border border-stone-200 rounded-2xl p-4">

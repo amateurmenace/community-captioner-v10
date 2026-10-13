@@ -7,7 +7,8 @@ import { GoogleGenAI } from "@google/genai";
 
 interface GlobalSettingsProps {
   isOpen: boolean;
-  onClose: () => void;
+  /** 'saved' after Save Changes, 'dismissed' from the X button (App cancels a pending Cloud start on dismiss). */
+  onClose: (reason?: 'saved' | 'dismissed') => void;
   appState: AppState;
   setAppState: React.Dispatch<React.SetStateAction<AppState>>;
   initialTab?: 'general' | 'cloud' | 'local' | 'guide' | 'help' | 'diagnostics';
@@ -22,11 +23,14 @@ const GlobalSettings: React.FC<GlobalSettingsProps> = ({ isOpen, onClose, appSta
   const [diagCopied, setDiagCopied] = useState(false);
   const runDiagnostics = async () => {
       setDiagBusy(true);
-      try { setDiag(await collectDiagnostics({ mode: appState.mode, isRecording: appState.isRecording, audioSourceId: appState.audioSourceId || '', captionsInSession: appState.captions.length, dictionaryRules: appState.dictionary.length, targetLanguage: appState.targetLanguage })); }
+      try { setDiag(await collectDiagnostics({ mode: appState.mode, isRecording: appState.isRecording, audioSourceId: appState.audioSourceId || '', captionsInSession: appState.captions.length, dictionaryRules: appState.dictionary.length, targetLanguage: appState.targetLanguage, geminiKeyInBrowser: appState.apiKey ? (appState.apiKeySource || 'stored') : 'none' })); }
       finally { setDiagBusy(false); }
   };
   useEffect(() => { if (isOpen && activeTab === 'diagnostics' && !diag) runDiagnostics(); }, [isOpen, activeTab]);
-  const [apiKeyInput, setApiKeyInput] = useState(appState.apiKey || '');
+  // The field shows a key the operator typed. A key adopted from the relay (.env.local on the
+  // desktop app) is used silently: never shown here, never written to localStorage.
+  const keyFromRelay = appState.apiKeySource === 'server' && !!appState.apiKey;
+  const [apiKeyInput, setApiKeyInput] = useState(keyFromRelay ? '' : (appState.apiKey || ''));
   const [localUrlInput, setLocalUrlInput] = useState(appState.localServerUrl || 'ws://localhost:9000');
   const [llmUrlInput, setLlmUrlInput] = useState(appState.localLlmUrl || 'http://localhost:11434');
   const [llmModelInput, setLlmModelInput] = useState(appState.localLlmModel || 'gemma4:e2b');
@@ -54,14 +58,20 @@ const GlobalSettings: React.FC<GlobalSettingsProps> = ({ isOpen, onClose, appSta
   const [statusMessage, setStatusMessage] = useState('');
 
   useEffect(() => {
-      if (isOpen) setActiveTab(initialTab);
+      if (!isOpen) return;
+      setActiveTab(initialTab);
+      // Re-sync from the live state each time the dialog opens: the key may have been adopted
+      // from the relay or typed elsewhere since this component mounted.
+      setApiKeyInput(appState.apiKeySource === 'server' ? '' : (appState.apiKey || ''));
+      setCloudStatus('idle');
   }, [isOpen, initialTab]);
 
   if (!isOpen) return null;
 
   // --- Connection Tests ---
   const testCloudConnection = async () => {
-      if (!apiKeyInput) {
+      const keyToTest = apiKeyInput.trim() || (keyFromRelay ? appState.apiKey! : '');
+      if (!keyToTest) {
           setCloudStatus('error');
           setStatusMessage('API Key is missing');
           return;
@@ -69,9 +79,9 @@ const GlobalSettings: React.FC<GlobalSettingsProps> = ({ isOpen, onClose, appSta
       setCloudStatus('testing');
       setStatusMessage('');
       try {
-          const ai = new GoogleGenAI({ apiKey: apiKeyInput });
+          const ai = new GoogleGenAI({ apiKey: keyToTest });
           await ai.models.generateContent({
-              model: "gemini-3-flash-preview",
+              model: "gemini-3.8-flash",
               contents: "ping",
           });
           setCloudStatus('success');
@@ -107,21 +117,26 @@ const GlobalSettings: React.FC<GlobalSettingsProps> = ({ isOpen, onClose, appSta
   };
 
   const saveSettings = () => {
+      // A typed key is stored and overrides everything. An empty field keeps a key that came
+      // from the relay (desktop app) and otherwise clears the stored key — App then asks the
+      // relay again, so clearing a typed key falls back to the relay's key where there is one.
+      const typedKey = apiKeyInput.trim();
       setAppState(prev => ({
           ...prev,
-          apiKey: apiKeyInput,
+          apiKey: typedKey || (prev.apiKeySource === 'server' ? prev.apiKey : ''),
+          apiKeySource: typedKey ? 'stored' : (prev.apiKeySource === 'server' ? 'server' : undefined),
           localServerUrl: localUrlInput,
           localLlmUrl: llmUrlInput,
           localLlmModel: llmModelInput,
       }));
-      localStorage.setItem('cc_api_key', apiKeyInput);
+      if (typedKey) localStorage.setItem('cc_api_key', typedKey); else localStorage.removeItem('cc_api_key');
       localStorage.setItem('cc_local_url', localUrlInput);
       localStorage.setItem('cc_llm_url', llmUrlInput);
       localStorage.setItem('cc_llm_model', llmModelInput);
       // Keep the relay's local brain pointed at the same model (it decides whether
       // Context Engine extraction runs through Ollama)
       fetch(`${relayHttp()}/api/local/brain`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ url: llmUrlInput, model: llmModelInput }) }).catch(() => {});
-      onClose();
+      onClose('saved');
   };
 
   const openLocalWizard = () => {
@@ -152,7 +167,7 @@ const GlobalSettings: React.FC<GlobalSettingsProps> = ({ isOpen, onClose, appSta
              <h2 className="font-display font-bold text-lg text-forest-dark flex items-center gap-2">
                 <Settings size={20} className="text-sage-600" /> Help &amp; Settings
              </h2>
-             <button onClick={onClose} className="p-1 hover:bg-stone-200 rounded-full transition-colors"><X size={20} className="text-stone-500" /></button>
+             <button onClick={() => onClose('dismissed')} className="p-1 hover:bg-stone-200 rounded-full transition-colors"><X size={20} className="text-stone-500" /></button>
         </div>
         
         <div className="flex flex-1 overflow-hidden">
@@ -289,7 +304,20 @@ const GlobalSettings: React.FC<GlobalSettingsProps> = ({ isOpen, onClose, appSta
                         <div>
                             <h3 className="text-lg font-bold text-forest-dark mb-2">Google Gemini API</h3>
                             <p className="text-sm text-stone-500 mb-4">Required for "Cloud Mode" and "Resilience Mode".</p>
-                            
+
+                            {appState.mode === 'cloud' && !appState.apiKey && (
+                                <div className="mb-4 p-3 rounded-xl bg-amber-50 border border-amber-200 text-amber-900 text-sm flex items-start gap-2">
+                                    <AlertCircle size={16} className="shrink-0 mt-0.5" />
+                                    <span>Cloud mode needs a Gemini API key. Paste it below and press Save Changes; if you pressed Start, the session begins as soon as the key is saved. Keys are free at aistudio.google.com/apikey.</span>
+                                </div>
+                            )}
+                            {keyFromRelay && (
+                                <div className="mb-4 p-3 rounded-xl bg-sage-50 border border-sage-200 text-forest-dark text-sm flex items-start gap-2">
+                                    <ShieldCheck size={16} className="shrink-0 mt-0.5 text-sage-600" />
+                                    <span>Using the Gemini key from the relay (.env.local) — enter one here only to override.</span>
+                                </div>
+                            )}
+
                             <label className="text-xs font-bold text-stone-400 uppercase tracking-wider mb-2 block">API Key</label>
                             <div className="flex gap-2">
                                 <div className="flex-1 flex items-center gap-3 p-3 border border-stone-200 rounded-xl bg-white focus-within:ring-2 focus-within:ring-sage-400 transition-all shadow-sm">
@@ -301,13 +329,13 @@ const GlobalSettings: React.FC<GlobalSettingsProps> = ({ isOpen, onClose, appSta
                                             setApiKeyInput(e.target.value);
                                             setCloudStatus('idle');
                                         }}
-                                        placeholder="AIzaSy..."
+                                        placeholder={keyFromRelay ? 'Using the relay key — paste a key only to override' : 'AIzaSy...'}
                                         className="w-full bg-transparent outline-none font-mono text-sm text-stone-800 placeholder:text-stone-400"
                                     />
                                 </div>
-                                <button 
+                                <button
                                     onClick={testCloudConnection}
-                                    disabled={cloudStatus === 'testing' || !apiKeyInput}
+                                    disabled={cloudStatus === 'testing' || (!apiKeyInput && !keyFromRelay)}
                                     className="bg-stone-100 hover:bg-stone-200 text-stone-600 px-4 rounded-xl font-bold text-sm transition-colors disabled:opacity-50"
                                 >
                                     Test

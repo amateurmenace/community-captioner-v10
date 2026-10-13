@@ -16,7 +16,7 @@
 import { readFileSync, writeFileSync, mkdirSync, existsSync } from 'fs';
 import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
-import { itemsToEntries, mapLimit, GEMINI_TEXT_MODEL } from './context-sources.js';
+import { itemsToEntries, mapLimit, GEMINI_TEXT_MODEL, textModelConfig } from './context-sources.js';
 import { brainActive, getBrainConfig, extractItemsWithOllama } from './local-llm.js';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -45,6 +45,15 @@ let extractionCount = 0;
 
 const EXTRACTION_INTERVAL_MS = 30000; // 30 seconds
 const MIN_BUFFER_LENGTH = 100; // Don't extract from tiny buffers
+
+// Auto-Learn (5 s budget) and Quick Names (8 s budget) need a model that answers
+// fast without thinking. Measured 2026-10-13: gemini-3.5-flash-lite 1.8 s for a
+// 30 s transcript (18 entries, parseable) and 2.6 s for six names (18 entries);
+// gemini-2.5-flash spent its whole 512-token output budget on thinking
+// (finish=MAX_TOKENS, nothing parseable) and took 3–10 s; gemini-3.8-flash with
+// low thinking took 3.9 s / 8.5 s — over the Quick Names budget and it rewrote
+// "Pearlman" as "Perlman". Lite models do not think and reject thinkingBudget.
+const LEARNER_MODEL = process.env.GEMINI_LEARNER_MODEL || 'gemini-3.5-flash-lite';
 
 // --- Persistence ---
 
@@ -137,9 +146,12 @@ ${text.slice(0, 15000)}`;
 
         const response = await Promise.race([
             ai.models.generateContent({
-                model: 'gemini-2.5-flash',
+                model: LEARNER_MODEL,
                 contents: prompt,
-                config: { maxOutputTokens: 512, temperature: 0.2 }
+                // JSON mode so the array is never wrapped in ``` fences; 1024 tokens (was 512)
+                // because a pretty-printed array of 15–20 suggestions is ~600 tokens and the
+                // old cap cut it mid-object (finish=MAX_TOKENS → parse failure).
+                config: { maxOutputTokens: 1024, temperature: 0.2, responseMimeType: 'application/json' }
             }),
             new Promise((_, reject) => setTimeout(() => reject(new Error('timeout')), 5000))
         ]);
@@ -292,7 +304,7 @@ ${chunk}`;
                 ai.models.generateContent({
                     model: GEMINI_TEXT_MODEL,
                     contents: prompt,
-                    config: { maxOutputTokens: 8192, temperature: 0.1, responseMimeType: 'application/json' },
+                    config: textModelConfig({ maxOutputTokens: 8192, temperature: 0.1, responseMimeType: 'application/json' }),
                 }),
                 new Promise((_, reject) => setTimeout(() => reject(new Error('timeout after 60s')), 60000)),
             ]);
@@ -373,9 +385,9 @@ ${nameList}`;
 
         const response = await Promise.race([
             ai.models.generateContent({
-                model: 'gemini-2.5-flash',
+                model: LEARNER_MODEL,
                 contents: prompt,
-                config: { maxOutputTokens: 2048, temperature: 0.3 }
+                config: { maxOutputTokens: 2048, temperature: 0.3, responseMimeType: 'application/json' }
             }),
             new Promise((_, reject) => setTimeout(() => reject(new Error('timeout')), 8000))
         ]);
