@@ -167,9 +167,9 @@ let deckLinkFrameRate = '29.97';
 
 // Caption encoding configuration (updated via /api/caption/config)
 let captionConfig = {
-    encodingMode: 'cea608',        // 'cea608' | 'dtvcc'
+    encodingMode: 'dtvcc',         // 'cea608' | 'dtvcc' (dtvcc with the one-frame transport is the default since 6.13.3)
     captionStrategy: 'truncate',   // 'truncate' | 'summarize' | 'verbatim'
-    maxCharsPerLine: 64,           // 32-128
+    maxCharsPerLine: 46,           // 32-128 (46 = two one-frame pieces of 23)
     rollupRows: 2,                 // 2 | 3
     polishEnabled: true,           // auto-punctuate, capitalize, fix contractions
     profanityFilter: false,        // bleep profanity with ***
@@ -178,7 +178,7 @@ let captionConfig = {
     // (diagnostic); cea608InDtvcc = also carry CEA-608 in DTVCC mode.
     cea608PaceFrames: 1,
     cea608Repeat: 1,
-    cea608InDtvcc: true,
+    cea608InDtvcc: false,          // off by default: YouTube prefers 608 when both are present and mangles it
     // VANC line of the caption packet on SDI (0 = DeckLink default = line 9).
     vancLine: 0,
     // CEA-708 redraw transport (see dtvcc-encoder.js): every frame carries one self-contained
@@ -186,19 +186,19 @@ let captionConfig = {
     // apart) and the whole window is re-sent every dtvccRepaintFrames frames (0 = classic
     // roll-up). A decoder behind a lossy encoder (Web Presenter) never shows text on the
     // wrong row and recovers a lost row at the next copy or keep-alive.
-    dtvccRepaintFrames: 1,      // 1 = continuous, the default since 6.13.1 (was 30)
-    dtvccRepeat: 1,
-    dtvccRepeatGap: 3,
-    dtvccKeepAlive: true,       // false = burst only (YouTube's converter shows a re-sent window for a moment per 5 s segment)
-    dtvccStyle: 'rollup',       // 'rollup' | 'popon' | 'youtube' | 'atomic' (see dtvcc-encoder.js)
+    dtvccRepaintFrames: 30,     // keep-alive interval when dtvccKeepAlive is on (1 = continuous, the decoder preset)
+    dtvccRepeat: 6,             // the one-frame default: six copies four frames apart (measured 29-30/30 on YouTube through a Web Presenter)
+    dtvccRepeatGap: 4,
+    dtvccKeepAlive: false,      // false = burst only (YouTube's converter shows a re-sent window for a moment per 5 s segment)
+    dtvccStyle: 'atomic',       // 'rollup' | 'popon' | 'youtube' | 'atomic' (see dtvcc-encoder.js); atomic = one-frame captions, the default since 6.13.3
     dtvccCcCount: 0,            // cc_data triplets per frame: 0 = standard for the rate (20 at 29.97). The Web Presenter re-packs to 20 and a 31 wedges it: leave 0.
-    dtvccAtomicDelete: false,   // atomic style: DeleteWindow + DefineWindow (23 characters) instead of Hide + pen + HCR (19)
+    dtvccAtomicDelete: true,    // atomic style: DeleteWindow + DefineWindow (23 characters) instead of Hide + pen + HCR (19)
     dtvccAtomicWindows: 1,      // atomic style: 2 = two rows per caption, each row its own window and one-frame packet
-    dtvccAtomicHoldFrames: 45,  // atomic style: frames each part of a long caption stays before the next part
+    dtvccAtomicHoldFrames: 60,  // atomic style: frames each part of a long caption stays before the next part
     // Experiments (API only): service blocks per packet (1|2), row erase ('pad'|'hcr'),
     // fixed row width (0 = one packet per row), DefineWindow with every caption.
     dtvccBlocks: 1,
-    dtvccRowErase: 'pad',
+    dtvccRowErase: 'hcr',
     dtvccColumns: 0,
     dtvccDefineOnChange: true,
 };

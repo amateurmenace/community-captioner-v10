@@ -52,7 +52,7 @@ build 6.12.0 was published from it. The Mac app needs a rebuild to pick up the s
    flicker; if a decoder flickers, raise `dtvccRepaintFrames` or send `setRepaint(0)`).
 3. Ship a Mac build and update `MAC_DOWNLOAD_URL` in `utils/appLinks.ts`.
 
-## Update, night of 12 October: 6.13.0 / 6.13.1 / 6.13.2 (commit a7933b0 and later; 6.13.1 makes continuous the default CEA-708 transport; 6.13.2 adds the one-frame "atomic" transport for YouTube through a Web Presenter, see CLAUDE.md addon note 19)
+## Update, night of 12 October: 6.13.0 / 6.13.1 / 6.13.2 (commit a7933b0 and later; 6.13.1 makes continuous the default CEA-708 transport; 6.13.2 adds the one-frame "atomic" transport for YouTube through a Web Presenter, see CLAUDE.md addon note 19; 6.13.3 makes it the default: CEA-708, CEA-608 off, 46-character captions)
 
 All platform-neutral JavaScript; the Mac app only needs `git pull`, a rebuild and `node test/test-cea708.mjs` (61 pass).
 

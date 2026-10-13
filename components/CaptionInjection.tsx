@@ -154,13 +154,13 @@ const CaptionInjection: React.FC<CaptionInjectionProps> = ({ onBack, apiKey }) =
     const [outputDevice, setOutputDevice] = useState(0);
     const [displayMode, setDisplayMode] = useState(0);
     const [frameRate, setFrameRate] = useState('29.97');
-    const [encodingMode, setEncodingMode] = useState<'cea608' | 'dtvcc'>('cea608');
+    const [encodingMode, setEncodingMode] = useState<'cea608' | 'dtvcc'>('dtvcc');
     // CEA-708 transport options (live-adjustable through /api/caption/config)
-    const [cea608InDtvcc, setCea608InDtvcc] = useState(true);
-    const [dtvccRepaintFrames, setDtvccRepaintFrames] = useState(1);
-    const [dtvccRepeat, setDtvccRepeat] = useState(1);
-    const [dtvccKeepAlive, setDtvccKeepAlive] = useState(true);
-    const [dtvccStyle, setDtvccStyle] = useState('rollup');
+    const [cea608InDtvcc, setCea608InDtvcc] = useState(false);
+    const [dtvccRepaintFrames, setDtvccRepaintFrames] = useState(30);
+    const [dtvccRepeat, setDtvccRepeat] = useState(6);
+    const [dtvccKeepAlive, setDtvccKeepAlive] = useState(false);
+    const [dtvccStyle, setDtvccStyle] = useState('atomic');
     // Transport presets (see dtvcc-encoder.js); the preset shown is derived from the live config
     const DTVCC_PRESETS: Record<string, Record<string, unknown>> = {
         webpresenter: { dtvccStyle: 'atomic', dtvccAtomicDelete: true, dtvccAtomicWindows: 1, dtvccAtomicHoldFrames: 60, dtvccRepaintFrames: 30, dtvccKeepAlive: false, dtvccRepeat: 6, dtvccRepeatGap: 4, dtvccRowErase: 'hcr' },
@@ -820,10 +820,10 @@ const CaptionInjection: React.FC<CaptionInjectionProps> = ({ onBack, apiKey }) =
                                     Transport
                                     <select value={dtvccPreset} className="px-2 py-1 rounded border border-stone-200 text-xs"
                                         onChange={e => applyDtvccPreset(e.target.value)}>
-                                        <option value="webpresenter">YouTube through a Web Presenter: one-frame captions, 23 characters (recommended)</option>
+                                        <option value="webpresenter">YouTube through a Web Presenter: one-frame captions, 23 characters (default)</option>
                                         <option value="youtube">YouTube / web encoder: pop-on, 3 copies</option>
                                         <option value="immediate">YouTube / web encoder: immediate (decoders blink)</option>
-                                        <option value="continuous">SDI decoder behind a lossy encoder: continuous (default)</option>
+                                        <option value="continuous">SDI decoder behind a lossy encoder: continuous</option>
                                         <option value="halfsec">re-send every ½ second</option>
                                         <option value="second">re-send every second</option>
                                         <option value="classic">classic roll-up (no redraw)</option>
