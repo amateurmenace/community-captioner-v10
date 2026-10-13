@@ -14,6 +14,14 @@
 > remains the YouTube path; embedded CEA-708 is
 > the in-room/decoder path. The YouTube 608 question (item 3) was not pursued: 608 is not needed
 > for YouTube at all.
+>
+> **Addendum, morning of 13 Oct (6.13.2):** one-frame ("atomic") captions, DeleteWindow + DefineWindow + up to 23
+> characters in a single packet sent six times four frames apart, reached YouTube through the Web Presenter 29–30
+> times out of 30, every one complete, appearing 0.7 s after sending (CLAUDE.md addon note 19). The box re-packs every
+> packet to 20 triplets per frame (31 wedges it), so 23 characters per frame is the ceiling and the sustained rate is
+> about 11 characters per second: fine for short or summarized captions, behind on long fast speech (51 of 72 pieces
+> when 50-character sentences came every 3 s). It ships as the "YouTube through a Web Presenter" preset, a documented
+> fallback; the POST path stays the full-quality answer.
 
 **Mandate for the new session:** decide, with evidence, whether embedded CEA-608/708 captions from
 Community Captioner can be made broadcast-reliable on the path *DeckLink SDI → Blackmagic Web
