@@ -186,8 +186,8 @@ let captionConfig = {
     // apart) and the whole window is re-sent every dtvccRepaintFrames frames (0 = classic
     // roll-up). A decoder behind a lossy encoder (Web Presenter) never shows text on the
     // wrong row and recovers a lost row at the next copy or keep-alive.
-    dtvccRepaintFrames: 30,
-    dtvccRepeat: 2,
+    dtvccRepaintFrames: 1,      // 1 = continuous, the default since 6.13.1 (was 30)
+    dtvccRepeat: 1,
     dtvccRepeatGap: 3,
     dtvccKeepAlive: true,       // false = burst only (YouTube's converter shows a re-sent window for a moment per 5 s segment)
     dtvccStyle: 'rollup',       // 'rollup' | 'popon' | 'youtube' (see dtvcc-encoder.js)

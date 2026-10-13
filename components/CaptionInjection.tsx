@@ -157,8 +157,8 @@ const CaptionInjection: React.FC<CaptionInjectionProps> = ({ onBack, apiKey }) =
     const [encodingMode, setEncodingMode] = useState<'cea608' | 'dtvcc'>('cea608');
     // CEA-708 transport options (live-adjustable through /api/caption/config)
     const [cea608InDtvcc, setCea608InDtvcc] = useState(true);
-    const [dtvccRepaintFrames, setDtvccRepaintFrames] = useState(30);
-    const [dtvccRepeat, setDtvccRepeat] = useState(2);
+    const [dtvccRepaintFrames, setDtvccRepaintFrames] = useState(1);
+    const [dtvccRepeat, setDtvccRepeat] = useState(1);
     const [dtvccKeepAlive, setDtvccKeepAlive] = useState(true);
     const [dtvccStyle, setDtvccStyle] = useState('rollup');
     // Transport presets (see dtvcc-encoder.js); the preset shown is derived from the live config
@@ -820,7 +820,7 @@ const CaptionInjection: React.FC<CaptionInjectionProps> = ({ onBack, apiKey }) =
                                         onChange={e => applyDtvccPreset(e.target.value)}>
                                         <option value="youtube">YouTube / web encoder: pop-on, 3 copies (recommended)</option>
                                         <option value="immediate">YouTube / web encoder: immediate (decoders blink)</option>
-                                        <option value="continuous">SDI decoder behind a lossy encoder: continuous</option>
+                                        <option value="continuous">SDI decoder behind a lossy encoder: continuous (default)</option>
                                         <option value="halfsec">re-send every ½ second</option>
                                         <option value="second">re-send every second</option>
                                         <option value="classic">classic roll-up (no redraw)</option>

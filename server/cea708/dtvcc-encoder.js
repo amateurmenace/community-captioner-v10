@@ -71,8 +71,8 @@ export class DtvccEncoder {
         this._rows = 2;
         this._lines = [];
         // Redraw mode settings (see class comment). repaintFrames 0 = classic roll-up.
-        this._repaintFrames = 30;
-        this._repeat = 2;           // copies of every row packet per caption / keep-alive
+        this._repaintFrames = 1;    // continuous (default since 6.13.1)
+        this._repeat = 1;           // copies of every row packet per caption / keep-alive
         this._repeatGap = 3;        // idle frames between copies
         this._keepAlive = true;     // false = burst only: the rows go out `repeat` times after a caption and never again
         this._style = 'rollup';     // 'rollup' = one visible window 0 rewritten in place; 'popon' = two windows, the new

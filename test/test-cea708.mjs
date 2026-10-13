@@ -119,6 +119,7 @@ console.log('\n═══ CEA-708 DTVCC Encoder ═══');
     // DefineWindow layout (CEA-708 §8.4.5): anchor point 7 (bottom-centre), relative 50 %/90 %, rows − 1, columns − 1
     const d = new DtvccEncoder();
     d.setRows(2);
+    d.setRepaint(30); d.setRedraw({ repeat: 2, repeatGap: 3 });   // the 1 s keep-alive layout; the default is continuous
     d.setFrameCapacity(CAP);
     d.enqueueText('Hi');
     const first = d.drainFrame(CAP);
@@ -141,7 +142,7 @@ console.log('\n═══ CEA-708 DTVCC Encoder ═══');
     assert(rowPk[0].length === 32 && String.fromCharCode(...rowPk[0].slice(4, 31)) === 'Hi'.padEnd(27), 'Row text padded to 27 columns overwrites stale characters');
 
     // Decoder round trip with the first copy of every row lost: the second copy restores the display
-    const e2 = new DtvccEncoder(); e2.setRows(2); e2.setRepaint(30);
+    const e2 = new DtvccEncoder(); e2.setRows(2); e2.setRepaint(30); e2.setRedraw({ repeat: 2, repeatGap: 3 });
     const b2 = new Cea708CdpBuilder(); const dec = new DtvccDecoder();
     e2.enqueueText('The quick brown fox jumps over the lazy dog near the river.');
     const shown = [];
