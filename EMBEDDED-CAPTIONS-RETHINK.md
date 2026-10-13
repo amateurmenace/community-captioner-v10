@@ -9,7 +9,9 @@
 > converter keys cues on window events (HideWindow closes, DefineWindow discards, DisplayWindow
 > restarts, text at the first DisplayWindow is frozen) and keeps only the last identical cue per
 > 5 s segment, so no transport that survives the Web Presenter's loss can also deliver every
-> caption to YouTube — the caption-ingestion POST remains the YouTube path; embedded CEA-708 is
+> caption to YouTube (best live result through the Web Presenter: 34 of 40 captions on YouTube's
+> track, 29 complete, with pop-on and three front-loaded copies) — the caption-ingestion POST
+> remains the YouTube path; embedded CEA-708 is
 > the in-room/decoder path. The YouTube 608 question (item 3) was not pursued: 608 is not needed
 > for YouTube at all.
 
