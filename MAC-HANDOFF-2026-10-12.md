@@ -52,6 +52,32 @@ build 6.12.0 was published from it. The Mac app needs a rebuild to pick up the s
    flicker; if a decoder flickers, raise `dtvccRepaintFrames` or send `setRepaint(0)`).
 3. Ship a Mac build and update `MAC_DOWNLOAD_URL` in `utils/appLinks.ts`.
 
+## Update, night of 12 October: 6.13.0 (commit a7933b0 and later)
+
+All platform-neutral JavaScript; the Mac app only needs `git pull`, a rebuild and `node test/test-cea708.mjs` (61 pass).
+
+- `server/cea708/dtvcc-encoder.js` — the repaint mode was rebuilt. Every frame now carries one
+  self-contained packet (one service block: SetPenLocation(row, 0) + the row padded to 27 columns
+  + ETX), DefineWindow goes out in its own packet with every new caption and never in a keep-alive,
+  each caption's rows are re-sent `repeat` times `repeatGap` frames apart and the whole window every
+  `repaintFrames` frames; `repaintFrames = 1` is "continuous" (rows alternate on every frame). Rows
+  are 27 columns wide in this mode (32 do not fit one block in a 29.97 frame). Classic mode
+  (`setRepaint(0)`) sends CR before each row, not after. New: `setRedraw({repeat, repeatGap,
+  maxBlocks, rowErase, columns, defineOnChange})`, `setFrameCapacity(bytes)` (the relay calls it
+  with `Cea708CdpBuilder.dtvccCapacity(frameRate)` when the frame loop starts), `.lines`, `.columns`.
+- `server/relay.js` — `captionConfig` gained `dtvccRepeat` (2), `dtvccRepeatGap` (3), `dtvccBlocks`
+  (1), `dtvccRowErase` ('pad'), `dtvccColumns` (0), `dtvccDefineOnChange` (true); `applyDtvccTransport()`;
+  `/api/inject/status` reports `dtvccTransport`.
+- `components/CaptionInjection.tsx` — re-send interval (never / continuously / 5 frames / ½ s / 1 s /
+  2 s) and copies; `components/HelpGuide.tsx` text; `utils/appLinks.ts` Windows 6.13.0.
+- `tools/sdi-verify/captions/` — CEA-708 decoder model, capture scorer, numbered-caption driver,
+  Web Presenter REST control, YouTube live-track reader (README there). `tools/sdi-verify/captions/
+  dtvcc-model.mjs` is imported by the unit tests.
+- Why: measured through the Web Presenter at 35–40 % frame loss, keep-alive 1 s gave 75 % of frames
+  correct and 36/40 captions complete; continuous gave 100 %, 40/40, worst delay 0.4 s, never a
+  garbled row (CLAUDE.md addon note 17). Nothing to verify on Mac hardware beyond "it still
+  encodes"; the Mac 608 path is untouched.
+
 ## Findings worth knowing
 
 - Blackmagic Web Presenter 4K 4.2.3 (two units, direct cable or Videohub, 1080p29.97/1080i/1080p30,
