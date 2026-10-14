@@ -294,3 +294,16 @@ from the CDPs with the CEA-608 model: every word shown, median word latency abou
 Presenter 4K on software 3.5 …" setup, Speech engine Cloud, Start captioning, and watch a decoder (or `decklink_probe` on the
 loopback input 7) fill the roll-up rows word by word; then a fresh YouTube broadcast through the box on 3.5 with the
 stream's Closed captions set to Embedded 608/708, and read its caption track with `tools/sdi-verify/captions/yt-live-captions.mjs`.
+
+# 2026-10-14 — notes from the Mac 6.15.0 release (nothing to rebuild on Windows)
+
+- **Bump the download link before the build.** `WINDOWS_DOWNLOAD_URL` / `MAC_DOWNLOAD_URL` in `utils/appLinks.ts` are compiled
+  into the frontend (deployment choice page, the Local AI "desktop app" notice, the Output designer's download prompt). The
+  Windows 6.14.0 exe was built before its link was bumped (14af5ac came after the build), so it linked to the 6.13.4 zip that
+  the release step then deleted; 6.15.0 bumped the link in the same commit as the version and is fine. Order for every release:
+  version + link in `appLinks.ts` → build → upload → delete the old asset.
+- `tools/e2e/cloud-e2e.mjs` is now platform-aware: Windows keeps the `chrome.exe` path and `taskkill`; macOS uses the
+  `Google Chrome.app` binary, `process.kill`, and `--disable-features=AudioServiceSandbox` (Chrome's sandboxed audio service
+  on macOS cannot read the fake-capture WAV, so the fake microphone was silent). Nothing changes for a Windows run.
+- Mac 6.15.0 is on release v10.1 (notarized; the three suites 123 / 30 / 32, both end-to-end scripts PASS against the
+  packaged binary; no DeckLink on the build Mac, so the roll-up-on-a-decoder check is still open on the Mac).

@@ -8,7 +8,9 @@ import { join } from 'node:path';
 import WebSocket from 'ws';
 
 const [appUrl = 'http://localhost:8092', wav] = process.argv.slice(2);
-const CHROME = 'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe';
+const CHROME = process.platform === 'win32'
+    ? 'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe'
+    : process.platform === 'darwin' ? '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome' : 'google-chrome';
 const PORT = 9333;
 const profile = mkdtempSync(join(tmpdir(), 'cc-e2e-'));
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
@@ -17,7 +19,10 @@ const stamp = () => new Date().toISOString().slice(11, 23);
 const chrome = spawn(CHROME, [
     `--user-data-dir=${profile}`, `--remote-debugging-port=${PORT}`, '--no-first-run', '--no-default-browser-check',
     '--use-fake-ui-for-media-stream', '--use-fake-device-for-media-stream', `--use-file-for-fake-audio-capture=${wav}`,
-    '--autoplay-policy=no-user-gesture-required', '--window-size=1400,900', '--disable-background-timer-throttling', appUrl,
+    '--autoplay-policy=no-user-gesture-required', '--window-size=1400,900', '--disable-background-timer-throttling',
+    // macOS: the sandboxed audio service cannot read the fake-capture WAV (the fake microphone then delivers digital silence,
+    // measured 2026-10-14 on an M1 Max); the test harness turns that sandbox off. Windows does not need it.
+    ...(process.platform === 'darwin' ? ['--disable-features=AudioServiceSandbox'] : []), appUrl,
 ], { stdio: 'ignore' });
 
 let ws, id = 0; const pending = new Map(); const consoleLog = [];
@@ -93,7 +98,7 @@ try {
     try { ws?.close(); } catch {}
     try { chrome.kill(); } catch {}
     await sleep(1500);
-    try { spawn('taskkill', ['/F', '/T', '/PID', String(chrome.pid)], { stdio: 'ignore' }); } catch {}
+    try { if (process.platform === 'win32') spawn('taskkill', ['/F', '/T', '/PID', String(chrome.pid)], { stdio: 'ignore' }); else process.kill(chrome.pid, 'SIGKILL'); } catch {}
     await sleep(1500);
     try { rmSync(profile, { recursive: true, force: true }); } catch {}
 }
