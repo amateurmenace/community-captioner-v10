@@ -276,3 +276,21 @@ gemini-3.8-flash, `/api/inject/status` addonLoaded + ndiAvailable, `/api/gemini/
 LAN address, `/api/obs/status`, `/api/caption/config` cea608Style rollup_pac, a TXT upload extracted with Gemini, and
 `node tools/e2e/cloud-e2e.mjs http://localhost:8092 speech.wav` (fresh Chrome profile, fake microphone): Gemini Live
 connected in 2 s on gemini-3.5-transcribe-live, the spoken sentence on the Dashboard in 6 s, no key typed.
+
+# v6.15.0 update (night of 2026-10-13)
+
+Built on the Windows rig during a live meeting (so no DeckLink test of this build yet: device 8 was carrying the
+meeting through the operator's 6.14.0). What is new: the live word feed (`server/live-feed.js`, `appendText()` on both
+encoders), the persisted caption config (`DATA_DIR/caption-config.json`), the virtual output (`sourceKind:'virtual'`,
+`GET /api/inject/cdps`), and the one-session UI (Injection screen drives the app's speech session, Dashboard SDI pill,
+Output designer "SDI CC" hand-off, "Where the captions go" setups). CLAUDE.md "Live word feed and one caption session"
+has the details; the Web Presenter 4K software result (3.5 forwards 240/240, 4.2.x loses 36–50 %) is in addon note 20.
+
+Verified on the packaged exe (`Desktop\CommunityCaptioner-6.15.0`, `PORT=8092`): `/api/app/info` 6.15.0, `/api/caption/config`
+with `liveFeed: true`, `/api/context/capabilities`, `/api/inject/status` addonLoaded, and `node tools/e2e/live-feed-e2e.mjs
+--relay http://localhost:8092` (virtual output: three sentences as interims + finals over the session WebSocket, decoded
+from the CDPs with the CEA-608 model: every word shown, median word latency about 0.8 s). Unit tests: `node test/test-live-feed.mjs`
+(21), `node test/test-cea708.mjs` (123). First thing to do with a free DeckLink: Caption Injection → "YouTube through a Web
+Presenter 4K on software 3.5 …" setup, Speech engine Cloud, Start captioning, and watch a decoder (or `decklink_probe` on the
+loopback input 7) fill the roll-up rows word by word; then a fresh YouTube broadcast through the box on 3.5 with the
+stream's Closed captions set to Embedded 608/708, and read its caption track with `tools/sdi-verify/captions/yt-live-captions.mjs`.

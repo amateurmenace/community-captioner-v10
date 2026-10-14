@@ -12,6 +12,11 @@ SDI, the unit keeps only the first CEA-608 field-1 pair of each frame, and once 
 anything at all until the stream was stopped and started. A second encoder on the same SDI (OBS Studio with a DeckLink input)
 forwarded 100 % of the same data, so the SDI signal is not the cause.
 
+**Update, evening of 13 October: the loss is a regression in the 4.x software.** Downgrading the same unit to software 3.5 (the
+last release before 4.0) removed it completely: the numbered pattern arrived 240 of 240 pairs with all 60 control codes in two
+runs, every pair on the frame it was sent on, and 29 of 30 one-frame CEA-708 captions sent once each arrived. Software 4.2.2
+(tried first, on Blackmagic support's advice to downgrade) lost 47–48 %. See Evidence 3.
+
 ## Setup
 
 - Unit: Blackmagic Web Presenter 4K "Web Presenter Control Room", MAC 7C-2E-0D-A5-48-39, software 4.2.3. A second Web Presenter 4K
@@ -82,8 +87,31 @@ A numbered test pattern makes every surviving pair identify the frame it was sen
    restored forwarding. It began after a USB session with Blackmagic Streaming Setup 4.2.4; sending the one-frame CDP layouts
    while streaming or idle, and dropping the SDI while idle, did not reproduce it.
 
+## Evidence 3 (13 October, evening): software versions on the same unit
+
+Blackmagic support's reply to the report was to downgrade. The same numbered pattern (240 CEA-608 pairs, one per frame, with the
+60 control codes), the same SDI feed and the same decode of the unit's own output, on each software version:
+
+| Software | Output | Pattern pairs received | Control codes | Notes |
+|---|---|---:|---:|---|
+| 4.2.3 | RTMP | 153 / 240 | 26 / 60 | afternoon baseline (Evidence 2) |
+| 4.2.2 | RTMP | 113 / 240 | 36 / 60 | survivors shifted 1–7 frames from the frame they were sent on |
+| 4.2.2 | SRT | 116 / 240 | — | |
+| 3.5 | SRT | **240 / 240** | **60 / 60** | run 1, every pair on the frame it was sent on |
+| 3.5 | SRT | **240 / 240** | **60 / 60** | run 2, 12 minutes later; 29 of 30 one-frame CEA-708 captions sent once each also arrived (the miss coincided with other captions in the same window) |
+
+1. **3.5 forwards the SDI captions intact; 4.2.2 and 4.2.3 do not.** 4.1 was flashed but not measured; 4.0, 4.2 and 4.2.1 were
+   not tried. The loss is a regression in the 4.x stream path.
+2. Two 3.5 observations for the engineers: a "Custom URL H.264" platform with an rtmp:// destination set through the REST API
+   reports Streaming (about 176 kb/s) without ever opening a connection to the destination, while the same destination over SRT
+   streams normally (4.2.x connected over RTMP); and a livestream start sent through the REST API immediately after a platform
+   change is ignored, a second start a few seconds later works.
+3. The unit stays on 3.5, giving up the 4.x additions (stream timecode, 16-channel audio, HDR metadata), until a 4.x release
+   forwards captions.
+
 ## Questions for Blackmagic
 
+- Can the 4.x caption forwarding be fixed, and is there a build between 3.5 and 4.2.2 that still forwards captions intact?
 - What is the caption path between the SDI VANC reader and the H.264 SEI writer in 4.2.3, and why does it skip blocks of frames?
 - Why does the unit keep only the first field-1 pair of a frame and re-pack the CDP to 20 triplets, and why does a 31-triplet CDP
   stop forwarding until the stream is restarted?
@@ -102,5 +130,7 @@ Embedded captions stay on the SDI for in-room decoders.
 - `obs-cap1.csv` — the per-frame decode of the OBS control run (240/240); `wp-v423b.csv` — the Web Presenter run of the same hour
   (153/240); `wp-wedge-N19.csv` — 19 field-1 pairs per CDP sent, one per frame received; `wp-v423a.csv` — the stream with cc_count 0
   on every frame.
-- The scripts that produced them (`sei-cc.mjs`, `wp-pattern.mjs`, `pattern-analyze.mjs`) are in the open-source Community Captioner
-  repository, `tools/sdi-verify/captions/`.
+- `firmware-2026-10-13/`: the per-frame decodes of the software trials — `wp-v423b.csv` (4.2.3), `wp-v422a.csv` and
+  `wp-v422srt.csv` (4.2.2 RTMP / SRT), `wp-v35s.csv` and `wp-v35b.csv` (3.5, two runs), `schedule-A35.json` (the one-frame 708 run).
+- The scripts that produced them (`sei-cc.mjs`, `wp-pattern.mjs`, `pattern-analyze.mjs`, `wp-control.mjs`, `dtvcc-display.mjs`) are in
+  the open-source Community Captioner repository, `tools/sdi-verify/captions/`.

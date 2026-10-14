@@ -153,6 +153,7 @@ export class Cea608Encoder {
         this._lastFrame = [NULL_PAIR];
         this._displayed = false; // something is on screen (for the hold/EDM logic)
         this._idleFrames = 0;    // frames drained with nothing to send since the last caption data
+        this._liveCol = 0;       // live feed (appendText): column after the last character on the bottom row, 0 = next word starts a row
         this.setRollupRows(options.rollupRows ?? 2);
         this.setPacing(options.paceFrames ?? 1, options.repeat ?? 1);
         if (options.style) this.setStyle(options.style);
@@ -255,6 +256,60 @@ export class Cea608Encoder {
         return out;
     }
 
+    /** The control codes that start a roll-up row: RUx, then PAC once (rollup) or CR + PAC (rollup_pac), as _captionPairs sends them. */
+    _rowPrefix() {
+        const out = [...this._control(this._rollupCode())];
+        if (this.style === 'rollup_pac') {
+            out.push(...this._control(CTRL.CR), ...this._control(CTRL.PAC));
+        } else {
+            if (!this.initialized) { this.initialized = true; out.push(...this._control(CTRL.PAC)); }
+            out.push(...this._control(CTRL.CR));
+        }
+        return out;
+    }
+
+    /**
+     * Live feed: append words to the bottom row right away, without waiting for the
+     * rest of the caption (server/live-feed.js decides which words are safe to send).
+     * Roll-up styles only — pop-on and paint-on show whole captions, so there the words
+     * go out as a caption of their own. The first word of a row is preceded by the
+     * usual RUx [CR] [PAC] prefix, later words continue on the same row after a space,
+     * and a word that would run past column 32 starts a new row (words longer than a
+     * row are split). endLine() makes the next word start a new row.
+     */
+    appendText(text) {
+        const words = String(text || '').trim().split(/\s+/).filter(Boolean);
+        if (!words.length) return;
+        if (this.style === 'popon' || this.style === 'painton') { this.enqueueText(words.join(' ')); return; }
+        const out = [];
+        for (const word of words) {
+            const pieces = [];
+            let rest = word;
+            while (rest.length > CEA608_COLUMNS) { pieces.push(rest.slice(0, CEA608_COLUMNS)); rest = rest.slice(CEA608_COLUMNS); }
+            pieces.push(rest);
+            for (const piece of pieces) {
+                const need = (this._liveCol > 0 ? 1 : 0) + piece.length;
+                if (this._liveCol > 0 && this._liveCol + need > CEA608_COLUMNS) this._liveCol = 0;   // wrap to a new row
+                if (this._liveCol === 0) {
+                    out.push(...this._rowPrefix(), ...textPairs(piece));
+                    this._liveCol = piece.length;
+                } else {
+                    out.push(...textPairs(' ' + piece));
+                    this._liveCol += need;
+                }
+            }
+        }
+        this._queue(out);
+        this._displayed = true;
+        this._idleFrames = 0;
+    }
+
+    /** Live feed: the next appended word starts a new row. */
+    endLine() { this._liveCol = 0; }
+
+    /** Live feed: column of the next character on the bottom row (0 = a new row starts next). */
+    get liveColumn() { return this._liveCol; }
+
     /** Queue the pairs of one caption as frames (one pair per frame, or packed with copies in one-frame mode). */
     _queue(pairs) {
         if (!pairs.length) return;
@@ -289,6 +344,7 @@ export class Cea608Encoder {
         } else {
             this._queue(this._captionPairs(rows));
         }
+        this._liveCol = 0;
         this._displayed = true;
         this._idleFrames = 0;
     }
@@ -301,6 +357,7 @@ export class Cea608Encoder {
         this._queue(this._control(CTRL.EDM));
         this.initialized = false;
         this._displayed = false;
+        this._liveCol = 0;
     }
 
     /**
@@ -365,5 +422,6 @@ export class Cea608Encoder {
         this._lastFrame = [NULL_PAIR];
         this._displayed = false;
         this._idleFrames = 0;
+        this._liveCol = 0;
     }
 }

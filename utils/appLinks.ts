@@ -18,4 +18,4 @@ export const MAC_DOWNLOAD_URL = `${GITHUB_REPO_URL}/releases/download/v10.1/Comm
 //          NDI → SDI passthrough (needs NDI Tools / the NDI Runtime) with audio from any PC input,
 //          CEA-608 rows that roll, CEA-708 with the self-positioned continuous redraw (the default transport since 6.13.1)
 //          that survives the Web Presenter's frame loss, a working YouTube caption-ingestion POST; local AI on CPU or NVIDIA.
-export const WINDOWS_DOWNLOAD_URL = `${GITHUB_REPO_URL}/releases/download/v10.1/Community-Captioner-6.14.0-windows-x64.zip`;
+export const WINDOWS_DOWNLOAD_URL = `${GITHUB_REPO_URL}/releases/download/v10.1/Community-Captioner-6.15.0-windows-x64.zip`;

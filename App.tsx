@@ -312,7 +312,7 @@ function App() {
   // Cloud mode or the Dashboard, or closes Help & Settings without saving.
   useEffect(() => {
       if (!pendingCloudStartRef.current) return;
-      if (appState.mode !== 'cloud' || appState.view !== 'dashboard') { pendingCloudStartRef.current = false; return; }
+      if (appState.mode !== 'cloud' || !(['dashboard', 'caption_injection'] as string[]).includes(appState.view)) { pendingCloudStartRef.current = false; return; }
       if (!appState.apiKey || appState.isRecording) return;
       pendingCloudStartRef.current = false;
       diagLog('info', `Gemini key ${appState.apiKeySource === 'server' ? 'from the relay' : 'saved'} — starting the Cloud session that was waiting for it`);
@@ -1457,6 +1457,7 @@ function App() {
             onOpenContext={() => setShowContextModal(true)}
             onEndSession={handleEndSession}
             openObsView={() => setShowOutputModal(true)}
+            onOpenInjection={() => setAppState(p => ({ ...p, view: 'caption_injection' }))}
             targetLanguage={appState.targetLanguage}
             setTargetLanguage={(v) => setAppState(p => ({...p, targetLanguage: v}))}
             goHome={() => setAppState(prev => ({ ...prev, view: 'landing' }))}
@@ -1523,6 +1524,16 @@ function App() {
           <CaptionInjection
               onBack={() => setAppState(p => ({...p, view: 'choice'}))}
               apiKey={appState.apiKey}
+              session={{
+                  mode: appState.mode,
+                  setMode: (v) => setAppState(p => ({ ...p, mode: v })),
+                  isRecording: appState.isRecording,
+                  setIsRecording: (v) => setAppState(p => ({ ...p, isRecording: v })),
+                  interimText: appState.interimText,
+                  captions: appState.captions,
+                  lastNotification: appState.notifications.length ? appState.notifications[appState.notifications.length - 1] : null,
+              }}
+              onOpenDashboard={() => setAppState(p => ({ ...p, view: 'dashboard' }))}
           />
       )}
 
@@ -1562,6 +1573,7 @@ function App() {
              outputMode={appState.outputMode}
              setOutputMode={(v) => setAppState(p => ({...p, outputMode: v}))}
              onClose={() => setShowOutputModal(false)}
+             onOpenInjection={() => { setShowOutputModal(false); setAppState(p => ({ ...p, view: 'caption_injection' })); }}
              onLaunch={handleLaunchOutput}
              previewText={getLastCaptionText()}
              cea708Enabled={appState.cea708Enabled}

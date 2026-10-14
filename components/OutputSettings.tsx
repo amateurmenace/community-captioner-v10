@@ -23,9 +23,11 @@ interface OutputSettingsProps {
   cea708Enabled: boolean;
   setCea708Enabled: (v: boolean) => void;
   onCea708Clear?: () => void;
+  /** Opens the Caption Injection screen, which owns the embedded SDI / NDI captions; the old DeckLink panel below is shown only without it */
+  onOpenInjection?: () => void;
 }
 
-const OutputSettings: React.FC<OutputSettingsProps> = ({ settings, setSettings, onClose, onLaunch, outputMode, setOutputMode, previewText, cea708Enabled, setCea708Enabled, onCea708Clear }) => {
+const OutputSettings: React.FC<OutputSettingsProps> = ({ settings, setSettings, onClose, onLaunch, outputMode, setOutputMode, previewText, cea708Enabled, setCea708Enabled, onCea708Clear, onOpenInjection }) => {
 
   const canvasRef = useRef<HTMLDivElement>(null);
   const [isDragging, setIsDragging] = useState(false);
@@ -255,7 +257,15 @@ const OutputSettings: React.FC<OutputSettingsProps> = ({ settings, setSettings, 
                 </div>
             </div>
 
-            {outputMode === 'sdi_cea708' && hasDeckLink && (
+            {outputMode === 'sdi_cea708' && onOpenInjection && (
+                <div className="p-4 rounded-xl border border-sage-300 bg-sage-50 space-y-3">
+                    <p className="text-sm font-bold text-forest-dark">Embedded SDI / NDI captions live on the Caption Injection screen</p>
+                    <p className="text-xs text-stone-600 leading-relaxed">That screen holds the video source, the DeckLink output, the caption form (CEA-608 roll-up or pop-on, CEA-708) and the same speech session as this dashboard. Whatever you caption here is embedded there as long as its injection is running.</p>
+                    <button onClick={onOpenInjection} className="w-full py-2.5 rounded-lg bg-forest-dark text-white text-sm font-bold hover:bg-forest-light transition-colors">Open Caption Injection</button>
+                </div>
+            )}
+
+            {outputMode === 'sdi_cea708' && hasDeckLink && !onOpenInjection && (
                 <>
                     {/* DeckLink Output Device */}
                     <div>

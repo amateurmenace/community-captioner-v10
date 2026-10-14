@@ -95,7 +95,67 @@ export class DtvccEncoder {
         this._blankRedrawsLeft = 0;
         this._repaintCount = 0;
         this._classicRowsWritten = 0;
+        this._liveCol = 0;          // live feed (appendText), classic mode: column after the last character on the bottom row
+        this._liveOpen = false;     // live feed, redraw roll-up: the bottom row of the window may still be extended
     }
+
+    /**
+     * Live feed: append words to the bottom row right away (see server/live-feed.js).
+     * Roll-up style only: in classic mode the words are written at the pen position (a
+     * CR first when they would run past column 32); in redraw mode the window's bottom
+     * row is extended (or a new row scrolls in) and the window is re-sent. Pop-on,
+     * youtube and atomic styles show whole captions, so there the words become a
+     * caption of their own.
+     */
+    appendText(text) {
+        const words = String(text || '').trim().split(/\s+/).filter(Boolean);
+        if (!words.length) return;
+        if (this._style !== 'rollup') { this.enqueueText(words.join(' ')); return; }
+        const pieces = [];
+        const width = this._repaintFrames > 0 ? this.columns : CEA608_COLUMNS;
+        for (const word of words) {
+            let rest = word;
+            while (rest.length > width) { pieces.push(rest.slice(0, width)); rest = rest.slice(width); }
+            pieces.push(rest);
+        }
+        if (this._repaintFrames > 0) {
+            for (const piece of pieces) {
+                const last = this._lines.length ? this._lines[this._lines.length - 1] : '';
+                if (this._liveOpen && this._lines.length && last.length + 1 + piece.length <= width) {
+                    this._lines[this._lines.length - 1] = last + ' ' + piece;
+                } else {
+                    this._lines.push(piece);
+                    while (this._lines.length > this._rows) this._lines.shift();
+                }
+                this._liveOpen = true;
+            }
+            this._blankRedrawsLeft = 0;
+            this._queueRedraw(!this._windowDefined, false);
+            return;
+        }
+        const block = [];
+        if (!this._windowDefined) { block.push(...this._buildDefineWindow()); this._windowDefined = true; }
+        block.push(CMD.CW0);
+        const put = (s) => { for (let i = 0; i < s.length; i++) { const code = s.charCodeAt(i); block.push(code >= 0x20 && code <= 0x7E ? code : 0x20); } };
+        for (const piece of pieces) {
+            const need = (this._liveCol > 0 ? 1 : 0) + piece.length;
+            if (this._liveCol > 0 && this._liveCol + need > width) this._liveCol = 0;
+            if (this._liveCol === 0) {
+                if (this._classicRowsWritten > 0) block.push(CMD.CR);
+                this._classicRowsWritten++;
+                put(piece);
+                this._liveCol = piece.length;
+            } else {
+                put(' ' + piece);
+                this._liveCol += need;
+            }
+        }
+        block.push(CMD.ETX);
+        this.blockQueue.push(block);
+    }
+
+    /** Live feed: the next appended word starts a new row. */
+    endLine() { this._liveCol = 0; this._liveOpen = false; }
 
     /** Re-send the full window every `frames` frames (0 = classic roll-up, no redraws). */
     setRepaint(frames) {
@@ -422,6 +482,8 @@ export class DtvccEncoder {
         }
         this._lastEnqueuedText = trimmed;
         this._lastEnqueuedTime = now;
+        this._liveCol = 0;
+        this._liveOpen = false;
 
         if (this._repaintFrames > 0) {
             // Redraw mode: new rows scroll in at the bottom (roll-up) or replace the window
@@ -480,6 +542,8 @@ export class DtvccEncoder {
      */
     enqueueClear() {
         this._lines = [];
+        this._liveCol = 0;
+        this._liveOpen = false;
         if (this._repaintFrames > 0) {
             if (this._style === 'popon' || this._style === 'youtube' || this._style === 'atomic') {
                 // hide the window(s), repeated for the copies
@@ -597,5 +661,7 @@ export class DtvccEncoder {
         this._classicRowsWritten = 0;
         this._win = 1;
         this._atomicQueue = [];
+        this._liveCol = 0;
+        this._liveOpen = false;
     }
 }

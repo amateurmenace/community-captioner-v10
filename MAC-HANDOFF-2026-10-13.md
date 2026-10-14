@@ -1,9 +1,26 @@
-# Mac handoff — Windows session of 13 October 2026 (6.14.0)
+# Mac handoff — Windows session of 13 October 2026 (6.14.0, then 6.15.0 the same night)
 
 Paste into the Mac Claude session after `git pull`. Everything below is on `main`; the Windows build
-6.14.0 is attached to release v10.1. The Mac app needs a rebuild to pick up the shared changes; the
+6.15.0 is attached to release v10.1. The Mac app needs a rebuild to pick up the shared changes; the
 native addon did NOT change, so the addon built for Mac 6.13.3 can be reused (`npm run build:native`
 is still the safe default when a DeckLink SDK is present).
+
+## 6.15.0 on top of 6.14.0 (read CLAUDE.md "Live word feed and one caption session" first)
+
+- `server/live-feed.js` (new) + `appendText()` on both encoders: interim words that the recognizer has
+  stopped revising are appended to the roll-up encoders at once (CEA-608 rollup/rollup_pac, CEA-708
+  rollup), so captions stream a second behind the speaker instead of a block per sentence. Config keys
+  `liveFeed` (default true), `liveFeedStable`, `liveFeedHold`, `liveFeedBreak`. Tests: `node test/test-live-feed.mjs`
+  (21), `node test/test-cea708.mjs` (123), `node tools/e2e/live-feed-e2e.mjs --spawn` (virtual output, no hardware).
+- The caption config persists in `DATA_DIR/caption-config.json`; `POST /api/inject/start {sourceKind:'virtual'}` +
+  `GET /api/inject/cdps` run the frame loop without a DeckLink.
+- UI: the Caption Injection screen drives the app's own session (five speech engines, Start/Stop, mirrors
+  interims/finals to the relay while on view), has the "Where the captions go" setups, live-roll-up checkbox;
+  the Dashboard has an SDI pill; the Output designer's "SDI CC" tab opens Caption Injection. The Web Presenter
+  4K on software 3.5 forwards every caption frame (240/240 twice); 4.2.2 and 4.2.3 drop 36–50 %.
+- Mac checks after the rebuild: the three test commands above against the packaged binary on a spare port
+  (`node tools/e2e/live-feed-e2e.mjs --relay http://localhost:8090` without `--spawn`), `GET /api/caption/config`
+  shows `liveFeed: true`, and with a DeckLink the roll-up on a decoder fills word by word.
 
 ## What changed (shared code — read CLAUDE.md addon note 20 and the "Gemini models" / "Cloud mode and
 ## the Gemini key" sections first)

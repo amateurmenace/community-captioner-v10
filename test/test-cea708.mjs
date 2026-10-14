@@ -526,6 +526,90 @@ try {
 }
 
 // ─────────────────────────────────────────────
+// Live feed: appendText on both encoders
+// ─────────────────────────────────────────────
+console.log('\n═══ Live feed (appendText) ═══');
+{
+    const { Cea608Decoder } = await import('../tools/sdi-verify/captions/cea608-model.mjs');
+    const { DtvccEncoder } = await import('../server/cea708/dtvcc-encoder.js');
+    const drainAll = (e) => { const out = []; while (e.queueLength > 0) out.push(...e.drainPairs()); return out; };
+    const rowsOf = (dec) => dec.display().filter(Boolean);
+    // the decoder model takes [cc1, cc2] arrays per pair
+    const decoderOf = () => { const d = new Cea608Decoder(); const feed = d.feedFrame.bind(d); d.feedFrame = (pairs) => feed(pairs.map(p => Array.isArray(p) ? p : [p.cc1, p.cc2])); return d; };
+
+    const e = new Cea608Encoder({ style: 'rollup_pac' });
+    const dec = decoderOf();
+    e.appendText('so welcome');
+    let pairs = drainAll(e);
+    assert(pairs.length === 6 + 5, 'appendText: the first words of a row go out as RU2 RU2 CR CR PAC PAC + text ("so welcome" = 5 pairs)');
+    dec.feedFrame(pairs);
+    assert(rowsOf(dec).join('|') === 'so welcome', `decoder shows the first words: ${JSON.stringify(rowsOf(dec))}`);
+    e.appendText('to the');
+    pairs = drainAll(e);
+    assert(pairs.length === 4 && pairs.every(p => (p.cc1 & 0x7F) >= 0x20), 'later words continue the row after a space with no control codes (" to the" = 4 pairs)');
+    dec.feedFrame(pairs);
+    assert(rowsOf(dec).join('|') === 'so welcome to the', 'the row grows in place');
+    assert(e.liveColumn === 17, 'the live column tracks the row (17 characters)');
+    e.appendText('advisory committee meeting of tonight');
+    dec.feedFrame(drainAll(e));
+    assert(rowsOf(dec).join('|') === 'so welcome to the advisory|committee meeting of tonight', `a word that would pass column 32 starts a new row: ${JSON.stringify(rowsOf(dec))}`);
+    e.endLine();
+    e.appendText('next');
+    dec.feedFrame(drainAll(e));
+    assert(rowsOf(dec).join('|') === 'committee meeting of tonight|next', 'endLine() makes the next word start a row, and a 2-row roll-up scrolls');
+    e.appendText('supercalifragilisticexpialidociousness');
+    dec.feedFrame(drainAll(e));
+    assert(rowsOf(dec).join('|') === 'supercalifragilisticexpialidocio|usness', `a word longer than a row is split: ${JSON.stringify(rowsOf(dec))}`);
+    e.enqueueText('whole caption');
+    dec.feedFrame(drainAll(e));
+    assert(e.liveColumn === 0 && rowsOf(dec).join('|') === 'usness|whole caption', 'enqueueText closes the live row and sends its rows as before');
+    e.enqueueClear();
+    dec.feedFrame(drainAll(e));
+    assert(rowsOf(dec).length === 0, 'enqueueClear erases the display');
+
+    // the PAC-once roll-up style sends the PAC only with the first row after start/clear
+    const e2 = new Cea608Encoder({ style: 'rollup' });
+    e2.appendText('one');
+    const first = drainAll(e2);
+    e2.appendText('two three four five six seven eight nine ten');
+    const second = drainAll(e2);
+    const pacs = (ps) => ps.filter(p => (p.cc1 & 0x7F) === 0x14 && (p.cc2 & 0x7F) === 0x70).length;
+    assert(pacs(first) === 2 && pacs(second) === 0, 'rollup (PAC once): PAC with the first row only, CR on wraps');
+
+    // pop-on falls back to whole captions
+    const e3 = new Cea608Encoder({ style: 'popon' });
+    e3.appendText('pop on words');
+    const p3 = drainAll(e3);
+    assert((p3[0].cc2 & 0x7F) === 0x20 && (p3[p3.length - 1].cc2 & 0x7F) === 0x2F, 'pop-on style: appended words become a pop-on caption (RCL … EOC)');
+
+    // CEA-708 classic roll-up: words at the pen position, CR only on wraps
+    const d = new DtvccEncoder();
+    d.setRepaint(0);
+    // service-block payloads (the 0x20+n block headers stripped), then the printable characters
+    const bytesOf = (enc) => { const out = []; let b; while ((b = enc.drainFrame(35))) { let i = 0; while (i < b.length) { const n = b[i] & 0x1F; out.push(...b.slice(i + 1, i + 1 + n)); i += 1 + n; } } return out; };
+    const text = (bytes) => String.fromCharCode(...bytes.filter(x => x >= 0x20 && x <= 0x7E));
+    d.appendText('hello');
+    let b = bytesOf(d);
+    assert(b.includes(0x98) && b.includes(0x80) && text(b).endsWith('hello') && !b.slice(b.indexOf(0x80)).includes(0x0D), 'CEA-708 classic: DefineWindow, SetCurrentWindow 0, the word, no CR for the first row');
+    d.appendText('world');
+    b = bytesOf(d);
+    assert(text(b) === ' world' && !b.includes(0x0D), 'CEA-708 classic: the next word continues the row after a space');
+    d.appendText('this is a much longer phrase here');
+    b = bytesOf(d);
+    assert(b.includes(0x0D) && text(b).includes('longer phrase here'), 'CEA-708 classic: a CR precedes the words that wrap to a new row');
+
+    // CEA-708 redraw roll-up: the window's bottom row is extended and re-sent
+    const d2 = new DtvccEncoder();
+    d2.setRepaint(1);
+    d2.setRedraw({ style: 'rollup', keepAlive: true, repeat: 1, rowErase: 'hcr' });
+    d2.appendText('first');
+    d2.appendText('words');
+    assert(d2._lines.length === 1 && d2._lines[0] === 'first words', `redraw roll-up: the bottom row of the window grows: ${JSON.stringify(d2._lines)}`);
+    d2.appendText('and then a second row of text');
+    assert(d2._lines.length === 2 && d2._lines[0] === 'first words and then a' && d2._lines[1] === 'second row of text', `redraw roll-up: wraps into a second row: ${JSON.stringify(d2._lines)}`);
+}
+
+// ─────────────────────────────────────────────
 // Summary
 // ─────────────────────────────────────────────
 console.log(`\n${'═'.repeat(40)}`);

@@ -1,8 +1,8 @@
-// wp-control.mjs — point a Blackmagic Web Presenter 4K (software 4.2+) at a local RTMP
-// receiver for caption captures, and put it back, through its REST API.
+// wp-control.mjs — point a Blackmagic Web Presenter 4K (software 3.4+) at a local RTMP or
+// SRT receiver for caption captures, and put it back, through its REST API.
 //
 //   node wp-control.mjs <host> status
-//   node wp-control.mjs <host> capture-on  <rtmp://pc-ip:1935/live> [key] [quality]   # saves the current platform to wp-saved-<host>.json; quality = Streaming High (default) | Streaming Medium | Streaming Low
+//   node wp-control.mjs <host> capture-on  <rtmp://pc-ip:1935/live | srt://pc-ip:9710> [key] [quality]   # saves the current platform to wp-saved-<host>.json; quality = Streaming High (default) | Streaming Medium | Streaming Low
 //   node wp-control.mjs <host> capture-off                                  # restores the saved platform (stream key included)
 //   node wp-control.mjs <host> start | stop
 //
@@ -12,7 +12,12 @@
 // stream key — keep it out of the repository (it is written in the working directory).
 // (A custom platform XML uploaded through /livestreams/customPlatforms registers and lists
 // its server, but PUT activePlatform answered "Invalid server provided" for it on 4.2.3.)
-// The receiver: ffmpeg -listen 1 -i rtmp://0.0.0.0:1935/live/<key> -c copy cap.ts
+// Receivers: ffmpeg -listen 1 -i rtmp://0.0.0.0:1935/live/<key> -c copy cap.ts
+//            ffmpeg -i "srt://0.0.0.0:9710?mode=listener" -c copy cap.ts
+// Software 3.5 (measured 2026-10-13): an rtmp:// custom URL reports "Streaming" at ~176 kb/s
+// but never connects to the receiver — use srt:// on 3.5 (4.2.x connected over RTMP); and a
+// start sent right after a platform change is ignored (status stays Idle), so startStream()
+// below re-sends it once the status has been read back.
 import { readFileSync, writeFileSync, existsSync } from 'node:fs';
 
 const [host, cmd, ...rest] = process.argv.slice(2);
@@ -26,6 +31,17 @@ async function put(p, body, type = 'application/json') {
     return r.status;
 }
 const redact = (o) => ({ ...o, key: o.key ? `<${String(o.key).length} chars>` : o.key });
+// Start the stream and read the status back; 3.5 drops a start sent right after a platform change, so send it again when the unit stays Idle.
+async function startStream() {
+    await put('livestreams/0/start', {});
+    for (let i = 0; i < 2; i++) {
+        await new Promise(r => setTimeout(r, 5000));
+        const s = await get('livestreams/0');
+        if (s.status === 'Streaming' || s.status === 'Connecting') return s;
+        await put('livestreams/0/start', {});
+    }
+    return get('livestreams/0');
+}
 
 if (cmd === 'status') {
     const [s, p, prod] = await Promise.all([get('livestreams/0'), get('livestreams/0/activePlatform'), get('system/product')]);
@@ -40,9 +56,8 @@ if (cmd === 'status') {
     try { await put('livestreams/0/stop', {}); await new Promise(r => setTimeout(r, 3000)); } catch {}
     // the built-in "Custom URL H.264" platform takes the destination directly (server "Custom" + url)
     await put('livestreams/0/activePlatform', { platform: 'Custom URL H.264', server: 'Custom', url, key, quality });
-    await put('livestreams/0/start', {});
-    await new Promise(r => setTimeout(r, 5000));
-    console.log(`streaming to ${url}/${key}; status:`, JSON.stringify(await get('livestreams/0')));
+    const s = await startStream();
+    console.log(`streaming to ${url}/${key}; status:`, JSON.stringify(s));
 } else if (cmd === 'capture-off') {
     if (!existsSync(saved)) throw new Error(`${saved} not found — nothing to restore`);
     const prev = JSON.parse(readFileSync(saved, 'utf8'));
@@ -50,8 +65,10 @@ if (cmd === 'status') {
     await new Promise(r => setTimeout(r, 3000));   // a platform change right after stop is refused
     await put('livestreams/0/activePlatform', prev);
     console.log(`restored ${JSON.stringify(redact(prev))} (not started); status:`, JSON.stringify(await get('livestreams/0')));
-} else if (cmd === 'start' || cmd === 'stop') {
-    await put(`livestreams/0/${cmd}`, {});
+} else if (cmd === 'start') {
+    console.log(JSON.stringify(await startStream()));
+} else if (cmd === 'stop') {
+    await put('livestreams/0/stop', {});
     console.log(JSON.stringify(await get('livestreams/0')));
 } else {
     throw new Error(`unknown command ${cmd}`);

@@ -12,6 +12,7 @@ import { feedText as learnerFeedText, setApiKey as setLearnerApiKey, setEnabled 
 import { translateCaption, setApiKey as setTranslationApiKey, getSupportedLanguages, getCacheStats as getTranslationStats, translationAvailable } from './translation-service.js';
 import { getSystemMetrics } from './system-metrics.js';
 import { configureObsCaptions, getObsCaptionStatus, sendObsCaption, refreshObsStreaming } from './obs-captions.js';
+import { LiveFeed } from './live-feed.js';
 import { appendFileSync as fsAppendFileSync, statSync as fsStatSync, truncateSync as fsTruncateSync, readFileSync as fsReadFileSync } from 'fs';
 
 // ---------------------------------------------------------------------------
@@ -216,7 +217,44 @@ let captionConfig = {
     dtvccRowErase: 'hcr',
     dtvccColumns: 0,
     dtvccDefineOnChange: true,
+    // Live feed (server/live-feed.js): words of the interim transcript that the recognizer has
+    // stopped revising are appended to the roll-up encoders at once instead of waiting for the
+    // final caption — the way broadcast captioners stream text. Verbatim strategy and roll-up
+    // styles only; pop-on and one-frame transports keep sending whole finals. liveFeedStable =
+    // identical interims a word must survive, liveFeedHold = words at the end of the interim
+    // that are never sent yet (the word being spoken), liveFeedBreak = end the row at each final.
+    liveFeed: true,
+    liveFeedStable: 3,
+    liveFeedHold: 1,
+    liveFeedBreak: false,
 };
+
+// The config is saved next to the data folder on every change and loaded at startup, so a
+// restart of the packaged app keeps the operator's encoding settings (it used to reset them).
+const CAPTION_CONFIG_FILE = path.join(path.dirname(LOCAL_DIR), 'caption-config.json');
+function saveCaptionConfig() {
+    try { fs.writeFileSync(CAPTION_CONFIG_FILE, JSON.stringify(captionConfig, null, 2)); }
+    catch (e) { console.warn('[Caption Config] save failed:', e.message); }
+}
+function loadCaptionConfig() {
+    try {
+        if (!fs.existsSync(CAPTION_CONFIG_FILE)) return;
+        const saved = JSON.parse(fs.readFileSync(CAPTION_CONFIG_FILE, 'utf8'));
+        let n = 0;
+        for (const k of Object.keys(captionConfig)) {
+            if (k in saved && typeof saved[k] === typeof captionConfig[k]) { captionConfig[k] = saved[k]; n++; }
+        }
+        console.log(`[Caption Config] Loaded ${n} settings from ${CAPTION_CONFIG_FILE}`);
+    } catch (e) { console.warn('[Caption Config] load failed:', e.message); }
+}
+loadCaptionConfig();
+
+// Virtual output (sourceKind 'virtual' on /api/inject/start): the frame loop runs without a
+// DeckLink and keeps the CDPs of the last frames for GET /api/inject/cdps, so the whole
+// caption path (WebSocket → live feed → encoders → CDP) can be tested on any machine.
+let virtualCdps = [];
+let virtualBase = 0;
+let virtualFrame = 0;
 
 function applyCea608Transport() {
     if (cea708Builder) cea708Builder.svcInfoEvery = captionConfig.cdpSvcInfoEvery || 0;
@@ -493,7 +531,8 @@ function startFrameLoop(frameRate = '29.97') {
     let debugCounter = 0;
     let activeFrames = 0;
     captionFrameInterval = setInterval(() => {
-        if (!cea708Builder || !decklink) return;
+        const virtual = deckLinkMode === 'inject_virtual';
+        if (!cea708Builder || (!decklink && !virtual)) return;
 
         let cdp;
         let isActive = false;
@@ -516,7 +555,13 @@ function startFrameLoop(frameRate = '29.97') {
         }
 
         if (isActive) activeFrames++;
-        try { decklink.pushCDP(Buffer.from(cdp)); } catch (e) {}
+        if (virtual) {
+            virtualCdps.push(Buffer.from(cdp).toString('hex'));
+            virtualFrame++;
+            if (virtualCdps.length > 6000) { virtualCdps.splice(0, 1000); virtualBase += 1000; }
+        } else {
+            try { decklink.pushCDP(Buffer.from(cdp)); } catch (e) {}
+        }
         debugCounter++;
         if (debugCounter % (Math.round(fps) * 5) === 0) {
             const qLen = captionConfig.encodingMode === 'dtvcc'
@@ -536,6 +581,35 @@ function stopFrameLoop() {
         captionFrameInterval = null;
         console.log('[CEA-708] Frame loop stopped');
     }
+}
+
+// --- Live feed: interim words → roll-up encoders (server/live-feed.js) ---
+const liveFeedState = new LiveFeed({ stable: captionConfig.liveFeedStable, holdLastWords: captionConfig.liveFeedHold });
+let liveFeedChunks = 0;
+// The encoders that take appended words right now: roll-up styles, verbatim strategy, output running.
+function liveFeedTargets() {
+    if (!deckLinkRunning || !captionConfig.liveFeed || captionConfig.captionStrategy !== 'verbatim') return [];
+    const out = [];
+    if (captionConfig.encodingMode === 'dtvcc') {
+        if (dtvccEncoder && captionConfig.dtvccStyle === 'rollup') out.push({ name: 'cea708', enc: dtvccEncoder });
+        if (cea608Encoder && captionConfig.cea608InDtvcc && /^rollup/.test(captionConfig.cea608Style)) out.push({ name: 'cea608', enc: cea608Encoder });
+    } else if (cea608Encoder && /^rollup/.test(captionConfig.cea608Style)) {
+        out.push({ name: 'cea608', enc: cea608Encoder });
+    }
+    return out;
+}
+// An interim transcript of the current utterance: the words that have stopped changing go on air now.
+function liveFeedInterim(text) {
+    const targets = liveFeedTargets();
+    if (!targets.length) { if (liveFeedState.committedCount) liveFeedState.reset(); return; }
+    const words = liveFeedState.interim(text);
+    if (!words.length) return;
+    let chunk = words.join(' ');
+    if (captionConfig.profanityFilter) chunk = filterProfanity(chunk);
+    chunk = applyCorrections(chunk, correctionIndex, { sensitivity: correctionSensitivity }).text;
+    for (const t of targets) t.enc.appendText(chunk);
+    liveFeedChunks++;
+    if (liveFeedChunks % 25 === 1) console.log(`[Live feed] +"${chunk}" (${liveFeedState.committedCount} words of this utterance on air)`);
 }
 
 // Feed caption text into the active encoder based on captionConfig.
@@ -596,19 +670,31 @@ function feedCaptionToEncoder(captionData) {
             captionMetrics.totalEncoded++;
 
             if (processed) {
+                // Live feed: the words of this utterance that are already on air stay; only the
+                // rest of the final is appended (and the row closed when liveFeedBreak is on).
+                const live = liveFeedTargets();
+                const liveNames = new Set(live.map(t => t.name));
+                if (live.length) {
+                    const tail = liveFeedState.final(processed);
+                    if (tail.length) for (const t of live) t.enc.appendText(tail.join(' '));
+                    if (captionConfig.liveFeedBreak) for (const t of live) t.enc.endLine();
+                } else if (liveFeedState.committedCount) {
+                    liveFeedState.reset();
+                }
                 // In DTVCC mode, feed BOTH encoders for backward compatibility
                 if (captionConfig.encodingMode === 'dtvcc') {
-                    if (dtvccEncoder) dtvccEncoder.enqueueText(processed);
-                    if (cea608Encoder && captionConfig.cea608InDtvcc) cea608Encoder.enqueueText(processed);
+                    if (dtvccEncoder && !liveNames.has('cea708')) dtvccEncoder.enqueueText(processed);
+                    if (cea608Encoder && captionConfig.cea608InDtvcc && !liveNames.has('cea608')) cea608Encoder.enqueueText(processed);
                 } else {
-                    if (cea608Encoder) cea608Encoder.enqueueText(processed);
+                    if (cea608Encoder && !liveNames.has('cea608')) cea608Encoder.enqueueText(processed);
                 }
-                console.log(`[CEA-708 ENCODE] [${captionConfig.encodingMode}/${strategy}] "${processed.slice(0,80)}"`);
+                console.log(`[CEA-708 ENCODE] [${captionConfig.encodingMode}/${strategy}${live.length ? '/live' : ''}] "${processed.slice(0,80)}"`);
             }
         })();
     } else if (captionData.type === 'cea708_clear') {
         if (cea608Encoder) cea608Encoder.enqueueClear();
         if (dtvccEncoder) dtvccEncoder.enqueueClear();
+        liveFeedState.reset();
     }
 }
 
@@ -819,7 +905,8 @@ app.post('/api/decklink/clear', (req, res) => {
 //   encodingMode?: 'cea608' | 'dtvcc',
 // }
 app.post('/api/inject/start', async (req, res) => {
-    if (!decklink) {
+    const virtual = req.body?.sourceKind === 'virtual';
+    if (!decklink && !virtual) {
         return res.status(400).json({ ok: false, error: 'DeckLink addon not loaded — install Blackmagic Desktop Video and place decklink_addon.node next to the executable.' });
     }
     const {
@@ -842,11 +929,12 @@ app.post('/api/inject/start', async (req, res) => {
     try {
         if (deckLinkRunning) {
             stopFrameLoop();
-            decklink.stopOutput();
+            if (decklink && deckLinkMode !== 'inject_virtual') decklink.stopOutput();
             deckLinkRunning = false;
             if (cea608Encoder) cea608Encoder.reset();
             if (dtvccEncoder) dtvccEncoder.reset();
             if (cea708Builder) cea708Builder.reset();
+            liveFeedState.reset();
         }
     } catch (e) {
         console.warn('[Inject] Stop during restart failed:', e.message);
@@ -854,11 +942,16 @@ app.post('/api/inject/start', async (req, res) => {
 
     try {
         await initCaptionEncoder();
-        if (decklink.setCaptionLine) { try { decklink.setCaptionLine(captionConfig.vancLine || 0); } catch {} }
+        if (decklink?.setCaptionLine) { try { decklink.setCaptionLine(captionConfig.vancLine || 0); } catch {} }
         let ok = false;
         let mode = '';
 
-        if (sourceKind === 'ndi') {
+        if (virtual) {
+            // no hardware: the frame loop keeps the CDPs for GET /api/inject/cdps (tests)
+            virtualCdps = []; virtualBase = 0; virtualFrame = 0;
+            ok = true;
+            mode = 'inject_virtual';
+        } else if (sourceKind === 'ndi') {
             if (!decklink.startNdiPassthrough) {
                 return res.status(400).json({ ok: false, error: 'NDI passthrough not built into this addon. Use SDI input instead, or rebuild the native addon with NDI SDK.' });
             }
@@ -901,19 +994,27 @@ app.post('/api/inject/start', async (req, res) => {
 });
 
 app.post('/api/inject/stop', (req, res) => {
-    if (!decklink) return res.status(400).json({ ok: false, error: 'DeckLink addon not loaded' });
+    const wasVirtual = deckLinkMode === 'inject_virtual';
+    if (!decklink && !wasVirtual) return res.status(400).json({ ok: false, error: 'DeckLink addon not loaded' });
     try {
         stopFrameLoop();
-        decklink.stopOutput();
+        if (decklink && !wasVirtual) decklink.stopOutput();
         deckLinkRunning = false;
         deckLinkMode = null;
         if (cea608Encoder) cea608Encoder.reset();
         if (dtvccEncoder) dtvccEncoder.reset();
         if (cea708Builder) cea708Builder.reset();
+        liveFeedState.reset();
         res.json({ ok: true });
     } catch (e) {
         res.status(500).json({ ok: false, error: e.message });
     }
+});
+
+// Virtual output: the CDPs of frames `from` onwards (hex), for tests of the caption path
+app.get('/api/inject/cdps', (req, res) => {
+    const from = Math.max(virtualBase, parseInt(req.query.from) || 0);
+    res.json({ virtual: deckLinkMode === 'inject_virtual', from, next: virtualFrame, frameRate: deckLinkFrameRate, cdps: virtualCdps.slice(from - virtualBase) });
 });
 
 app.get('/api/inject/status', (req, res) => {
@@ -921,7 +1022,8 @@ app.get('/api/inject/status', (req, res) => {
     const host = req.get('host');
     const presenterUrl = publicTunnelUrl || backupTunnelUrl || `${protocol}://${host}`;
     let nativeStatus = { running: false, mode: 'stopped', framesOutput: 0, droppedFrames: 0 };
-    try { if (decklink) nativeStatus = decklink.getStatus(); } catch {}
+    try { if (decklink && deckLinkMode !== 'inject_virtual') nativeStatus = decklink.getStatus(); } catch {}
+    if (deckLinkMode === 'inject_virtual') nativeStatus = { running: true, mode: 'virtual', framesOutput: virtualFrame, droppedFrames: 0 };
 
     res.json({
         running: deckLinkRunning && /^inject_/.test(deckLinkMode || ''),
@@ -933,6 +1035,13 @@ app.get('/api/inject/status', (req, res) => {
         encoderQueueDepth: (captionConfig.encodingMode === 'dtvcc' ? dtvccEncoder?.queueLength : cea608Encoder?.queueLength) || 0,
         dtvccTransport: dtvccEncoder ? { repaintFrames: dtvccEncoder.repaintFrames, ...dtvccEncoder.redrawOptions } : null,
         cea608Transport: cea608Encoder ? cea608Encoder.transport : null,
+        liveFeed: {
+            enabled: captionConfig.liveFeed,
+            targets: liveFeedTargets().map(t => t.name),      // encoders taking appended words right now
+            committedWords: liveFeedState.committedCount,
+            chunks: liveFeedChunks,
+            stats: liveFeedState.stats,
+        },
         cea708BridgeClients: cea708Clients.size,
         presenterUrl: `${presenterUrl}/?view=audience&session=demo`,
         addonLoaded: !!decklink,
@@ -984,11 +1093,16 @@ app.post('/api/caption/config', (req, res) => {
     const { encodingMode, captionStrategy, maxCharsPerLine, rollupRows, polishEnabled, profanityFilter,
             cea608PaceFrames, cea608Repeat, cea608InDtvcc, vancLine, dtvccRepaintFrames,
             cea608Style, cea608ControlRepeat, cea608OneFrame, cea608Copies, cea608CopyGap, cea608HoldFrames, cea608CcCount, cea608MaxPairs, cdpSvcInfoEvery,
-            dtvccRepeat, dtvccRepeatGap, dtvccKeepAlive, dtvccStyle, dtvccCcCount, dtvccAtomicDelete, dtvccAtomicWindows, dtvccAtomicHoldFrames, dtvccBlocks, dtvccRowErase, dtvccColumns, dtvccDefineOnChange } = req.body;
+            dtvccRepeat, dtvccRepeatGap, dtvccKeepAlive, dtvccStyle, dtvccCcCount, dtvccAtomicDelete, dtvccAtomicWindows, dtvccAtomicHoldFrames, dtvccBlocks, dtvccRowErase, dtvccColumns, dtvccDefineOnChange,
+            liveFeed, liveFeedStable, liveFeedHold, liveFeedBreak } = req.body;
 
     if (encodingMode && ['cea608', 'dtvcc'].includes(encodingMode)) {
         captionConfig.encodingMode = encodingMode;
     }
+    if (liveFeed !== undefined) captionConfig.liveFeed = !!liveFeed;
+    if (liveFeedStable !== undefined) { captionConfig.liveFeedStable = Math.max(1, Math.min(6, parseInt(liveFeedStable) || 3)); liveFeedState.stable = captionConfig.liveFeedStable; }
+    if (liveFeedHold !== undefined) { captionConfig.liveFeedHold = Math.max(0, Math.min(3, parseInt(liveFeedHold) || 0)); liveFeedState.holdLastWords = captionConfig.liveFeedHold; }
+    if (liveFeedBreak !== undefined) captionConfig.liveFeedBreak = !!liveFeedBreak;
     if (captionStrategy && ['truncate', 'summarize', 'verbatim'].includes(captionStrategy)) {
         captionConfig.captionStrategy = captionStrategy;
     }
@@ -1050,6 +1164,7 @@ app.post('/api/caption/config', (req, res) => {
     }
 
     console.log(`[Caption Config] Updated:`, captionConfig);
+    saveCaptionConfig();
     res.json(captionConfig);
 });
 
@@ -2413,6 +2528,12 @@ wss.on('connection', (ws, req) => {
                 });
                 return; // Don't fall through to unpolished broadcast
             }
+        }
+
+        // Live feed: interim words that have stopped changing go to the roll-up encoders now
+        if (data.type === 'caption' && !data.isFinal) {
+            const t = (typeof data.payload === 'string') ? data.payload : (data.payload?.text || '');
+            if (t) liveFeedInterim(t);
         }
 
         // Interim captions and settings: broadcast without polishing

@@ -4,15 +4,28 @@ import {
     Play, RefreshCw, Signal, Square, Tv, Wifi, Youtube, Plug, Radio,
     AlertTriangle, Zap, Send, Settings as SettingsIcon, ExternalLink
 } from 'lucide-react';
-import { DeckLinkDevice } from '../types';
+import { DeckLinkDevice, AppState, Caption } from '../types';
+
+/** The app's own speech session (the same engine and state the Live Session dashboard uses). */
+export interface InjectionSession {
+    mode: AppState['mode'];
+    setMode: (m: AppState['mode']) => void;
+    isRecording: boolean;
+    setIsRecording: (v: boolean) => void;
+    interimText: string;
+    captions: Caption[];
+    lastNotification?: { message: string; type: string; timestamp: number } | null;
+}
 
 interface CaptionInjectionProps {
     onBack: () => void;
     apiKey?: string;
+    session?: InjectionSession;
+    onOpenDashboard?: () => void;
 }
 
 type SourceKind = 'sdi' | 'ndi' | 'standalone';
-type CaptionSource = 'live_mic' | 'system_audio' | 'external_ws' | 'manual';
+type CaptionSource = 'session' | 'manual';
 
 interface InjectStatus {
     running: boolean;
@@ -25,7 +38,17 @@ interface InjectStatus {
     addonLoaded: boolean;
     ndiAvailable: boolean;
     encodingMode: string;
+    liveFeed?: { enabled: boolean; targets: string[]; committedWords: number; chunks: number };
 }
+
+/** The speech engines of the Live Session, in the order the dashboard shows them. */
+const SESSION_MODES: { value: AppState['mode']; label: string; hint: string }[] = [
+    { value: 'balanced', label: 'Balanced', hint: 'Browser speech (Chrome / Edge) with Gemini polish, fastest to start' },
+    { value: 'local', label: 'Local', hint: 'Whisper on this computer, Gemini for polish and names' },
+    { value: 'fully_local', label: 'Fully local', hint: 'Whisper plus the local brain, nothing leaves the machine' },
+    { value: 'resilience', label: 'Resilience', hint: 'Browser speech with automatic restarts for long sessions' },
+    { value: 'cloud', label: 'Cloud', hint: 'Gemini Live transcription, best names and punctuation' },
+];
 
 // Small panel for YouTube's Caption Ingestion URL — the only working way to
 // get live captions onto YouTube when streaming through a Blackmagic Web
@@ -221,7 +244,7 @@ const ObsCaptionPanel: React.FC = () => {
     );
 };
 
-const CaptionInjection: React.FC<CaptionInjectionProps> = ({ onBack, apiKey }) => {
+const CaptionInjection: React.FC<CaptionInjectionProps> = ({ onBack, apiKey, session, onOpenDashboard }) => {
     const getRelayUrl = () => {
         const port = window.location.port || '80';
         const relayPort = (parseInt(port) >= 5170 && parseInt(port) <= 5199) ? '8080' : port;
@@ -310,11 +333,50 @@ const CaptionInjection: React.FC<CaptionInjectionProps> = ({ onBack, apiKey }) =
     const [captionStrategy, setCaptionStrategy] = useState('truncate');
     const [maxCharsPerLine, setMaxCharsPerLine] = useState(46);
     const [maxCharsText, setMaxCharsText] = useState('46');
+    // Live feed: words that the recognizer has stopped revising go to the roll-up encoders at once (server/live-feed.js)
+    const [liveFeed, setLiveFeed] = useState(true);
     const commitMaxChars = (raw: string) => {
         const n = parseInt(raw, 10);
         const v = Number.isFinite(n) ? Math.max(32, Math.min(128, n)) : maxCharsPerLine;
         setMaxCharsText(String(v));
         if (v !== maxCharsPerLine) { setMaxCharsPerLine(v); postCaptionConfig({ maxCharsPerLine: v }); }
+    };
+    // Setups: one click sets the whole encoding for a destination (measured on the Studio A rig, 2026-10-13)
+    const SETUPS: Record<string, { label: string; hint: string; cfg: Record<string, unknown> }> = {
+        youtube_live:  { label: 'YouTube through a Web Presenter 4K on software 3.5, OBS, or any encoder that forwards every frame',
+                         hint: 'CEA-608 roll-up; words reach the screen as they are recognized, the way broadcast captioners send them',
+                         cfg: { encodingMode: 'cea608', cea608Style: 'rollup_pac', cea608ControlRepeat: 2, cea608OneFrame: false, cea608InDtvcc: false, captionStrategy: 'verbatim', liveFeed: true } },
+        youtube_popon: { label: 'YouTube through a lossless encoder: pop-on blocks',
+                         hint: 'CEA-608 pop-on; two full rows appear at once after each sentence',
+                         cfg: { encodingMode: 'cea608', cea608Style: 'popon', cea608ControlRepeat: 2, cea608OneFrame: false, cea608InDtvcc: false, captionStrategy: 'verbatim', liveFeed: false } },
+        youtube_lossy: { label: 'YouTube through a Web Presenter 4K on software 4.2.x (drops a third of the caption frames)',
+                         hint: 'one-frame CEA-708 pieces of 23 characters, six copies each; the only form that survives the loss',
+                         cfg: { encodingMode: 'dtvcc', ...DTVCC_PRESETS.webpresenter, cea608InDtvcc: false, captionStrategy: 'truncate', maxCharsPerLine: 46, liveFeed: false } },
+        decoder:       { label: 'TV or SDI caption decoder',
+                         hint: 'CEA-708 re-sent continuously plus CEA-608 roll-up, live words',
+                         cfg: { encodingMode: 'dtvcc', ...DTVCC_PRESETS.continuous, cea608InDtvcc: true, cea608Style: 'rollup_pac', cea608OneFrame: false, captionStrategy: 'verbatim', liveFeed: true } },
+    };
+    const currentSetup = encodingMode === 'cea608' && cea608Style === 'rollup_pac' && !cea608OneFrame && captionStrategy === 'verbatim' && liveFeed ? 'youtube_live'
+        : encodingMode === 'cea608' && cea608Style === 'popon' && !cea608OneFrame && captionStrategy === 'verbatim' ? 'youtube_popon'
+        : encodingMode === 'dtvcc' && dtvccStyle === 'atomic' && !cea608InDtvcc && captionStrategy === 'truncate' ? 'youtube_lossy'
+        : encodingMode === 'dtvcc' && dtvccStyle === 'rollup' && dtvccRepaintFrames === 1 && cea608InDtvcc && captionStrategy === 'verbatim' ? 'decoder'
+        : 'custom';
+    const applySetup = (name: string) => {
+        const s = SETUPS[name];
+        if (!s) return;
+        const cfg = s.cfg;
+        if (cfg.encodingMode === 'cea608' || cfg.encodingMode === 'dtvcc') setEncodingMode(cfg.encodingMode as 'cea608' | 'dtvcc');
+        if (typeof cfg.cea608Style === 'string') setCea608Style(cfg.cea608Style);
+        if (typeof cfg.cea608OneFrame === 'boolean') setCea608OneFrame(cfg.cea608OneFrame);
+        if (typeof cfg.cea608InDtvcc === 'boolean') setCea608InDtvcc(cfg.cea608InDtvcc);
+        if (typeof cfg.captionStrategy === 'string') setCaptionStrategy(cfg.captionStrategy);
+        if (typeof cfg.maxCharsPerLine === 'number') { setMaxCharsPerLine(cfg.maxCharsPerLine); setMaxCharsText(String(cfg.maxCharsPerLine)); }
+        if (typeof cfg.liveFeed === 'boolean') setLiveFeed(cfg.liveFeed);
+        if (typeof cfg.dtvccRepaintFrames === 'number') setDtvccRepaintFrames(cfg.dtvccRepaintFrames);
+        if (typeof cfg.dtvccKeepAlive === 'boolean') setDtvccKeepAlive(cfg.dtvccKeepAlive);
+        if (typeof cfg.dtvccRepeat === 'number') setDtvccRepeat(cfg.dtvccRepeat);
+        if (typeof cfg.dtvccStyle === 'string') setDtvccStyle(cfg.dtvccStyle);
+        postCaptionConfig(cfg);
     };
     useEffect(() => {
         fetch(`${getRelayUrl()}/api/caption/config`).then(r => r.json()).then(c => {
@@ -328,6 +390,8 @@ const CaptionInjection: React.FC<CaptionInjectionProps> = ({ onBack, apiKey }) =
             if (typeof c.cea608Style === 'string') setCea608Style(c.cea608Style);
             if (typeof c.cea608OneFrame === 'boolean') setCea608OneFrame(c.cea608OneFrame);
             if (typeof c.cea608Copies === 'number') setCea608Copies(c.cea608Copies);
+            if (typeof c.liveFeed === 'boolean') setLiveFeed(c.liveFeed);
+            if (c.encodingMode === 'cea608' || c.encodingMode === 'dtvcc') setEncodingMode(c.encodingMode);
         }).catch(() => {});
     }, []);
     const [ndiSources, setNdiSources] = useState<{name: string; url: string}[]>([]);
@@ -339,7 +403,7 @@ const CaptionInjection: React.FC<CaptionInjectionProps> = ({ onBack, apiKey }) =
     const [ndiAvailable, setNdiAvailable] = useState(false);
 
     // Caption source
-    const [captionSource, setCaptionSource] = useState<CaptionSource>('live_mic');
+    const [captionSource, setCaptionSource] = useState<CaptionSource>(session ? 'session' : 'manual');
     const [manualText, setManualText] = useState('');
 
     // Live status
@@ -348,13 +412,11 @@ const CaptionInjection: React.FC<CaptionInjectionProps> = ({ onBack, apiKey }) =
     const [startError, setStartError] = useState<string | null>(null);
     const [copied, setCopied] = useState(false);
 
-    // STT (live_mic) — uses Web Speech API for low-friction setup
-    const [listening, setListening] = useState(false);
-    const recognitionRef = useRef<any>(null);
+    // Captions come from the app's own speech session (mirrored to the relay from here, because
+    // the Live Session dashboard is not mounted while this screen is open) or are typed by hand.
     const wsRef = useRef<WebSocket | null>(null);
-    const [interimText, setInterimText] = useState('');
     const [recentCaptions, setRecentCaptions] = useState<string[]>([]);
-    const [micPermissionError, setMicPermissionError] = useState<string | null>(null);
+    const interimText = session?.interimText || '';
 
     // Load devices + status on mount
     useEffect(() => {
@@ -463,20 +525,19 @@ const CaptionInjection: React.FC<CaptionInjectionProps> = ({ onBack, apiKey }) =
     const handleStop = async () => {
         try {
             await fetch(`${getRelayUrl()}/api/inject/stop`, { method: 'POST' });
-            if (listening) stopListening();
         } catch {}
     };
 
     // --- Caption broadcast helpers ---
-    const broadcastCaption = useCallback((text: string, isFinal: boolean) => {
+    const broadcastCaption = useCallback((text: string, isFinal: boolean, opts: { applyDictionary?: boolean } = {}) => {
         if (!text) return;
         // 1. Push directly into encoder via dedicated endpoint (works even
-        //    without a session WebSocket).
+        //    without a session WebSocket). Session captions arrive corrected already.
         if (isFinal) {
             fetch(`${getRelayUrl()}/api/inject/caption`, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ text, isFinal: true }),
+                body: JSON.stringify({ text, isFinal: true, applyDictionary: opts.applyDictionary !== false }),
             }).catch(() => {});
         }
 
@@ -500,74 +561,20 @@ const CaptionInjection: React.FC<CaptionInjectionProps> = ({ onBack, apiKey }) =
         }
     }, []);
 
-    // Web Speech for live_mic source
-    const startListening = useCallback(async () => {
-        setMicPermissionError(null);
-        const SR = (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
-        if (!SR) {
-            setMicPermissionError('SpeechRecognition API not available in this browser. Use Chrome or Edge.');
-            return;
-        }
-        try {
-            await navigator.mediaDevices.getUserMedia({ audio: true });
-        } catch (e) {
-            setMicPermissionError('Microphone permission denied. Allow mic access in browser settings.');
-            return;
-        }
-        const recognition = new SR();
-        recognition.continuous = true;
-        recognition.interimResults = true;
-        recognition.lang = 'en-US';
-
-        recognition.onresult = (event: any) => {
-            let interim = '';
-            for (let i = event.resultIndex; i < event.results.length; i++) {
-                const transcript = event.results[i][0].transcript;
-                if (event.results[i].isFinal) {
-                    broadcastCaption(transcript.trim(), true);
-                    setInterimText('');
-                } else {
-                    interim += transcript;
-                }
-            }
-            if (interim) {
-                setInterimText(interim);
-                broadcastCaption(interim, false);
-            }
-        };
-
-        recognition.onerror = (e: any) => {
-            console.warn('[Inject STT] error', e.error);
-            if (e.error === 'not-allowed') setMicPermissionError('Mic permission denied');
-            if (e.error === 'no-speech') return; // ignore
-        };
-
-        recognition.onend = () => {
-            // Auto-restart while listening flag is on
-            if (recognitionRef.current === recognition && listeningRef.current) {
-                try { recognition.start(); } catch {}
-            }
-        };
-
-        recognitionRef.current = recognition;
-        listeningRef.current = true;
-        try { recognition.start(); setListening(true); } catch (e) {
-            setMicPermissionError((e as Error).message);
-        }
-    }, [broadcastCaption]);
-
-    const listeningRef = useRef(false);
-    const stopListening = useCallback(() => {
-        listeningRef.current = false;
-        try { recognitionRef.current?.stop(); } catch {}
-        recognitionRef.current = null;
-        setListening(false);
-        setInterimText('');
-        try { wsRef.current?.close(); } catch {}
-        wsRef.current = null;
-    }, []);
-
-    useEffect(() => () => stopListening(), [stopListening]);
+    // Mirror the app's session into the relay: interims feed the live roll-up, finals are encoded
+    // (the Live Session dashboard does the same while it is the screen on view).
+    useEffect(() => {
+        if (session?.interimText) broadcastCaption(session.interimText, false);
+    }, [session?.interimText, broadcastCaption]);
+    const lastMirroredRef = useRef<string | null>(null);
+    useEffect(() => {
+        if (!session?.captions.length) return;
+        const last = session.captions[session.captions.length - 1];
+        if (last.id === lastMirroredRef.current || Date.now() - last.timestamp > 3000) return;
+        lastMirroredRef.current = last.id;
+        broadcastCaption(last.text, true, { applyDictionary: false });
+    }, [session?.captions, broadcastCaption]);
+    useEffect(() => () => { try { wsRef.current?.close(); } catch {} wsRef.current = null; }, []);
 
     const handleSendManual = () => {
         if (!manualText.trim()) return;
@@ -920,19 +927,30 @@ const CaptionInjection: React.FC<CaptionInjectionProps> = ({ onBack, apiKey }) =
                             <div className="w-6 h-6 bg-forest-dark text-white rounded-full flex items-center justify-center text-[10px] font-bold">3</div>
                             <h3 className="text-sm font-bold text-forest-dark">Caption Encoding</h3>
                         </div>
+                        <div className="mb-3">
+                            <label className="text-[10px] font-bold text-stone-400 uppercase tracking-wider mb-1 block">Where the captions go — one click sets everything below</label>
+                            <div className="grid grid-cols-1 gap-1.5">
+                                {Object.entries(SETUPS).map(([key, s]) => (
+                                    <button key={key} onClick={() => applySetup(key)}
+                                        className={`px-3 py-2 rounded-lg border text-left transition-all ${currentSetup === key ? 'border-sage-500 bg-sage-50' : 'border-stone-200 hover:border-sage-300'}`}>
+                                        <p className="text-xs font-bold text-stone-800">{s.label}</p>
+                                        <p className="text-[10px] text-stone-500">{s.hint}</p>
+                                    </button>
+                                ))}
+                            </div>
+                            <p className="text-[10px] text-stone-500 mt-1">{currentSetup === 'custom' ? 'Custom settings (below). Changes apply while the injection runs.' : 'Changes apply while the injection runs; on YouTube, start a fresh broadcast after changing the caption form (it keeps the first form it saw).'}</p>
+                        </div>
                         <div className="grid grid-cols-2 gap-2">
                             <button
-                                onClick={() => setEncodingMode('cea608')}
-                                disabled={running}
-                                className={`p-3 rounded-lg border text-left transition-all ${encodingMode === 'cea608' ? 'border-sage-500 bg-sage-50' : 'border-stone-200 hover:border-sage-300'} disabled:opacity-50`}
+                                onClick={() => { setEncodingMode('cea608'); postCaptionConfig({ encodingMode: 'cea608' }); }}
+                                className={`p-3 rounded-lg border text-left transition-all ${encodingMode === 'cea608' ? 'border-sage-500 bg-sage-50' : 'border-stone-200 hover:border-sage-300'}`}
                             >
                                 <p className="text-xs font-bold text-stone-800">CEA-608</p>
-                                <p className="text-[10px] text-stone-500">Roll-up · universal decoders · ~60 cps</p>
+                                <p className="text-[10px] text-stone-500">Roll-up or pop-on · every decoder and YouTube · ~60 cps</p>
                             </button>
                             <button
-                                onClick={() => setEncodingMode('dtvcc')}
-                                disabled={running}
-                                className={`p-3 rounded-lg border text-left transition-all ${encodingMode === 'dtvcc' ? 'border-sage-500 bg-sage-50' : 'border-stone-200 hover:border-sage-300'} disabled:opacity-50`}
+                                onClick={() => { setEncodingMode('dtvcc'); postCaptionConfig({ encodingMode: 'dtvcc' }); }}
+                                className={`p-3 rounded-lg border text-left transition-all ${encodingMode === 'dtvcc' ? 'border-sage-500 bg-sage-50' : 'border-stone-200 hover:border-sage-300'}`}
                             >
                                 <p className="text-xs font-bold text-stone-800">CEA-708 (DTVCC)</p>
                                 <p className="text-[10px] text-stone-500">Higher throughput · self-healing · optional 608</p>
@@ -959,7 +977,20 @@ const CaptionInjection: React.FC<CaptionInjectionProps> = ({ onBack, apiKey }) =
                                     characters
                                 </label>
                             </div>
-                            <p className="text-[11px] text-stone-500">Truncate cuts each caption at the cap on a word boundary; Summarize condenses it with Gemini (needs a key, falls back to truncate); Verbatim sends everything and can lag behind fast speech. The one-frame YouTube transport sends pieces of 23 characters, so the cap mainly matters for the other transports.</p>
+                            <p className="text-[11px] text-stone-500"><b>Verbatim</b> sends every word (use it for a broadcast). Truncate cuts each caption at the cap on a word boundary and Summarize condenses it with Gemini: both drop words and exist for the one-frame transport, which carries 23 characters per piece.</p>
+                            {captionStrategy === 'verbatim' && (
+                                <label className="flex items-center gap-2 text-xs text-stone-700">
+                                    <input type="checkbox" checked={liveFeed}
+                                        onChange={e => { setLiveFeed(e.target.checked); postCaptionConfig({ liveFeed: e.target.checked }); }} />
+                                    Send words as they are recognized (live roll-up)
+                                    {status?.liveFeed && running && (
+                                        <span className={`text-[10px] ${status.liveFeed.targets.length ? 'text-green-700' : 'text-stone-400'}`}>
+                                            {status.liveFeed.targets.length ? `live on ${status.liveFeed.targets.map(t => t === 'cea608' ? 'CEA-608' : 'CEA-708').join(' + ')}, ${status.liveFeed.chunks} chunks sent` : (liveFeed ? 'needs a roll-up style' : 'off: whole captions after each sentence')}
+                                        </span>
+                                    )}
+                                </label>
+                            )}
+                            <p className="text-[11px] text-stone-500">With the live roll-up a word goes on air once the recognizer has stopped revising it (about a second behind the speaker), like a stenographer's feed; without it a sentence appears whole once it is final. Roll-up styles only; pop-on and one-frame transports always send whole captions.</p>
                             {encodingMode === 'cea608' && (
                                 <>
                                     <label className="flex items-center gap-2 text-xs text-stone-700">
@@ -1034,23 +1065,16 @@ const CaptionInjection: React.FC<CaptionInjectionProps> = ({ onBack, apiKey }) =
                             <Mic size={16} className="text-purple-500" />
                             <h3 className="text-sm font-bold text-forest-dark">Caption Source</h3>
                         </div>
-                        <p className="text-[11px] text-stone-500 mb-3">Where the caption text comes from. Pick one — text is encoded as CEA-608/708 and embedded in VANC.</p>
-                        <div className="grid grid-cols-3 gap-2">
+                        <p className="text-[11px] text-stone-500 mb-3">The same speech session as the Live Session dashboard: one engine, one dictionary, one set of captions for the SDI, the audience phones and the transcript. Switch screens freely; the session keeps running.</p>
+                        <div className="grid grid-cols-2 gap-2">
                             <button
-                                onClick={() => setCaptionSource('live_mic')}
-                                className={`p-3 rounded-lg border text-left transition-all ${captionSource === 'live_mic' ? 'border-purple-400 bg-purple-50' : 'border-stone-200 hover:border-purple-200'}`}
+                                onClick={() => setCaptionSource('session')}
+                                disabled={!session}
+                                className={`p-3 rounded-lg border text-left transition-all ${captionSource === 'session' ? 'border-purple-400 bg-purple-50' : 'border-stone-200 hover:border-purple-200'} disabled:opacity-50`}
                             >
-                                <Mic size={14} className={captionSource === 'live_mic' ? 'text-purple-600 mb-1' : 'text-stone-500 mb-1'} />
-                                <p className="text-xs font-bold text-stone-800">Browser Mic</p>
-                                <p className="text-[10px] text-stone-500">Web Speech API</p>
-                            </button>
-                            <button
-                                onClick={() => setCaptionSource('external_ws')}
-                                className={`p-3 rounded-lg border text-left transition-all ${captionSource === 'external_ws' ? 'border-purple-400 bg-purple-50' : 'border-stone-200 hover:border-purple-200'}`}
-                            >
-                                <Plug size={14} className={captionSource === 'external_ws' ? 'text-purple-600 mb-1' : 'text-stone-500 mb-1'} />
-                                <p className="text-xs font-bold text-stone-800">External</p>
-                                <p className="text-[10px] text-stone-500">Use main Dashboard</p>
+                                <Mic size={14} className={captionSource === 'session' ? 'text-purple-600 mb-1' : 'text-stone-500 mb-1'} />
+                                <p className="text-xs font-bold text-stone-800">Speech</p>
+                                <p className="text-[10px] text-stone-500">Balanced · Cloud · Local</p>
                             </button>
                             <button
                                 onClick={() => setCaptionSource('manual')}
@@ -1062,40 +1086,39 @@ const CaptionInjection: React.FC<CaptionInjectionProps> = ({ onBack, apiKey }) =
                             </button>
                         </div>
 
-                        {captionSource === 'live_mic' && (
+                        {captionSource === 'session' && session && (
                             <div className="mt-4 space-y-3">
+                                <div>
+                                    <label className="text-[10px] font-bold text-stone-400 uppercase tracking-wider mb-1 block">Speech engine</label>
+                                    <div className="grid grid-cols-5 gap-1">
+                                        {SESSION_MODES.map(m => (
+                                            <button key={m.value} onClick={() => session.setMode(m.value)} disabled={session.isRecording} title={m.hint}
+                                                className={`px-1.5 py-2 rounded-lg border text-[11px] font-bold ${session.mode === m.value ? 'border-purple-400 bg-purple-50 text-purple-700' : 'border-stone-200 text-stone-600 hover:border-purple-200'} disabled:opacity-60`}>{m.label}</button>
+                                        ))}
+                                    </div>
+                                    <p className="text-[10px] text-stone-500 mt-1">{SESSION_MODES.find(m => m.value === session.mode)?.hint || ''}. The Gemini key, the microphone and the spoken language are in Help &amp; Settings.</p>
+                                </div>
                                 <button
-                                    onClick={listening ? stopListening : startListening}
-                                    disabled={!running}
-                                    className={`w-full py-3 rounded-xl font-bold text-sm flex items-center justify-center gap-2 transition-all ${
-                                        listening ? 'bg-red-500 text-white hover:bg-red-600' : 'bg-purple-500 text-white hover:bg-purple-600'
-                                    } disabled:opacity-40 disabled:cursor-not-allowed`}
+                                    onClick={() => session.setIsRecording(!session.isRecording)}
+                                    className={`w-full py-3 rounded-xl font-bold text-sm flex items-center justify-center gap-2 transition-all ${session.isRecording ? 'bg-red-500 text-white hover:bg-red-600' : 'bg-purple-500 text-white hover:bg-purple-600'}`}
                                 >
-                                    {listening ? (
-                                        <><Square size={14} /> Stop Listening</>
-                                    ) : (
-                                        <><Mic size={14} /> Start Listening</>
-                                    )}
+                                    {session.isRecording ? <><Square size={14} /> Stop captioning</> : <><Mic size={14} /> Start captioning</>}
                                 </button>
-                                {!running && (
-                                    <p className="text-[10px] text-amber-600 bg-amber-50 px-2 py-1.5 rounded">Start the SDI injection first, then begin listening.</p>
+                                {session.isRecording && !running && (
+                                    <p className="text-[10px] text-amber-600 bg-amber-50 px-2 py-1.5 rounded">Captions are running for the dashboard and the audience; start the SDI injection above to embed them.</p>
                                 )}
-                                {micPermissionError && (
-                                    <p className="text-[10px] text-red-600 bg-red-50 px-2 py-1.5 rounded">{micPermissionError}</p>
+                                {session.lastNotification && session.lastNotification.type === 'error' && Date.now() - session.lastNotification.timestamp < 30000 && (
+                                    <p className="text-[10px] text-red-600 bg-red-50 px-2 py-1.5 rounded">{session.lastNotification.message}</p>
                                 )}
                                 {interimText && (
                                     <div className="px-3 py-2 bg-purple-50 border border-purple-200 rounded-lg">
-                                        <p className="text-[10px] font-bold text-purple-600 uppercase mb-0.5">Interim</p>
+                                        <p className="text-[10px] font-bold text-purple-600 uppercase mb-0.5">Hearing</p>
                                         <p className="text-sm text-stone-700 italic">{interimText}</p>
                                     </div>
                                 )}
-                            </div>
-                        )}
-
-                        {captionSource === 'external_ws' && (
-                            <div className="mt-4 p-3 bg-stone-50 border border-stone-200 rounded-lg text-[11px] text-stone-600 space-y-1.5">
-                                <p>Use the main <strong>Live Session</strong> dashboard to drive captions. Anything that lands as a final caption on session <code className="bg-stone-100 px-1 rounded">demo</code> will be encoded and embedded automatically.</p>
-                                <p className="text-stone-500">Useful when you've already got a presenter speaking through the Dashboard mic + you want to mirror those captions onto the SDI feed.</p>
+                                {onOpenDashboard && (
+                                    <button onClick={onOpenDashboard} className="text-[11px] font-bold text-forest-dark hover:underline">Open the Live Session dashboard (same session) →</button>
+                                )}
                             </div>
                         )}
 
@@ -1214,11 +1237,11 @@ const CaptionInjection: React.FC<CaptionInjectionProps> = ({ onBack, apiKey }) =
                     <div className="bg-white border border-stone-200 rounded-2xl p-4">
                         <p className="text-[10px] font-bold text-stone-400 uppercase tracking-wider mb-2">How injection works</p>
                         <ul className="text-[11px] text-stone-500 space-y-1 leading-relaxed">
-                            <li>• Caption text → CEA-608 byte pairs (Roll-Up 2) or CEA-708 Service 1 blocks</li>
-                            <li>• Wrapped in SMPTE 334 CDP packets</li>
+                            <li>• Caption text → CEA-608 byte pairs (roll-up or pop-on) or CEA-708 Service 1 packets; with the live roll-up, stable words go out before the sentence ends</li>
+                            <li>• Wrapped in SMPTE 334 CDP packets, one per frame</li>
                             <li>• Embedded in SDI VANC ancillary data (DID 0x61, SDID 0x01, line 9)</li>
                             <li>• Native DeckLink output emits the SDI with captions at {frameRate} fps</li>
-                            <li>• Web presenter passes VANC through; YouTube re-renders as broadcast CC</li>
+                            <li>• The encoder forwards the VANC into the H.264 stream; YouTube renders it as broadcast CC (a Web Presenter 4K must run software 3.5 to forward every frame)</li>
                         </ul>
                     </div>
                 </div>

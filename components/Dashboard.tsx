@@ -21,6 +21,8 @@ interface DashboardProps {
   onOpenContext: () => void;
   onEndSession: () => void;
   openObsView: () => void;
+  /** Opens the Caption Injection screen (embedded SDI / NDI captions); the header shows its state */
+  onOpenInjection?: () => void;
   targetLanguage: string;
   setTargetLanguage: (lang: string) => void;
   goHome: () => void;
@@ -342,6 +344,7 @@ const Dashboard: React.FC<DashboardProps> = ({
   onOpenContext,
   onEndSession,
   openObsView,
+  onOpenInjection,
   targetLanguage,
   setTargetLanguage,
   goHome,
@@ -376,6 +379,19 @@ const Dashboard: React.FC<DashboardProps> = ({
   const relayWsRef = useRef<WebSocket | null>(null);
   const bcRef = useRef<BroadcastChannel | null>(null);
   const [relayConnected, setRelayConnected] = useState(false);
+
+  // Embedded SDI / NDI captions (the Caption Injection screen's output): the header shows whether
+  // this session's captions are going out on the SDI right now and in which form
+  const [injectStatus, setInjectStatus] = useState<{ running: boolean; encodingMode: string; liveFeed?: { targets: string[] } } | null>(null);
+  useEffect(() => {
+      if (!onOpenInjection) return;
+      const url = getRelayWsUrl().replace(/^ws/, 'http') + '/api/inject/status';
+      let active = true;
+      const tick = () => fetch(url).then(r => r.json()).then(d => { if (active) setInjectStatus(d); }).catch(() => { if (active) setInjectStatus(null); });
+      tick();
+      const t = setInterval(tick, 3000);
+      return () => { active = false; clearInterval(t); };
+  }, [onOpenInjection]);
 
   // Monitor Mode (PiP)
   const pipVideoRef = useRef<HTMLVideoElement>(null);
@@ -1003,6 +1019,15 @@ const Dashboard: React.FC<DashboardProps> = ({
               <Tooltip text="Configure size, font, and colors of the output">
                   <button onClick={openObsView} className={`h-9 px-3 rounded-lg border text-xs font-bold flex items-center gap-1.5 shrink-0 transition-colors bg-white text-stone-600 border-stone-200 hover:bg-stone-50`}><Layout size={14} /> <span className="hidden xl:inline">Output</span></button>
               </Tooltip>
+              {onOpenInjection && (
+                  <Tooltip text={injectStatus?.running
+                      ? `This session's captions are going out embedded on the SDI as ${injectStatus.encodingMode === 'cea608' ? 'CEA-608' : 'CEA-708'}${injectStatus.liveFeed?.targets?.length ? ' with the live roll-up' : ''}. Open Caption Injection.`
+                      : 'Embedded SDI / NDI captions are off. Open Caption Injection to start them.'}>
+                      <button onClick={onOpenInjection} className={`h-9 px-3 rounded-lg border text-xs font-bold flex items-center gap-1.5 shrink-0 transition-colors ${injectStatus?.running ? 'bg-green-50 text-green-700 border-green-200 hover:bg-green-100' : 'bg-white text-stone-600 border-stone-200 hover:bg-stone-50'}`}>
+                          <Captions size={13} /> SDI{injectStatus?.running && <span className="w-1.5 h-1.5 rounded-full bg-green-500 animate-pulse" />}
+                      </button>
+                  </Tooltip>
+              )}
               {cea708Enabled && (
                   <Tooltip text="CEA-708 CC output is active. Captions are being forwarded to the SDI bridge.">
                       <div className={`h-9 px-3 rounded-lg border text-xs font-bold flex items-center gap-1.5 shrink-0 transition-colors bg-green-50 text-green-700 border-green-200`}><Captions size={13} /> CC <span className="w-1.5 h-1.5 rounded-full bg-green-500 animate-pulse" /></div>
