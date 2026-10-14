@@ -277,26 +277,33 @@ export class Cea608Encoder {
      * and a word that would run past column 32 starts a new row (words longer than a
      * row are split). endLine() makes the next word start a new row.
      */
-    appendText(text) {
+    appendText(text, opts = {}) {
         const words = String(text || '').trim().split(/\s+/).filter(Boolean);
         if (!words.length) return;
         if (this.style === 'popon' || this.style === 'painton') { this.enqueueText(words.join(' ')); return; }
         const out = [];
+        let joinFirst = !!opts.continueWord && this._liveCol > 0;   // the rest of a word already on the row: no space before it
         for (const word of words) {
             const pieces = [];
             let rest = word;
             while (rest.length > CEA608_COLUMNS) { pieces.push(rest.slice(0, CEA608_COLUMNS)); rest = rest.slice(CEA608_COLUMNS); }
             pieces.push(rest);
             for (const piece of pieces) {
-                const need = (this._liveCol > 0 ? 1 : 0) + piece.length;
-                if (this._liveCol > 0 && this._liveCol + need > CEA608_COLUMNS) this._liveCol = 0;   // wrap to a new row
+                const glue = (this._liveCol > 0 && !joinFirst) ? 1 : 0;
+                const need = glue + piece.length;
+                if (this._liveCol > 0 && this._liveCol + need > CEA608_COLUMNS) {
+                    // wrap to a new row; a trailing space keeps converters that join rows (YouTube) from gluing the words
+                    if (this._liveCol < CEA608_COLUMNS) out.push(...textPairs(' '));
+                    this._liveCol = 0;
+                }
                 if (this._liveCol === 0) {
                     out.push(...this._rowPrefix(), ...textPairs(piece));
                     this._liveCol = piece.length;
                 } else {
-                    out.push(...textPairs(' ' + piece));
+                    out.push(...textPairs((glue ? ' ' : '') + piece));
                     this._liveCol += need;
                 }
+                joinFirst = false;
             }
         }
         this._queue(out);

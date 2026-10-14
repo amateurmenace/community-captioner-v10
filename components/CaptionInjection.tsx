@@ -990,7 +990,7 @@ const CaptionInjection: React.FC<CaptionInjectionProps> = ({ onBack, apiKey, ses
                                     )}
                                 </label>
                             )}
-                            <p className="text-[11px] text-stone-500">With the live roll-up a word goes on air once the recognizer has stopped revising it (about a second behind the speaker), like a stenographer's feed; without it a sentence appears whole once it is final. Roll-up styles only; pop-on and one-frame transports always send whole captions.</p>
+                            <p className="text-[11px] text-stone-500">With the live roll-up a word goes on air once the recognizer has stopped revising it (a second or two behind the speaker, never the last two words it is still hearing), like a stenographer's feed; the final sentence then completes or extends what is on screen. Without it a sentence appears whole once it is final. Roll-up styles only; pop-on and one-frame transports always send whole captions.</p>
                             {encodingMode === 'cea608' && (
                                 <>
                                     <label className="flex items-center gap-2 text-xs text-stone-700">

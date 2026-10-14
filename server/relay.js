@@ -224,8 +224,9 @@ let captionConfig = {
     // identical interims a word must survive, liveFeedHold = words at the end of the interim
     // that are never sent yet (the word being spoken), liveFeedBreak = end the row at each final.
     liveFeed: true,
-    liveFeedStable: 3,
-    liveFeedHold: 1,
+    liveFeedStable: 4,
+    liveFeedHold: 2,
+    liveFeedMinAge: 1200,          // ms a word must have stood at its position before it can go out
     liveFeedBreak: false,
 };
 
@@ -584,7 +585,7 @@ function stopFrameLoop() {
 }
 
 // --- Live feed: interim words → roll-up encoders (server/live-feed.js) ---
-const liveFeedState = new LiveFeed({ stable: captionConfig.liveFeedStable, holdLastWords: captionConfig.liveFeedHold });
+const liveFeedState = new LiveFeed({ stable: captionConfig.liveFeedStable, holdLastWords: captionConfig.liveFeedHold, minAgeMs: captionConfig.liveFeedMinAge });
 let liveFeedChunks = 0;
 // The encoders that take appended words right now: roll-up styles, verbatim strategy, output running.
 function liveFeedTargets() {
@@ -675,8 +676,11 @@ function feedCaptionToEncoder(captionData) {
                 const live = liveFeedTargets();
                 const liveNames = new Set(live.map(t => t.name));
                 if (live.length) {
-                    const tail = liveFeedState.final(processed);
-                    if (tail.length) for (const t of live) t.enc.appendText(tail.join(' '));
+                    const r = liveFeedState.final(processed);
+                    for (const t of live) {
+                        if (r.completeLastWord) t.enc.appendText(r.completeLastWord, { continueWord: true });
+                        if (r.words.length) t.enc.appendText(r.words.join(' '));
+                    }
                     if (captionConfig.liveFeedBreak) for (const t of live) t.enc.endLine();
                 } else if (liveFeedState.committedCount) {
                     liveFeedState.reset();
@@ -1094,7 +1098,7 @@ app.post('/api/caption/config', (req, res) => {
             cea608PaceFrames, cea608Repeat, cea608InDtvcc, vancLine, dtvccRepaintFrames,
             cea608Style, cea608ControlRepeat, cea608OneFrame, cea608Copies, cea608CopyGap, cea608HoldFrames, cea608CcCount, cea608MaxPairs, cdpSvcInfoEvery,
             dtvccRepeat, dtvccRepeatGap, dtvccKeepAlive, dtvccStyle, dtvccCcCount, dtvccAtomicDelete, dtvccAtomicWindows, dtvccAtomicHoldFrames, dtvccBlocks, dtvccRowErase, dtvccColumns, dtvccDefineOnChange,
-            liveFeed, liveFeedStable, liveFeedHold, liveFeedBreak } = req.body;
+            liveFeed, liveFeedStable, liveFeedHold, liveFeedMinAge, liveFeedBreak } = req.body;
 
     if (encodingMode && ['cea608', 'dtvcc'].includes(encodingMode)) {
         captionConfig.encodingMode = encodingMode;
@@ -1102,6 +1106,7 @@ app.post('/api/caption/config', (req, res) => {
     if (liveFeed !== undefined) captionConfig.liveFeed = !!liveFeed;
     if (liveFeedStable !== undefined) { captionConfig.liveFeedStable = Math.max(1, Math.min(6, parseInt(liveFeedStable) || 3)); liveFeedState.stable = captionConfig.liveFeedStable; }
     if (liveFeedHold !== undefined) { captionConfig.liveFeedHold = Math.max(0, Math.min(3, parseInt(liveFeedHold) || 0)); liveFeedState.holdLastWords = captionConfig.liveFeedHold; }
+    if (liveFeedMinAge !== undefined) { captionConfig.liveFeedMinAge = Math.max(0, Math.min(5000, parseInt(liveFeedMinAge) || 0)); liveFeedState.minAgeMs = captionConfig.liveFeedMinAge; }
     if (liveFeedBreak !== undefined) captionConfig.liveFeedBreak = !!liveFeedBreak;
     if (captionStrategy && ['truncate', 'summarize', 'verbatim'].includes(captionStrategy)) {
         captionConfig.captionStrategy = captionStrategy;

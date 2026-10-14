@@ -107,7 +107,7 @@ export class DtvccEncoder {
      * youtube and atomic styles show whole captions, so there the words become a
      * caption of their own.
      */
-    appendText(text) {
+    appendText(text, opts = {}) {
         const words = String(text || '').trim().split(/\s+/).filter(Boolean);
         if (!words.length) return;
         if (this._style !== 'rollup') { this.enqueueText(words.join(' ')); return; }
@@ -118,16 +118,19 @@ export class DtvccEncoder {
             while (rest.length > width) { pieces.push(rest.slice(0, width)); rest = rest.slice(width); }
             pieces.push(rest);
         }
+        let joinFirst = !!opts.continueWord;   // the rest of a word already on the row: no space before it
         if (this._repaintFrames > 0) {
             for (const piece of pieces) {
                 const last = this._lines.length ? this._lines[this._lines.length - 1] : '';
-                if (this._liveOpen && this._lines.length && last.length + 1 + piece.length <= width) {
-                    this._lines[this._lines.length - 1] = last + ' ' + piece;
+                const glue = joinFirst && this._liveOpen && last ? '' : ' ';
+                if (this._liveOpen && this._lines.length && last.length + glue.length + piece.length <= width) {
+                    this._lines[this._lines.length - 1] = last + glue + piece;
                 } else {
                     this._lines.push(piece);
                     while (this._lines.length > this._rows) this._lines.shift();
                 }
                 this._liveOpen = true;
+                joinFirst = false;
             }
             this._blankRedrawsLeft = 0;
             this._queueRedraw(!this._windowDefined, false);
@@ -138,17 +141,22 @@ export class DtvccEncoder {
         block.push(CMD.CW0);
         const put = (s) => { for (let i = 0; i < s.length; i++) { const code = s.charCodeAt(i); block.push(code >= 0x20 && code <= 0x7E ? code : 0x20); } };
         for (const piece of pieces) {
-            const need = (this._liveCol > 0 ? 1 : 0) + piece.length;
-            if (this._liveCol > 0 && this._liveCol + need > width) this._liveCol = 0;
+            const glue = (this._liveCol > 0 && !joinFirst) ? 1 : 0;
+            const need = glue + piece.length;
+            if (this._liveCol > 0 && this._liveCol + need > width) {
+                if (this._liveCol < width) put(' ');   // trailing space: converters that join rows keep the words apart
+                this._liveCol = 0;
+            }
             if (this._liveCol === 0) {
                 if (this._classicRowsWritten > 0) block.push(CMD.CR);
                 this._classicRowsWritten++;
                 put(piece);
                 this._liveCol = piece.length;
             } else {
-                put(' ' + piece);
+                put((glue ? ' ' : '') + piece);
                 this._liveCol += need;
             }
+            joinFirst = false;
         }
         block.push(CMD.ETX);
         this.blockQueue.push(block);

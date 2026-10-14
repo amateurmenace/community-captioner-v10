@@ -9,9 +9,11 @@ is still the safe default when a DeckLink SDK is present).
 
 - `server/live-feed.js` (new) + `appendText()` on both encoders: interim words that the recognizer has
   stopped revising are appended to the roll-up encoders at once (CEA-608 rollup/rollup_pac, CEA-708
-  rollup), so captions stream a second behind the speaker instead of a block per sentence. Config keys
-  `liveFeed` (default true), `liveFeedStable`, `liveFeedHold`, `liveFeedBreak`. Tests: `node test/test-live-feed.mjs`
-  (21), `node test/test-cea708.mjs` (123), `node tools/e2e/live-feed-e2e.mjs --spawn` (virtual output, no hardware).
+  rollup), so captions stream a second or two behind the speaker instead of a block per sentence. The final is
+  aligned to the words already on air by content (fragments are completed, revised words skipped). Config keys
+  `liveFeed` (default true), `liveFeedStable` (4), `liveFeedHold` (2), `liveFeedMinAge` (1200 ms), `liveFeedBreak`.
+  Tests: `node test/test-live-feed.mjs` (30), `node test/test-cea708.mjs` (123), `node tools/e2e/live-feed-e2e.mjs --spawn`
+  (virtual output, no hardware).
 - The caption config persists in `DATA_DIR/caption-config.json`; `POST /api/inject/start {sourceKind:'virtual'}` +
   `GET /api/inject/cdps` run the frame loop without a DeckLink.
 - UI: the Caption Injection screen drives the app's own session (five speech engines, Start/Stop, mirrors
