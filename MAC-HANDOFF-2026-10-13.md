@@ -66,9 +66,12 @@ is still the safe default when a DeckLink SDK is present).
    Expected: Gemini Live connected within ~2 s, the sentence on the Dashboard within ~6 s, no settings dialog, no key in localStorage.
 5. If a DeckLink is attached: Caption Injection in CEA-608 mode with the default style, `decklink_probe` on a loopback input
    should decode rolling rows (the PAC is now on every row); the 708 default (one-frame) is unchanged.
-6. Attach `build/Community-Captioner-6.14.0-mac-arm64.zip` to release v10.1 (`gh release upload v10.1 … --clobber`), point
-   `MAC_DOWNLOAD_URL` in `utils/appLinks.ts` at it, commit with
-   `-c user.name="Stephen Walter" -c user.email="swalter4669@gmail.com"` and the Co-Authored-By trailer; never push `v*` tags.
+6. Attach `build/Community-Captioner-6.15.0-mac-arm64.zip` to release v10.1 (`gh release upload v10.1 … --clobber`), delete the
+   6.13.3 Mac zip from the release (`gh release delete-asset v10.1 Community-Captioner-6.13.3-mac-arm64.zip --yes`), point
+   `MAC_DOWNLOAD_URL` in `utils/appLinks.ts` at the new file, update the release notes (intro line and the macOS row say 6.13.3;
+   `gh release view v10.1 --json body --jq .body > notes.md`, edit, `gh release edit v10.1 --notes-file notes.md`), commit with
+   `-c user.name="Stephen Walter" -c user.email="swalter4669@gmail.com"` and the Co-Authored-By trailer; never push `v*` tags,
+   never commit `build/` or `.env.local`.
 
 ## Verdict to carry forward (so the Mac session does not re-open it)
 
